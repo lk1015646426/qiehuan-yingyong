@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use crate::models::work_cn::WorkCnInstallation;
+use crate::models::work_cn::{WorkCnAccountView, WorkCnInstallation, WorkCnSnapshotValidation};
 use crate::modules::{logger, process, trae_account};
 
 /// User-visible product name. The internal platform identifier stays
@@ -70,4 +70,30 @@ fn build_storage_path(user_data_dir: &Path) -> std::path::PathBuf {
         .join("User")
         .join("globalStorage")
         .join("storage.json")
+}
+
+/// Import the currently logged-in TRAE Work CN account as a full snapshot
+/// (tokens + device keys + ids). `label` is stored as a tag; email is never
+/// overwritten. Returns a desensitized view.
+#[tauri::command]
+pub fn import_current_work_cn_account(
+    _app: tauri::AppHandle,
+    label: Option<String>,
+) -> Result<WorkCnAccountView, String> {
+    trae_account::import_current_work_cn_account(label)
+}
+
+/// List previously imported Work CN accounts as desensitized views.
+#[tauri::command]
+pub fn list_work_cn_accounts() -> Result<Vec<WorkCnAccountView>, String> {
+    trae_account::list_work_cn_accounts()
+}
+
+/// Validate the completeness of a saved Work CN account snapshot.
+#[tauri::command]
+pub fn validate_work_cn_account(account_id: String) -> Result<WorkCnSnapshotValidation, String> {
+    let Some(account) = trae_account::load_account(&account_id) else {
+        return Err("账号不存在".to_string());
+    };
+    Ok(trae_account::validate_work_cn_account_snapshot(&account))
 }

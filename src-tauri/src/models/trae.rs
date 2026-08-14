@@ -37,6 +37,14 @@ pub struct TraeAccount {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trae_usertag_raw: Option<String>,
 
+    // Work CN 完整设备快照字段（阶段 3）。所有字段 serde(default) 以兼容旧账号文件。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkin_device_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_device_id: Option<String>,
+
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -115,6 +123,12 @@ pub struct TraeImportPayload {
     pub trae_usage_raw: Option<serde_json::Value>,
     pub trae_server_raw: Option<serde_json::Value>,
     pub trae_usertag_raw: Option<String>,
+
+    // Work CN 完整设备快照字段（阶段 3）。与 TraeAccount 保持一致，serde(default) 兼容旧数据。
+    pub checkin_device_id: Option<String>,
+    pub machine_id: Option<String>,
+    pub auth_device_id: Option<String>,
+
     pub status: Option<String>,
     pub status_reason: Option<String>,
 }

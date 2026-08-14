@@ -311,6 +311,9 @@ pub fn add_trae_account_with_token(
         trae_usage_raw: None,
         trae_server_raw: None,
         trae_usertag_raw: None,
+        checkin_device_id: None,
+        machine_id: None,
+        auth_device_id: None,
         status: None,
         status_reason: None,
     };

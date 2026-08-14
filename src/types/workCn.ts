@@ -9,3 +9,40 @@ export interface WorkCnInstallation {
   version: string | null;
   legacyPath: boolean;
 }
+
+// Snapshot completeness validation returned by the backend.
+// Mirrors `WorkCnSnapshotValidation` in src-tauri/src/models/work_cn.rs.
+export interface WorkCnSnapshotValidation {
+  validForSwitch: boolean;
+  hasAccessToken: boolean;
+  hasRefreshToken: boolean;
+  hasUserId: boolean;
+  hasAuthDeviceId: boolean;
+  hasDevicePrivateKey: boolean;
+  hasDevicePublicKey: boolean;
+  hasCheckinDeviceId: boolean;
+  warnings: string[];
+}
+
+// Desensitized view of a saved Work CN account. Tokens / private keys are
+// never exposed to the frontend. Mirrors `WorkCnAccountView`.
+export interface WorkCnAccountView {
+  id: string;
+  email: string | null;
+  userId: string | null;
+  nickname: string | null;
+  tags: string[] | null;
+  planType: string | null;
+  createdAt: number;
+  lastUsed: number;
+  hasAccessToken: boolean;
+  hasRefreshToken: boolean;
+  hasUserId: boolean;
+  hasAuthDeviceId: boolean;
+  hasCheckinDeviceId: boolean;
+  hasMachineId: boolean;
+  hasDevicePrivateKey: boolean;
+  hasDevicePublicKey: boolean;
+  validForSwitch: boolean;
+  warnings: string[];
+}

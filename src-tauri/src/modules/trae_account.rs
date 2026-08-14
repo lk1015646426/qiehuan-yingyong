@@ -1245,6 +1245,9 @@ fn apply_payload(account: &mut TraeAccount, payload: TraeImportPayload) {
     account.trae_usage_raw = payload.trae_usage_raw;
     account.trae_server_raw = payload.trae_server_raw;
     account.trae_usertag_raw = normalize_non_empty(payload.trae_usertag_raw.as_deref());
+    account.checkin_device_id = payload.checkin_device_id.clone();
+    account.machine_id = payload.machine_id.clone();
+    account.auth_device_id = payload.auth_device_id.clone();
     account.status = normalize_non_empty(payload.status.as_deref());
     account.status_reason = normalize_non_empty(payload.status_reason.as_deref());
     account.last_used = now_ts();
@@ -1321,6 +1324,9 @@ pub fn upsert_account(payload: TraeImportPayload) -> Result<TraeAccount, String>
         trae_usage_raw: payload.trae_usage_raw.clone(),
         trae_server_raw: payload.trae_server_raw.clone(),
         trae_usertag_raw: normalize_non_empty(payload.trae_usertag_raw.as_deref()),
+        checkin_device_id: payload.checkin_device_id.clone(),
+        machine_id: payload.machine_id.clone(),
+        auth_device_id: payload.auth_device_id.clone(),
         status: normalize_non_empty(payload.status.as_deref()),
         status_reason: normalize_non_empty(payload.status_reason.as_deref()),
         quota_query_last_error: None,
@@ -1640,6 +1646,9 @@ fn payload_from_storage_root(storage_root: &Value) -> Result<TraeImportPayload, 
         trae_usage_raw: None,
         trae_server_raw: server_raw,
         trae_usertag_raw: usertag_raw,
+        checkin_device_id: None,
+        machine_id: None,
+        auth_device_id: None,
         status,
         status_reason,
     })
@@ -1867,6 +1876,9 @@ fn payload_from_import_value(raw: Value) -> Result<TraeImportPayload, String> {
         trae_usage_raw: usage_raw,
         trae_server_raw: server_raw,
         trae_usertag_raw: usertag_raw,
+        checkin_device_id: None,
+        machine_id: None,
+        auth_device_id: None,
         status,
         status_reason,
     })
@@ -3698,6 +3710,327 @@ pub fn import_from_local_for_platform(
         account.email
     ));
     Ok(Some(account))
+}
+
+// ===== 阶段 3：完整 Work CN 设备快照导入 =====
+
+/// Extract the device snapshot from a local TRAE Work CN `storage.json` root
+/// without touching any secrets. `auth_device_id` is the *numeric* device id
+/// embedded in the `iCubeAuthInfo://icube-dc:<数字ID>` storage key; it must not
+/// be confused with `checkin_device_id` (the UUID `telemetry.devDeviceId`).
+pub(crate) fn extract_local_work_cn_device_snapshot(
+    storage_root: &Value,
+) -> crate::models::work_cn::LocalWorkCnDeviceSnapshot {
+    use crate::models::work_cn::LocalWorkCnDeviceSnapshot;
+    let root_obj = match storage_root.as_object() {
+        Some(obj) => obj,
+        None => return LocalWorkCnDeviceSnapshot::default(),
+    };
+
+    let device_key_entry = root_obj
+        .iter()
+        .find(|(key, _)| key.starts_with(TRAE_STORAGE_DEVICE_KEY_PREFIX));
+
+    let auth_device_id = device_key_entry
+        .and_then(|(key, _)| key.strip_prefix(TRAE_STORAGE_DEVICE_KEY_PREFIX))
+        .and_then(|s| normalize_non_empty(Some(s)))
+        .map(String::from);
+
+    let parsed_device_key = device_key_entry
+        .and_then(|(_, value)| parse_value_or_json_string_or_icube_cipher(Some(value)));
+    // Some TRAE builds nest the keypair under `deviceKeyPair`; others store it
+    // directly on the device-key object. Try the wrapper first, then fall back
+    // to the object itself so both shapes are captured.
+    let device_key_obj = parsed_device_key
+        .as_ref()
+        .and_then(|obj| obj.get("deviceKeyPair"))
+        .or_else(|| parsed_device_key.as_ref());
+    let (device_private_key, device_public_key) = device_key_obj
+        .and_then(normalize_device_key_pair_value)
+        .map(|kp| {
+            (
+                kp.get("privateKeyPEM").and_then(Value::as_str).map(String::from),
+                kp.get("publicKeyPEM").and_then(Value::as_str).map(String::from),
+            )
+        })
+        .unwrap_or((None, None));
+
+    let checkin_device_id = pick_string(
+        Some(storage_root),
+        &[&["telemetry", "devDeviceId"], &["telemetry.devDeviceId"]],
+    )
+    .map(String::from);
+
+    let machine_id = pick_string(
+        Some(storage_root),
+        &[&["telemetry", "machineId"], &["telemetry.machineId"]],
+    )
+    .map(String::from);
+
+    LocalWorkCnDeviceSnapshot {
+        checkin_device_id,
+        machine_id,
+        auth_device_id,
+        device_private_key,
+        device_public_key,
+    }
+}
+
+/// Merge an extracted device snapshot into an import payload so the resulting
+/// account keeps the full device context. Device keys are folded into
+/// `trae_auth_raw.deviceKeyPair` (consumed later by
+/// `resolve_device_key_pair_for_inject`).
+pub(crate) fn merge_work_cn_device_snapshot_into_payload(
+    payload: &mut TraeImportPayload,
+    snapshot: crate::models::work_cn::LocalWorkCnDeviceSnapshot,
+) {
+    payload.checkin_device_id = snapshot.checkin_device_id.clone();
+    payload.machine_id = snapshot.machine_id.clone();
+    payload.auth_device_id = snapshot.auth_device_id.clone();
+
+    if snapshot.device_private_key.is_some() || snapshot.device_public_key.is_some() {
+        let mut auth_obj = payload
+            .trae_auth_raw
+            .take()
+            .unwrap_or_else(|| Value::Object(Map::new()));
+        if let Some(obj) = auth_obj.as_object_mut() {
+            let device_key_pair = serde_json::json!({
+                "privateKeyPEM": snapshot.device_private_key.unwrap_or_default(),
+                "publicKeyPEM": snapshot.device_public_key.unwrap_or_default(),
+            });
+            obj.insert("deviceKeyPair".to_string(), device_key_pair);
+        }
+        payload.trae_auth_raw = Some(auth_obj);
+    }
+}
+
+/// Validate whether a saved Work CN account carries everything needed for a
+/// safe one-click switch. Returns structured flags, not just a bool.
+pub fn validate_work_cn_account_snapshot(
+    account: &TraeAccount,
+) -> crate::models::work_cn::WorkCnSnapshotValidation {
+    use crate::models::work_cn::WorkCnSnapshotValidation;
+    let has_access_token = !account.access_token.is_empty();
+    let has_refresh_token = account
+        .refresh_token
+        .as_ref()
+        .map(|t| !t.is_empty())
+        .unwrap_or(false);
+    let has_user_id = account
+        .user_id
+        .as_ref()
+        .map(|u| !u.is_empty())
+        .unwrap_or(false);
+    let has_auth_device_id = account
+        .auth_device_id
+        .as_ref()
+        .map(|u| !u.is_empty())
+        .unwrap_or(false);
+    let has_checkin_device_id = account
+        .checkin_device_id
+        .as_ref()
+        .map(|u| !u.is_empty())
+        .unwrap_or(false);
+
+    let (has_device_private_key, has_device_public_key) = account
+        .trae_auth_raw
+        .as_ref()
+        .and_then(|raw| raw.get("deviceKeyPair"))
+        .map(|kp| {
+            (
+                kp.get("privateKeyPEM")
+                    .and_then(Value::as_str)
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false),
+                kp.get("publicKeyPEM")
+                    .and_then(Value::as_str)
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false),
+            )
+        })
+        .unwrap_or((false, false));
+
+    let mut warnings: Vec<String> = Vec::new();
+    if !has_user_id {
+        warnings.push("缺少用户 ID (user_id)，切号后可能无法识别账号".to_string());
+    }
+    if !has_checkin_device_id {
+        warnings.push("缺少 checkin 设备 ID (telemetry.devDeviceId)".to_string());
+    }
+    if !has_auth_device_id {
+        warnings.push("缺少 auth 设备 ID (icube-dc 数字 ID)".to_string());
+    }
+    if !has_device_private_key || !has_device_public_key {
+        warnings.push("设备密钥对不完整，切号后可能需重新授权设备".to_string());
+    }
+
+    let valid_for_switch = has_access_token
+        && has_user_id
+        && has_auth_device_id
+        && has_checkin_device_id
+        && has_device_private_key
+        && has_device_public_key;
+
+    WorkCnSnapshotValidation {
+        valid_for_switch,
+        has_access_token,
+        has_refresh_token,
+        has_user_id,
+        has_auth_device_id,
+        has_device_private_key,
+        has_device_public_key,
+        has_checkin_device_id,
+        warnings,
+    }
+}
+
+/// Enforce the "max 4 distinct UIDs" cap for a platform before upserting. The
+/// incoming `new_user_id` counts as an addition only when it is non-empty and
+/// not already present, so re-importing the same UID never trips the cap.
+fn enforce_work_cn_account_cap(
+    platform: TraePlatformKind,
+    new_user_id: Option<&str>,
+) -> Result<(), String> {
+    let index = load_account_index_checked()?;
+    let mut distinct_uids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for item in &index.accounts {
+        if let Some(account) = load_account(&item.id) {
+            if resolve_account_platform_kind(&account) != platform {
+                continue;
+            }
+            if let Some(uid) = account.user_id.as_deref().filter(|u| !u.is_empty()) {
+                distinct_uids.insert(uid.to_string());
+            }
+        }
+    }
+    let new_uid = new_user_id.filter(|u| !u.trim().is_empty());
+    let would_add = match new_uid {
+        Some(uid) => !distinct_uids.contains(uid),
+        None => false,
+    };
+    if would_add && distinct_uids.len() >= 4 {
+        return Err(format!(
+            "TRAE Work CN 最多支持 4 个不同账号，当前已有 {} 个，无法导入第 5 个",
+            distinct_uids.len()
+        ));
+    }
+    Ok(())
+}
+
+/// Core import used by both the Tauri command and unit tests. Reads a resolved
+/// payload (already carrying the device snapshot), enforces the cap, upserts the
+/// account, and stores the optional `label` as a tag (never overwriting email).
+pub(crate) fn import_work_cn_account_from_payload(
+    mut payload: TraeImportPayload,
+    label: Option<String>,
+) -> Result<TraeAccount, String> {
+    let platform = resolve_payload_platform_kind(&payload);
+    attach_platform_metadata_to_payload(&mut payload, platform);
+    enforce_work_cn_account_cap(platform, payload.user_id.as_deref())?;
+    let mut account = upsert_account(payload)?;
+    if let Some(label) = label.filter(|l| !l.trim().is_empty()) {
+        account = update_account_tags(&account.id, vec![label.trim().to_string()])?;
+    }
+    Ok(account)
+}
+
+/// Tauri command: import the currently logged-in TRAE Work CN account as a full
+/// snapshot (tokens + device keys + ids). Safe: reads only the local official
+/// `storage.json`; never sends secrets anywhere.
+pub fn import_current_work_cn_account(
+    label: Option<String>,
+) -> Result<crate::models::work_cn::WorkCnAccountView, String> {
+    let platform = TraePlatformKind::TraeSoloCn;
+    let storage_path = get_default_trae_storage_path_for_platform(platform)?;
+    if !storage_path.exists() {
+        return Err(
+            "未检测到已登录的 TRAE Work CN 账号，请先在官方客户端登录后再导入".to_string(),
+        );
+    }
+    let storage_root = read_storage_json(&storage_path)?;
+    let mut payload = payload_from_storage_root(&storage_root)?;
+    let snapshot = extract_local_work_cn_device_snapshot(&storage_root);
+    merge_work_cn_device_snapshot_into_payload(&mut payload, snapshot);
+
+    let account = import_work_cn_account_from_payload(payload, label)?;
+    let validation = validate_work_cn_account_snapshot(&account);
+    Ok(build_work_cn_account_view(&account, validation))
+}
+
+/// Build a desensitized view of a saved Work CN account. Tokens and private
+/// keys are never included; only boolean completeness flags + masked ids.
+pub(crate) fn build_work_cn_account_view(
+    account: &TraeAccount,
+    validation: crate::models::work_cn::WorkCnSnapshotValidation,
+) -> crate::models::work_cn::WorkCnAccountView {
+    let email_masked = mask_identity_for_view(account.email.as_str());
+    let user_id_masked = account.user_id.as_ref().map(|uid| mask_tail(uid.as_str()));
+    crate::models::work_cn::WorkCnAccountView {
+        id: account.id.clone(),
+        email: if email_masked.is_empty() {
+            None
+        } else {
+            Some(email_masked)
+        },
+        user_id: user_id_masked,
+        nickname: account.nickname.clone(),
+        tags: account.tags.clone(),
+        plan_type: account.plan_type.clone(),
+        created_at: account.created_at,
+        last_used: account.last_used,
+        has_access_token: validation.has_access_token,
+        has_refresh_token: validation.has_refresh_token,
+        has_user_id: validation.has_user_id,
+        has_auth_device_id: validation.has_auth_device_id,
+        has_checkin_device_id: validation.has_checkin_device_id,
+        has_machine_id: account
+            .machine_id
+            .as_ref()
+            .map(|m| !m.is_empty())
+            .unwrap_or(false),
+        has_device_private_key: validation.has_device_private_key,
+        has_device_public_key: validation.has_device_public_key,
+        valid_for_switch: validation.valid_for_switch,
+        warnings: validation.warnings,
+    }
+}
+
+/// List saved Work CN accounts as desensitized views.
+pub fn list_work_cn_accounts() -> Result<Vec<crate::models::work_cn::WorkCnAccountView>, String> {
+    let accounts = list_accounts_checked()?;
+    Ok(accounts
+        .iter()
+        .filter(|account| resolve_account_platform_kind(account) == TraePlatformKind::TraeSoloCn)
+        .map(|account| {
+            build_work_cn_account_view(account, validate_work_cn_account_snapshot(account))
+        })
+        .collect())
+}
+
+fn mask_identity_for_view(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    if trimmed.contains('@') {
+        let (local, domain) = trimmed.split_once('@').unwrap();
+        let stars = local.len().saturating_sub(1).max(1);
+        let local_mask = format!("{}{}", &local[..1.min(local.len())], "*".repeat(stars));
+        return format!("{}@{}", local_mask, domain);
+    }
+    mask_tail(trimmed)
+}
+
+fn mask_tail(value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.len() <= 4 {
+        return "*".repeat(trimmed.len()).to_string();
+    }
+    format!(
+        "{}{}",
+        "*".repeat(trimmed.len() - 4),
+        &trimmed[trimmed.len() - 4..]
+    )
 }
 
 pub(crate) fn resolve_current_account_id(accounts: &[TraeAccount]) -> Option<String> {
@@ -5588,6 +5921,9 @@ mod tests {
             trae_usage_raw: None,
             trae_server_raw: None,
             trae_usertag_raw: Some("row".to_string()),
+            checkin_device_id: None,
+            machine_id: None,
+            auth_device_id: None,
             status: None,
             status_reason: None,
             quota_query_last_error: None,
@@ -5995,6 +6331,9 @@ mod tests {
             trae_usage_raw: None,
             trae_server_raw: None,
             trae_usertag_raw: None,
+            checkin_device_id: None,
+            machine_id: None,
+            auth_device_id: None,
             status: None,
             status_reason: None,
         };
@@ -6278,6 +6617,250 @@ mod tests {
         assert_eq!(
             decoded.get("publicKeyPEM").and_then(Value::as_str),
             Some("public-key")
+        );
+    }
+
+    // ===== 阶段 3：Work CN 完整设备快照导入 =====
+
+    use crate::models::trae::TraeImportPayload;
+    use crate::models::work_cn::LocalWorkCnDeviceSnapshot;
+
+    static WORK_CN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn work_cn_device_snapshot_extraction_parses_all_ids_and_keys() {
+        let storage_root = serde_json::json!({
+            "iCubeAuthInfo://icube.cloudide": serde_json::json!({
+                "accessToken": "access-abc",
+                "refreshToken": "refresh-abc",
+                "userId": "7463021402682639361",
+                "email": "user@example.com"
+            }),
+            "iCubeAuthInfo://icube-dc:1132918838145530": serde_json::json!({
+                "deviceKeyPair": {
+                    "privateKeyPEM": "priv-xyz",
+                    "publicKeyPEM": "pub-xyz"
+                }
+            }).to_string(),
+            "telemetry.devDeviceId": "d6b8ac2e-f4d1-496d-a9a6-c9c7b4bd23e3",
+            "telemetry.machineId": "machine-hash"
+        });
+
+        let snapshot = extract_local_work_cn_device_snapshot(&storage_root);
+        assert_eq!(snapshot.auth_device_id.as_deref(), Some("1132918838145530"));
+        assert_eq!(
+            snapshot.checkin_device_id.as_deref(),
+            Some("d6b8ac2e-f4d1-496d-a9a6-c9c7b4bd23e3")
+        );
+        assert_eq!(snapshot.machine_id.as_deref(), Some("machine-hash"));
+        assert_eq!(snapshot.device_private_key.as_deref(), Some("priv-xyz"));
+        assert_eq!(snapshot.device_public_key.as_deref(), Some("pub-xyz"));
+    }
+
+    #[test]
+    fn work_cn_snapshot_merge_into_payload_sets_fields_and_device_keypair() {
+        let mut payload = TraeImportPayload {
+            email: "user@example.com".to_string(),
+            user_id: Some("7463021402682639361".to_string()),
+            nickname: None,
+            access_token: "access-abc".to_string(),
+            refresh_token: Some("refresh-abc".to_string()),
+            token_type: None,
+            expires_at: None,
+            plan_type: None,
+            plan_reset_at: None,
+            trae_auth_raw: Some(serde_json::json!({"userId": "7463021402682639361"})),
+            trae_profile_raw: None,
+            trae_entitlement_raw: None,
+            trae_usage_raw: None,
+            trae_server_raw: None,
+            trae_usertag_raw: None,
+            checkin_device_id: None,
+            machine_id: None,
+            auth_device_id: None,
+            status: None,
+            status_reason: None,
+        };
+        let snapshot = LocalWorkCnDeviceSnapshot {
+            checkin_device_id: Some("d6b8ac2e-xxxx".to_string()),
+            machine_id: Some("machine-hash".to_string()),
+            auth_device_id: Some("1132918838145530".to_string()),
+            device_private_key: Some("priv-xyz".to_string()),
+            device_public_key: Some("pub-xyz".to_string()),
+        };
+        merge_work_cn_device_snapshot_into_payload(&mut payload, snapshot);
+        assert_eq!(payload.auth_device_id.as_deref(), Some("1132918838145530"));
+        assert_eq!(payload.checkin_device_id.as_deref(), Some("d6b8ac2e-xxxx"));
+        assert_eq!(payload.machine_id.as_deref(), Some("machine-hash"));
+        let auth_raw = payload.trae_auth_raw.as_ref().unwrap();
+        let kp = auth_raw.get("deviceKeyPair").expect("deviceKeyPair present");
+        assert_eq!(kp.get("privateKeyPEM").and_then(Value::as_str), Some("priv-xyz"));
+        assert_eq!(kp.get("publicKeyPEM").and_then(Value::as_str), Some("pub-xyz"));
+    }
+
+    #[test]
+    fn work_cn_import_caps_at_four_and_dedupes_same_uid_and_encrypts() {
+        let _guard = WORK_CN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::modules::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let dir = std::env::temp_dir().join(format!(
+            "work-cn-import-test-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::env::set_var("COCKPIT_TOOLS_TEST_DATA_DIR", &dir);
+
+        fn make_payload(uid: &str, token: &str) -> TraeImportPayload {
+            TraeImportPayload {
+                email: format!("user-{uid}@example.com"),
+                user_id: Some(uid.to_string()),
+                nickname: None,
+                access_token: token.to_string(),
+                refresh_token: Some(format!("refresh-{token}")),
+                token_type: Some("Bearer".to_string()),
+                expires_at: None,
+                plan_type: None,
+                plan_reset_at: None,
+                trae_auth_raw: Some(serde_json::json!({
+                    "platform": "trae_solo_cn",
+                    "deviceKeyPair": {
+                        "privateKeyPEM": format!("priv-{token}"),
+                        "publicKeyPEM": format!("pub-{token}")
+                    }
+                })),
+                trae_profile_raw: None,
+                trae_entitlement_raw: None,
+                trae_usage_raw: None,
+                trae_server_raw: None,
+                trae_usertag_raw: None,
+                checkin_device_id: Some("checkin-uuid".to_string()),
+                machine_id: Some("machine-hash".to_string()),
+                auth_device_id: Some("1132918838145530".to_string()),
+                status: None,
+                status_reason: None,
+            }
+        }
+
+        for i in 0..4u32 {
+            let uid = format!("uid-{i}");
+            let account = import_work_cn_account_from_payload(
+                make_payload(&uid, &format!("tok-{i}")),
+                None,
+            )
+            .expect("import");
+            assert_eq!(account.auth_device_id.as_deref(), Some("1132918838145530"));
+            let validation = validate_work_cn_account_snapshot(&account);
+            assert!(validation.has_device_private_key);
+            assert!(validation.has_device_public_key);
+            assert!(validation.has_checkin_device_id);
+        }
+
+        let count = list_accounts_checked().expect("list").len();
+        assert_eq!(count, 4, "应有 4 个账号");
+
+        // 第 5 个不同 UID 必须返回明确错误
+        let err = import_work_cn_account_from_payload(make_payload("uid-4", "tok-4"), None)
+            .unwrap_err();
+        assert!(err.contains("4"), "应提示最多 4 个: {err}");
+
+        // 同 UID 重复导入不应增加账号数量
+        import_work_cn_account_from_payload(make_payload("uid-0", "tok-0-new"), None)
+            .expect("re-import same uid");
+        assert_eq!(
+            list_accounts_checked().expect("list").len(),
+            4,
+            "同 UID 不应增加数量"
+        );
+
+        // 账号详情文件密文中搜不到 token 明文和私钥
+        for i in 0..4u32 {
+            let uid = format!("uid-{i}");
+            let account =
+                import_work_cn_account_from_payload(make_payload(&uid, &format!("tok-{i}")), None)
+                    .unwrap();
+            let serialized =
+                crate::modules::secure_account_storage::serialize_account_file("trae", &account)
+                    .expect("serialize");
+            assert!(
+                !serialized.contains(&format!("tok-{i}")),
+                "密文中不应出现明文 access token"
+            );
+            assert!(
+                !serialized.contains(&format!("priv-{i}")),
+                "密文中不应出现明文私钥"
+            );
+            assert!(
+                !serialized.contains("privateKeyPEM"),
+                "密文中不应出现 privateKeyPEM 字面量"
+            );
+        }
+
+        std::env::remove_var("COCKPIT_TOOLS_TEST_DATA_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // Opt-in runtime probe: validates the full Stage 3 extraction pipeline against
+    // the REAL local TRAE Work CN `storage.json`. Skipped unless a dev points
+    // `WORK_CN_REAL_STORAGE_PATH` at the file. Reads only — never writes secrets,
+    // never upserts. Confirms every field required for a valid one-click switch is
+    // actually present in the real storage format.
+    #[test]
+    fn work_cn_real_storage_snapshot_probe() {
+        let Ok(path) = std::env::var("WORK_CN_REAL_STORAGE_PATH") else {
+            eprintln!("work_cn_real_storage_snapshot_probe skipped (set WORK_CN_REAL_STORAGE_PATH to run)");
+            return;
+        };
+        let text = std::fs::read_to_string(&path).expect("read real storage.json");
+        let storage_root: Value = serde_json::from_str(&text).expect("parse real storage.json");
+        let payload = payload_from_storage_root(&storage_root).expect("build payload");
+        let snapshot = extract_local_work_cn_device_snapshot(&storage_root);
+        eprintln!(
+            "REAL payload: has_access={} user_id_prefix={:?} email_prefix={:?}",
+            !payload.access_token.is_empty(),
+            payload
+                .user_id
+                .as_deref()
+                .map(|s| format!("{}…", &s[..s.len().min(3)])),
+            format!("{}…", payload.email.chars().next().unwrap_or('?'))
+        );
+        eprintln!(
+            "REAL snapshot: auth_device_id={:?} checkin={:?} machine={:?} has_priv={} has_pub={}",
+            snapshot.auth_device_id,
+            snapshot.checkin_device_id,
+            snapshot.machine_id,
+            snapshot.device_private_key.is_some(),
+            snapshot.device_public_key.is_some()
+        );
+        assert!(
+            !payload.access_token.is_empty(),
+            "real storage must carry access token"
+        );
+        assert!(
+            payload
+                .user_id
+                .as_deref()
+                .map(|s| !s.is_empty())
+                .unwrap_or(false),
+            "real storage must carry user id"
+        );
+        assert!(
+            snapshot.auth_device_id.is_some(),
+            "real storage must carry auth device id"
+        );
+        assert!(
+            snapshot.checkin_device_id.is_some(),
+            "real storage must carry checkin device id"
+        );
+        assert!(
+            snapshot.machine_id.is_some(),
+            "real storage must carry machine id"
+        );
+        assert!(
+            snapshot.device_private_key.is_some() && snapshot.device_public_key.is_some(),
+            "real storage must carry device keypair"
         );
     }
 }

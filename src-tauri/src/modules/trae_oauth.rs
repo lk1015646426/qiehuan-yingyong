@@ -2847,6 +2847,9 @@ pub async fn complete_login(
             trae_usage_raw: None,
             trae_server_raw: Some(server_raw),
             trae_usertag_raw: user_tag_raw,
+            checkin_device_id: None,
+            machine_id: None,
+            auth_device_id: None,
             status: None,
             status_reason: None,
         })
