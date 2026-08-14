@@ -2,6 +2,7 @@ import { invoke } from '@tauri-apps/api/core';
 import type {
   WorkCnInstallation,
   WorkCnAccountView,
+  WorkCnCreditsSummary,
   WorkCnSnapshotValidation,
   WorkCnSwitchResult,
   WorkCnCommandError,
@@ -35,6 +36,23 @@ export function validateWorkCnAccount(accountId: string): Promise<WorkCnSnapshot
 export async function switchWorkCnAccount(accountId: string): Promise<WorkCnSwitchResult> {
   try {
     return await invoke<WorkCnSwitchResult>('switch_work_cn_account', { accountId });
+  } catch (err) {
+    throw parseWorkCnCommandError(err);
+  }
+}
+
+// Query a saved Work CN account's credit balance. Query only — never performs a
+// local check-in / claim. `forceRefresh` re-queries the upstream quota API using
+// the cached access token; any error is re-thrown as a parsed `WorkCnCommandError`.
+export async function getWorkCnCredits(
+  accountId: string,
+  forceRefresh = false,
+): Promise<WorkCnCreditsSummary> {
+  try {
+    return await invoke<WorkCnCreditsSummary>('get_work_cn_credits', {
+      accountId,
+      forceRefresh,
+    });
   } catch (err) {
     throw parseWorkCnCommandError(err);
   }

@@ -1,8 +1,8 @@
 use std::path::Path;
 
 use crate::models::work_cn::{
-    command_error_to_string, WorkCnAccountView, WorkCnInstallation, WorkCnSnapshotValidation,
-    WorkCnSwitchResult,
+    command_error_to_string, WorkCnAccountView, WorkCnCreditsSummary, WorkCnInstallation,
+    WorkCnSnapshotValidation, WorkCnSwitchResult,
 };
 use crate::modules::{logger, process, trae_account};
 
@@ -111,6 +111,19 @@ pub async fn switch_work_cn_account(
     account_id: String,
 ) -> Result<WorkCnSwitchResult, String> {
     trae_account::switch_work_cn_account(account_id)
+        .await
+        .map_err(|error| command_error_to_string(&error))
+}
+
+/// Query a saved Work CN account's credit balance. Query only — this never
+/// performs a local check-in / claim (开发指南 §8.4). On error the backend
+/// returns a serialized `WorkCnCommandError` JSON string.
+#[tauri::command]
+pub async fn get_work_cn_credits(
+    account_id: String,
+    force_refresh: bool,
+) -> Result<WorkCnCreditsSummary, String> {
+    trae_account::get_work_cn_credits(&account_id, force_refresh)
         .await
         .map_err(|error| command_error_to_string(&error))
 }

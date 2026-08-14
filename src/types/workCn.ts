@@ -79,3 +79,15 @@ export interface WorkCnCommandError {
   message: string;
   detail: string | null;
 }
+
+// Credit balance summary for a Work CN account. Mirrors `WorkCnCreditsSummary`
+// in src-tauri/src/models/work_cn.rs. `total`/`remaining` are `null` when there
+// is no parsed entitlement data (UI shows "暂无积分数据"); `unlimited` means an
+// infinite `-1` quota (UI shows "无限"). `remaining` is always >= 0.
+export interface WorkCnCreditsSummary {
+  total: number | null;
+  used: number;
+  remaining: number | null;
+  unlimited: boolean;
+  updatedAt: number;
+}

@@ -17,7 +17,9 @@ use std::time::Duration;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::models::trae::{TraeAccount, TraeAccountIndex, TraeImportPayload};
-use crate::models::work_cn::{WorkCnCommandError, WorkCnErrorCode, WorkCnSwitchResult};
+use crate::models::work_cn::{
+    WorkCnCommandError, WorkCnCreditsSummary, WorkCnErrorCode, WorkCnSwitchResult,
+};
 use crate::modules::{account, config, logger};
 
 const ACCOUNTS_INDEX_FILE: &str = "trae_accounts.json";
@@ -6300,6 +6302,158 @@ pub async fn refresh_account_usage_only_async(
     result
 }
 
+// ---------------------------------------------------------------
+// 阶段 5：积分查询与展示（仅查询，绝不签到）
+// ---------------------------------------------------------------
+
+/// Parse Work CN credit balances from the cached `trae_usage_raw` (the raw
+/// response body of `/trae/api/v2/pay/ide_user_ent_usage`).
+///
+/// Rules (开发指南 §8.4):
+/// 1. Read `user_entitlement_pack_list`.
+/// 2. Skip hidden packs (`is_hide == true`).
+/// 3. Skip explicitly inactive packs (`is_active == false` / `status` inactive).
+/// 4. Sum `entitlement_base_info.quota.credits_limit` and `usage.credits_amount`.
+/// 5. `credits_limit == -1` => infinite; any infinite pack => `unlimited=true`,
+///    `total=None`, `remaining=None`.
+/// 6. Otherwise `total`/`used` are sums and `remaining = max(total - used, 0)`.
+/// 7. If no pack carries a parseable `credits_limit`, return a no-data summary
+///    (`total=None`) so the UI shows "暂无积分数据" instead of a misleading 0.
+pub fn parse_work_cn_credits_from_usage(usage_raw: &Option<Value>) -> WorkCnCreditsSummary {
+    let no_data = WorkCnCreditsSummary {
+        total: None,
+        used: 0,
+        remaining: None,
+        unlimited: false,
+        updated_at: work_cn_credits_now_secs(),
+    };
+    let Some(raw) = usage_raw else {
+        return no_data;
+    };
+    let payload = usage_response_payload_root(raw);
+    let packs = payload
+        .get("user_entitlement_pack_list")
+        .or_else(|| raw.get("user_entitlement_pack_list"))
+        .and_then(|value| value.as_array());
+    let Some(packs) = packs else {
+        return no_data;
+    };
+
+    let mut total: i64 = 0;
+    let mut used: i64 = 0;
+    let mut unlimited = false;
+    let mut found_any = false;
+
+    for pack in packs {
+        // 2) skip hidden packs
+        if pack.get("is_hide").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        // 3) skip explicitly inactive packs
+        if pack.get("is_active").and_then(Value::as_bool) == Some(false) {
+            continue;
+        }
+        if let Some(status) = pack.get("status").and_then(Value::as_i64) {
+            if status <= 0 {
+                continue;
+            }
+        } else if let Some(status) = pack.get("status").and_then(Value::as_str) {
+            let status = status.to_ascii_lowercase();
+            if status == "inactive" || status == "disabled" || status == "expired" {
+                continue;
+            }
+        }
+
+        // 4) read quota + usage, tolerating nesting
+        let credits_limit = pick_i64(
+            Some(pack),
+            &[
+                &["entitlement_base_info", "quota", "credits_limit"],
+                &["quota", "credits_limit"],
+                &["credits_limit"],
+            ],
+        );
+        let credits_amount = pick_i64(
+            Some(pack),
+            &[&["usage", "credits_amount"], &["credits_amount"]],
+        )
+        .unwrap_or(0);
+
+        let Some(limit) = credits_limit else {
+            // rule 7: a pack without a quota limit is ignored (never counted as 0)
+            continue;
+        };
+        found_any = true;
+
+        if limit == -1 {
+            unlimited = true;
+        } else {
+            total += limit;
+            used += credits_amount;
+        }
+    }
+
+    if !found_any {
+        return no_data;
+    }
+
+    if unlimited {
+        WorkCnCreditsSummary {
+            total: None,
+            used: 0,
+            remaining: None,
+            unlimited: true,
+            updated_at: work_cn_credits_now_secs(),
+        }
+    } else {
+        WorkCnCreditsSummary {
+            total: Some(total),
+            used,
+            remaining: Some((total - used).max(0)),
+            unlimited: false,
+            updated_at: work_cn_credits_now_secs(),
+        }
+    }
+}
+
+fn work_cn_credits_now_secs() -> i64 {
+    chrono::Utc::now().timestamp()
+}
+
+/// Query the credit balance for a saved Work CN account. Query only — this never
+/// performs a local check-in / claim.
+///
+/// `force_refresh=true` calls the upstream usage-only refresh
+/// (`refresh_account_usage_only_async`), reusing the existing request chain; it
+/// must NOT call `/trae/api/v2/ug/checkin_credits/claim`. On failure (e.g. an
+/// expired access token) a structured error is returned — it never clears the
+/// local account and never blocks switching.
+pub async fn get_work_cn_credits(
+    account_id: &str,
+    force_refresh: bool,
+) -> Result<WorkCnCreditsSummary, WorkCnCommandError> {
+    let account = load_account(account_id).ok_or_else(|| {
+        WorkCnCommandError::new(WorkCnErrorCode::AccountNotFound, "账号不存在")
+    })?;
+
+    let account = if force_refresh {
+        match refresh_account_usage_only_async(account_id, None).await {
+            Ok(updated) => updated,
+            Err(err) => {
+                return Err(WorkCnCommandError::new(
+                    WorkCnErrorCode::SnapshotIncomplete,
+                    "积分查询失败：access token 可能已失效，请在官方客户端重新登录后重新导入本账号",
+                )
+                .with_detail(err));
+            }
+        }
+    } else {
+        account
+    };
+
+    Ok(parse_work_cn_credits_from_usage(&account.trae_usage_raw))
+}
+
 async fn refresh_accounts(
     accounts: Vec<TraeAccount>,
 ) -> Result<Vec<(String, Result<TraeAccount, String>)>, String> {
@@ -6346,6 +6500,7 @@ pub async fn refresh_tokens_for_platform(
 mod tests {
     use super::*;
     use crate::models::trae::TraeAccount;
+    use crate::models::work_cn::{WorkCnCommandError, WorkCnErrorCode};
 
     fn sample_account() -> TraeAccount {
         TraeAccount {
@@ -7322,7 +7477,6 @@ mod tests {
 
     // ===== 阶段 4：安全的一键切换与回滚（TDD） =====
 
-    use crate::models::work_cn::{WorkCnCommandError, WorkCnErrorCode, WorkCnSwitchResult};
     use crate::modules::trae_instance::{
         load_default_settings_for_platform, update_default_settings_for_platform,
     };
@@ -7715,5 +7869,219 @@ mod tests {
         std::env::remove_var("WORK_CN_SWITCH_SKIP_PROCESS");
         let _ = std::fs::remove_dir_all(&data_dir);
         let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    // ---------------------------------------------------------------
+    // 阶段 5：积分查询与展示（TDD）
+    // ---------------------------------------------------------------
+
+    fn make_credits_payload(uid: &str, token: &str, usage_raw: Option<Value>) -> TraeImportPayload {
+        TraeImportPayload {
+            email: format!("user-{uid}@example.com"),
+            user_id: Some(uid.to_string()),
+            nickname: None,
+            access_token: token.to_string(),
+            refresh_token: Some(format!("refresh-{token}")),
+            token_type: Some("Bearer".to_string()),
+            expires_at: None,
+            plan_type: None,
+            plan_reset_at: None,
+            trae_auth_raw: Some(serde_json::json!({
+                "platform": "trae_solo_cn",
+                "deviceKeyPair": {
+                    "privateKeyPEM": format!("priv-{token}"),
+                    "publicKeyPEM": format!("pub-{token}")
+                }
+            })),
+            trae_profile_raw: None,
+            trae_entitlement_raw: None,
+            trae_usage_raw: usage_raw,
+            trae_server_raw: None,
+            trae_usertag_raw: None,
+            checkin_device_id: Some("checkin-uuid".to_string()),
+            machine_id: Some("machine-hash".to_string()),
+            auth_device_id: Some("1132918838145530".to_string()),
+            status: None,
+            status_reason: None,
+        }
+    }
+
+    // ---- parse_work_cn_credits_from_usage（纯函数，无需账号库） ----
+
+    #[test]
+    fn work_cn_credits_normal_single_pack() {
+        let usage = serde_json::json!({
+            "code": 0,
+            "data": {
+                "user_entitlement_pack_list": [
+                    {
+                        "entitlement_base_info": { "quota": { "credits_limit": 1000 } },
+                        "usage": { "credits_amount": 250 }
+                    }
+                ]
+            }
+        });
+        let summary = super::parse_work_cn_credits_from_usage(&Some(usage));
+        assert_eq!(summary.total, Some(1000));
+        assert_eq!(summary.used, 250);
+        assert_eq!(summary.remaining, Some(750));
+        assert!(!summary.unlimited);
+    }
+
+    #[test]
+    fn work_cn_credits_multiple_packs_sum() {
+        let usage = serde_json::json!({
+            "user_entitlement_pack_list": [
+                { "entitlement_base_info": { "quota": { "credits_limit": 1000 } }, "usage": { "credits_amount": 250 } },
+                { "entitlement_base_info": { "quota": { "credits_limit": 500 } }, "usage": { "credits_amount": 100 } }
+            ]
+        });
+        let summary = super::parse_work_cn_credits_from_usage(&Some(usage));
+        assert_eq!(summary.total, Some(1500));
+        assert_eq!(summary.used, 350);
+        assert_eq!(summary.remaining, Some(1150));
+        assert!(!summary.unlimited);
+    }
+
+    #[test]
+    fn work_cn_credits_unlimited_pack() {
+        let usage = serde_json::json!({
+            "user_entitlement_pack_list": [
+                { "entitlement_base_info": { "quota": { "credits_limit": -1 } }, "usage": { "credits_amount": 500 } }
+            ]
+        });
+        let summary = super::parse_work_cn_credits_from_usage(&Some(usage));
+        assert!(summary.unlimited, "无限包应标记 unlimited");
+        assert_eq!(summary.total, None, "无限时 total 为 None");
+        assert_eq!(summary.remaining, None, "无限时 remaining 为 None");
+    }
+
+    #[test]
+    fn work_cn_credits_hidden_pack_skipped() {
+        let usage = serde_json::json!({
+            "user_entitlement_pack_list": [
+                { "is_hide": true, "entitlement_base_info": { "quota": { "credits_limit": 999 } }, "usage": { "credits_amount": 1 } },
+                { "entitlement_base_info": { "quota": { "credits_limit": 1000 } }, "usage": { "credits_amount": 250 } }
+            ]
+        });
+        let summary = super::parse_work_cn_credits_from_usage(&Some(usage));
+        assert_eq!(summary.total, Some(1000), "隐藏包必须被忽略");
+        assert_eq!(summary.used, 250);
+        assert!(!summary.unlimited);
+    }
+
+    #[test]
+    fn work_cn_credits_no_data_when_missing_field_or_empty() {
+        let none_summary = super::parse_work_cn_credits_from_usage(&None);
+        assert_eq!(none_summary.total, None);
+        assert_eq!(none_summary.used, 0);
+        assert_eq!(none_summary.remaining, None);
+        assert!(!none_summary.unlimited);
+
+        let empty = serde_json::json!({ "code": 0 });
+        let empty_summary = super::parse_work_cn_credits_from_usage(&Some(empty));
+        assert_eq!(empty_summary.total, None, "无 pack 列表应判为暂无积分数据");
+        assert!(!empty_summary.unlimited);
+    }
+
+    #[test]
+    fn work_cn_credits_pack_without_limit_is_ignored_not_zero() {
+        let usage = serde_json::json!({
+            "user_entitlement_pack_list": [
+                { "entitlement_base_info": { "quota": {} }, "usage": { "credits_amount": 10 } }
+            ]
+        });
+        let summary = super::parse_work_cn_credits_from_usage(&Some(usage));
+        assert_eq!(summary.total, None, "找不到 credits_limit 应判暂无积分数据，不能误显示 0");
+    }
+
+    #[test]
+    fn work_cn_credits_remaining_floored_at_zero() {
+        let usage = serde_json::json!({
+            "user_entitlement_pack_list": [
+                { "entitlement_base_info": { "quota": { "credits_limit": 100 } }, "usage": { "credits_amount": 150 } }
+            ]
+        });
+        let summary = super::parse_work_cn_credits_from_usage(&Some(usage));
+        assert_eq!(summary.total, Some(100));
+        assert_eq!(summary.used, 150);
+        assert_eq!(summary.remaining, Some(0), "剩余不允许为负");
+    }
+
+    #[test]
+    fn work_cn_credits_nested_under_result_payload() {
+        let usage = serde_json::json!({
+            "Result": {
+                "user_entitlement_pack_list": [
+                    { "entitlement_base_info": { "quota": { "credits_limit": 800 } }, "usage": { "credits_amount": 123 } }
+                ]
+            }
+        });
+        let summary = super::parse_work_cn_credits_from_usage(&Some(usage));
+        assert_eq!(summary.total, Some(800));
+        assert_eq!(summary.used, 123);
+    }
+
+    // ---- get_work_cn_credits 命令（仅读缓存，不联网） ----
+
+    #[tokio::test]
+    async fn work_cn_get_credits_reads_cached_usage() {
+        let _guard = WORK_CN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::modules::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let data_dir = std::env::temp_dir().join(format!(
+            "work-cn-credits-test-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).expect("temp data dir");
+        std::env::set_var("COCKPIT_TOOLS_TEST_DATA_DIR", &data_dir);
+
+        let usage = serde_json::json!({
+            "user_entitlement_pack_list": [
+                { "entitlement_base_info": { "quota": { "credits_limit": 1000 } }, "usage": { "credits_amount": 250 } }
+            ]
+        });
+        let account = super::import_work_cn_account_from_payload(
+            make_credits_payload("uid-credits", "tok-c", Some(usage)),
+            None,
+        )
+        .expect("import credits account");
+
+        let summary = super::get_work_cn_credits(&account.id, false)
+            .await
+            .expect("credits query");
+        assert_eq!(summary.total, Some(1000));
+        assert_eq!(summary.used, 250);
+        assert_eq!(summary.remaining, Some(750));
+
+        std::env::remove_var("COCKPIT_TOOLS_TEST_DATA_DIR");
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn work_cn_get_credits_unknown_account_errors() {
+        let _guard = WORK_CN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::modules::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let data_dir = std::env::temp_dir().join(format!(
+            "work-cn-credits-missing-test-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).expect("temp data dir");
+        std::env::set_var("COCKPIT_TOOLS_TEST_DATA_DIR", &data_dir);
+
+        let err = super::get_work_cn_credits("does-not-exist", false)
+            .await
+            .expect_err("未知账号应返回错误");
+        assert_eq!(err.code, crate::models::work_cn::WorkCnErrorCode::AccountNotFound);
+
+        std::env::remove_var("COCKPIT_TOOLS_TEST_DATA_DIR");
+        let _ = std::fs::remove_dir_all(&data_dir);
     }
 }

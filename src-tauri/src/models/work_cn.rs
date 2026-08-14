@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Detection result for the local TRAE Work CN install.
 ///
@@ -82,6 +82,22 @@ pub struct WorkCnSwitchResult {
     pub verified: bool,
     pub github_synced: bool,
     pub warning: Option<String>,
+}
+
+/// Work CN credit balance summary (阶段 5).
+///
+/// `total`/`remaining` are `None` when the account has no parsed entitlement
+/// data — the UI shows "暂无积分数据" and must NOT show 0. `unlimited` is true
+/// when any pack carries an infinite `-1` quota — the UI shows "无限". `remaining`
+/// is always floored at 0 (never negative).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkCnCreditsSummary {
+    pub total: Option<i64>,
+    pub used: i64,
+    pub remaining: Option<i64>,
+    pub unlimited: bool,
+    pub updated_at: i64,
 }
 
 /// Structured error codes for Work CN commands so the frontend never has to

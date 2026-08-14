@@ -6,11 +6,11 @@
 //         一键切换、积分查询等能力将在后续阶段接入。
 
 import { useEffect, useState } from 'react';
-import type { CSSProperties } from 'react';
+import type { CSSProperties, ReactElement } from 'react';
 import { getWorkCnInstallation } from '../services/workCnService';
 import { useWorkCnStore } from '../stores/useWorkCnStore';
 import { WorkCnAddAccountDialog } from '../components/work-cn/WorkCnAddAccountDialog';
-import type { WorkCnInstallation, WorkCnAccountView } from '../types/workCn';
+import type { WorkCnInstallation, WorkCnAccountView, WorkCnCreditsSummary } from '../types/workCn';
 
 const ACCOUNT_SLOT_COUNT = 4;
 
@@ -225,14 +225,52 @@ function SnapshotBadges({ account }: { account: WorkCnAccountView }) {
   );
 }
 
+function renderCredits(
+  credits: WorkCnCreditsSummary | null | undefined,
+  error: string | null | undefined,
+): ReactElement | null {
+  if (error) {
+    return <div style={warningStyle}>积分查询失败：{error}</div>;
+  }
+  if (!credits) {
+    return null;
+  }
+  if (credits.unlimited) {
+    return (
+      <div style={{ fontSize: 20, fontWeight: 700, color: '#1f2430' }}>剩余积分：无限</div>
+    );
+  }
+  if (credits.total == null) {
+    return <div style={slotStatusStyle}>剩余积分：暂无积分数据</div>;
+  }
+  return (
+    <>
+      <div style={{ fontSize: 20, fontWeight: 700, color: '#1f2430' }}>
+        剩余 {credits.remaining} 积分
+      </div>
+      <div style={slotStatusStyle}>
+        已用 {credits.used} / 总 {credits.total}
+      </div>
+    </>
+  );
+}
+
 function AccountCard({
   account,
+  credits,
+  creditsError,
   switching,
+  refreshingCredits,
   onSwitch,
+  onRefreshCredits,
 }: {
   account: WorkCnAccountView;
+  credits: WorkCnCreditsSummary | null;
+  creditsError: string | null;
   switching: boolean;
+  refreshingCredits: boolean;
   onSwitch: () => void;
+  onRefreshCredits: () => void;
 }) {
   const title = account.tags?.length
     ? account.tags[0]
@@ -245,11 +283,12 @@ function AccountCard({
         {account.validForSwitch ? '快照完整 · 可切换' : '快照不完整 · 不可切换'}
         {account.userId ? ` · ${account.userId}` : ''}
       </div>
+      {renderCredits(credits, creditsError)}
       <SnapshotBadges account={account} />
       {account.warnings.length ? (
         <div style={warningStyle}>{account.warnings.join('；')}</div>
       ) : null}
-      <div style={{ marginTop: 'auto' }}>
+      <div style={{ marginTop: 'auto', display: 'flex', gap: 8 }}>
         <button
           type="button"
           style={account.validForSwitch ? primaryButtonStyle : buttonStyle}
@@ -262,6 +301,15 @@ function AccountCard({
           }
         >
           {switching ? '切换中…' : account.validForSwitch ? '切换并打开' : '快照不完整'}
+        </button>
+        <button
+          type="button"
+          style={buttonStyle}
+          disabled={refreshingCredits || switching}
+          onClick={onRefreshCredits}
+          title="仅查询积分，绝不签到"
+        >
+          {refreshingCredits ? '查询中…' : '刷新积分'}
         </button>
       </div>
     </div>
@@ -297,6 +345,10 @@ export function WorkCnSwitcherPage() {
   const lastImportWarning = useWorkCnStore((s) => s.lastImportWarning);
   const switchingId = useWorkCnStore((s) => s.switchingId);
   const switchTo = useWorkCnStore((s) => s.switchTo);
+  const creditsById = useWorkCnStore((s) => s.creditsById);
+  const creditsErrorById = useWorkCnStore((s) => s.creditsErrorById);
+  const refreshingCreditsId = useWorkCnStore((s) => s.refreshingCreditsId);
+  const refreshCredits = useWorkCnStore((s) => s.refreshCredits);
 
   useEffect(() => {
     let cancelled = false;
@@ -382,8 +434,12 @@ export function WorkCnSwitcherPage() {
             <AccountCard
               key={account.id}
               account={account}
+              credits={creditsById[account.id] ?? null}
+              creditsError={creditsErrorById[account.id] ?? null}
               switching={switchingId === account.id}
+              refreshingCredits={refreshingCreditsId === account.id}
               onSwitch={() => void switchTo(account.id)}
+              onRefreshCredits={() => void refreshCredits(account.id)}
             />
           ))}
           {Array.from({ length: emptySlots }, (_, index) => (
