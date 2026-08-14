@@ -518,7 +518,7 @@ export function WorkCnSwitcherPage() {
               githubSync={githubSyncResultById[account.id] ?? null}
               githubSyncing={githubSyncingById[account.id] ?? false}
               onSwitch={() => void switchTo(account.id)}
-              onRefreshCredits={() => void refreshCredits(account.id)}
+              onRefreshCredits={() => void refreshCredits(account.id, true)}
               onSyncGitHub={() => void syncGitHub(account.id)}
             />
           ))}

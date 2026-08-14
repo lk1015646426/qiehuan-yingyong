@@ -118,6 +118,9 @@ export const useWorkCnStore = create<WorkCnState>((set, get) => ({
             : null,
         };
       });
+      // 导入成功后立即联网查询一次积分（仅查用量接口，绝不签到/领取），
+      // 否则新账号无缓存，界面只会显示“暂无积分数据”。
+      void get().refreshCredits(account.id, true);
     } catch (err) {
       set({
         error: err instanceof Error ? err.message : String(err),
