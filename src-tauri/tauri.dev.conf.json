@@ -1,16 +1,16 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Cockpit Tools Dev",
-  "identifier": "com.jlcodes.cockpit-tools.dev",
+  "productName": "TRAE Work CN 账号切换器 Dev",
+  "identifier": "com.lk.trae-work-cn-switcher.dev",
   "app": {
     "windows": [
       {
         "label": "main",
-        "title": "Cockpit Tools Dev",
-        "width": 1280,
-        "height": 800,
-        "minWidth": 900,
-        "minHeight": 600,
+        "title": "TRAE Work CN 账号切换器 Dev",
+        "width": 960,
+        "height": 680,
+        "minWidth": 820,
+        "minHeight": 560,
         "center": true,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
@@ -19,7 +19,7 @@
       },
       {
         "label": "floating-card",
-        "title": "Cockpit Tools Dev",
+        "title": "TRAE Work CN 账号切换器 Dev",
         "create": false,
         "width": 250,
         "height": 290,

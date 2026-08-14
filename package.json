@@ -1,7 +1,7 @@
 {
-  "name": "cockpit-tools",
+  "name": "trae-work-cn-switcher",
   "private": true,
-  "version": "1.3.16",
+  "version": "0.1.0",
   "type": "module",
   "scripts": {
     "dev": "vite",

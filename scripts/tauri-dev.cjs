@@ -22,7 +22,7 @@ function resolveMacosSdkRoot() {
 
 const env = {
   ...process.env,
-  COCKPIT_TOOLS_PROFILE: process.env.COCKPIT_TOOLS_PROFILE || 'dev',
+  TRAE_WORK_CN_SWITCHER_PROFILE: process.env.TRAE_WORK_CN_SWITCHER_PROFILE || 'dev',
   COCKPIT_TOOLS_API_PORT: process.env.COCKPIT_TOOLS_API_PORT || '1456',
   VITE_COCKPIT_TOOLS_PROFILE: process.env.VITE_COCKPIT_TOOLS_PROFILE || 'dev',
 };
@@ -32,22 +32,36 @@ if (macosSdkRoot) {
 }
 const extraArgs = process.argv.slice(2);
 
-const syncResult = spawnSync('npm', ['run', 'sync-version'], {
-  stdio: 'inherit',
-  env,
-});
+const syncResult = spawnSync(
+  process.platform === 'win32' ? 'npm.cmd' : 'npm',
+  ['run', 'sync-version'],
+  {
+    stdio: 'inherit',
+    env,
+    shell: process.platform === 'win32',
+  },
+);
+
+if (syncResult.error) {
+  throw syncResult.error;
+}
 
 if (syncResult.status !== 0) {
   process.exit(syncResult.status ?? 1);
 }
 
 const tauriResult = spawnSync(
-  'tauri',
-  ['dev', '--config', 'src-tauri/tauri.dev.conf.json', ...extraArgs],
+  process.platform === 'win32' ? 'npx.cmd' : 'npx',
+  ['tauri', 'dev', '--config', 'src-tauri/tauri.dev.conf.json', ...extraArgs],
   {
     stdio: 'inherit',
     env,
+    shell: process.platform === 'win32',
   },
 );
+
+if (tauriResult.error) {
+  throw tauriResult.error;
+}
 
 process.exit(tauriResult.status ?? 1);

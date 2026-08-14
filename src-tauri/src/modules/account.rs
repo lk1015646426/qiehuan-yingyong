@@ -27,11 +27,11 @@ static LIST_ACCOUNTS_LOAD_LOCK: std::sync::LazyLock<Mutex<()>> =
 const QUOTA_ALERT_COOLDOWN_SECONDS: i64 = 300;
 const LIST_ACCOUNTS_CACHE_TTL_MS: u64 = 800;
 
-// 使用与 AntigravityCockpit 插件相同的数据目录
-const DATA_DIR: &str = ".antigravity_cockpit";
-const DEV_DATA_DIR: &str = ".antigravity_cockpit_dev";
-const DATA_DIR_ENV: &str = "COCKPIT_TOOLS_DATA_DIR";
-const PROFILE_ENV: &str = "COCKPIT_TOOLS_PROFILE";
+// TRAE Work CN 专用数据目录：禁止与原 Cockpit Tools 共用账号库和加密密钥。
+const DATA_DIR: &str = ".trae_work_cn_switcher";
+const DEV_DATA_DIR: &str = ".trae_work_cn_switcher_dev";
+const DATA_DIR_ENV: &str = "TRAE_WORK_CN_SWITCHER_DATA_DIR";
+const PROFILE_ENV: &str = "TRAE_WORK_CN_SWITCHER_PROFILE";
 
 const ACCOUNTS_INDEX: &str = "accounts.json";
 const ACCOUNTS_DIR: &str = "accounts";
@@ -234,6 +234,10 @@ fn deserialize_account_from_storage(
 
 /// 获取数据目录路径
 pub fn is_dev_profile() -> bool {
+    if cfg!(debug_assertions) {
+        return true;
+    }
+
     std::env::var(PROFILE_ENV)
         .map(|value| value.trim().eq_ignore_ascii_case("dev"))
         .unwrap_or(false)
@@ -258,12 +262,22 @@ pub fn resolve_data_dir() -> Result<PathBuf, String> {
 
 pub fn get_data_dir() -> Result<PathBuf, String> {
     // #816: tests can isolate storage via env without touching real user data.
-    // Prefer COCKPIT_TOOLS_TEST_DATA_DIR (community PR name); keep COCKPIT_TEST_DATA_DIR alias.
-    for key in [
+    // Production builds only accept this application's overrides. Test builds retain
+    // the upstream aliases so the inherited suite stays isolated from real user data.
+    #[cfg(test)]
+    let override_keys = [
+        "TRAE_WORK_CN_SWITCHER_TEST_DATA_DIR",
+        "TRAE_WORK_CN_SWITCHER_DATA_DIR",
         "COCKPIT_TOOLS_TEST_DATA_DIR",
         "COCKPIT_TEST_DATA_DIR",
-        "COCKPIT_TOOLS_DATA_DIR",
-    ] {
+    ];
+    #[cfg(not(test))]
+    let override_keys = [
+        "TRAE_WORK_CN_SWITCHER_TEST_DATA_DIR",
+        "TRAE_WORK_CN_SWITCHER_DATA_DIR",
+    ];
+
+    for key in override_keys {
         if let Ok(override_dir) = std::env::var(key) {
             let override_dir = override_dir.trim();
             if !override_dir.is_empty() {
