@@ -31,16 +31,12 @@ chrono = "0.4"
 dirs = "5.0"
 reqwest = { version = "0.12", features = ["json", "gzip", "brotli", "deflate", "zstd", "stream", "socks", "blocking"] }
 quick-xml = "0.40"
-# 为 tauri-plugin-updater 所依赖的 reqwest 0.13 合并 socks 特性，
-# 使 updater 链路在全局代理配置为 socks5:// 时可正常发起请求。
-reqwest_updater_socks = { package = "reqwest", version = "0.13", default-features = false, features = ["socks"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "time"] }
 tracing-appender = "0.2"
 tracing-log = "0.2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 base64 = "0.22"
-minisign-verify = "0.2"
 tokio = { version = "1", features = ["full"] }
 tokio-rustls = "0.26"
 rustls = "0.23"
@@ -59,15 +55,12 @@ rand = "0.8"
 futures = "0.3"
 sysinfo = "0.33"
 libc = "0.2"
-tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
 futures-util = "0.3"
 md5 = "0.7"
 tiny_http = "0.12"
 urlencoding = "2.1"
 lazy_static = "1.5"
 trash = "5"
-reqwest_dav = "0.3.3"
-zip = { version = "4.6.1", default-features = false, features = ["deflate"] }
 
 # VS Code Copilot token injection (Windows only)
 aes-gcm = "0.10"
@@ -95,4 +88,3 @@ objc2-app-kit = "0.3.2"
 
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 tauri-plugin-process = "2.3.1"
-tauri-plugin-updater = "2.10.0"

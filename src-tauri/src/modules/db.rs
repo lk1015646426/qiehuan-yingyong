@@ -3,39 +3,6 @@ use base64::{engine::general_purpose, Engine as _};
 use rusqlite::{Connection, Error as SqliteError, ErrorCode, OptionalExtension};
 use std::path::{Path, PathBuf};
 
-/// 获取 Antigravity IDE 数据库路径
-pub fn get_db_path() -> Result<PathBuf, String> {
-    #[cfg(target_os = "macos")]
-    {
-        let home = dirs::home_dir().ok_or("无法获取 Home 目录")?;
-        let path =
-            home.join("Library/Application Support/Antigravity IDE/User/globalStorage/state.vscdb");
-        if path.exists() {
-            return Ok(path);
-        }
-        return Err(format!("数据库文件不存在: {:?}", path));
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let path = crate::modules::antigravity_paths::state_db_path()?;
-        if path.exists() {
-            return Ok(path);
-        }
-        return Err(format!("数据库文件不存在: {:?}", path));
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let home = dirs::home_dir().ok_or("无法获取 Home 目录")?;
-        let path = home.join(".config/Antigravity IDE/User/globalStorage/state.vscdb");
-        if path.exists() {
-            return Ok(path);
-        }
-        return Err(format!("数据库文件不存在: {:?}", path));
-    }
-}
-
 pub fn is_unusable_sqlite_database_error(error: &SqliteError) -> bool {
     matches!(
         error.sqlite_error_code(),
@@ -225,20 +192,5 @@ fn clear_enterprise_project_preference(conn: &Connection) -> Result<(), String> 
         ["antigravityUnifiedStateSync.enterprisePreferences"],
     )
     .map_err(|e| format!("清理 Enterprise Preference 失败: {}", e))?;
-    Ok(())
-}
-
-/// 写入 serviceMachineId 到数据库
-pub fn write_service_machine_id(service_machine_id: &str) -> Result<(), String> {
-    let db_path = get_db_path()?;
-    let conn = Connection::open(&db_path).map_err(|e| format!("打开数据库失败: {}", e))?;
-
-    conn.execute(
-        "INSERT OR REPLACE INTO ItemTable (key, value) VALUES (?, ?)",
-        ["storage.serviceMachineId", service_machine_id],
-    )
-    .map_err(|e| format!("写入 serviceMachineId 失败: {}", e))?;
-
-    crate::modules::logger::log_info(&format!("serviceMachineId 已写入: {}", service_machine_id));
     Ok(())
 }

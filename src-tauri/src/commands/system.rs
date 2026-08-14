@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -8,15 +7,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use tauri::Manager;
 use tauri_plugin_autostart::ManagerExt as _;
-use url::Url;
 
 use crate::modules;
 use crate::modules::config::{
     self, CloseWindowBehavior, MinimizeWindowBehavior, TrayIconStyle, UserConfig,
     DEFAULT_REPORT_PORT, DEFAULT_WS_PORT,
 };
-use crate::modules::web_report;
-use crate::modules::websocket;
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
@@ -336,20 +332,6 @@ pub struct GeneralConfig {
     pub workbuddy_quota_alert_threshold: i32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AntigravityInstalledVersionInfo {
-    pub product_name: String,
-    pub version: String,
-    pub app_path: String,
-    pub source: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AntigravityVersionScanMode {
-    Quick,
-    Full,
-}
-
 /// 自动备份设置（前端使用）
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutoBackupSettings {
@@ -399,594 +381,12 @@ pub struct AutoBackupPlatformEntry {
     pub account_count: u64,
 }
 
-/// WebDAV 备份同步设置（前端使用）
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WebdavSyncSettings {
-    /// 是否启用自动同步
-    pub enabled: bool,
-    /// WebDAV 服务地址
-    pub url: String,
-    /// WebDAV 用户名
-    pub username: String,
-    /// 本地配置中是否已保存密码
-    pub has_password: bool,
-    /// WebDAV 远端备份目录
-    pub remote_dir: String,
-    /// 最近一次上传时间
-    pub last_upload_at: Option<String>,
-    /// 最近一次上传文件名
-    pub last_upload_file_name: Option<String>,
-    /// 最近一次下载时间
-    pub last_download_at: Option<String>,
-    /// 最近一次下载文件名
-    pub last_download_file_name: Option<String>,
-    /// 备份保留天数
-    pub retention_days: i32,
-}
-
 const DEFAULT_UI_SCALE: f64 = 1.0;
 const MIN_UI_SCALE: f64 = 0.8;
 const MAX_UI_SCALE: f64 = 2.0;
 const MAX_STARTUP_WAKEUP_DELAY_SECONDS: i32 = 24 * 60 * 60;
-const ANTIGRAVITY_VERSION_BADGE_TIMEOUT_MS: u64 = 1200;
-const ANTIGRAVITY_VERSION_FULL_SCAN_TIMEOUT_MS: u64 = 30_000;
 const AUTO_SWITCH_ACCOUNT_SCOPE_ALL: &str = "all_accounts";
 const AUTO_SWITCH_ACCOUNT_SCOPE_SELECTED: &str = "selected_accounts";
-static ANTIGRAVITY_VERSION_INFO_CACHE: OnceLock<
-    Mutex<HashMap<String, AntigravityInstalledVersionInfo>>,
-> = OnceLock::new();
-
-fn trim_non_empty(value: &str) -> Option<String> {
-    let trimmed = value.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(trimmed.to_string())
-    }
-}
-
-fn json_string_field(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
-    keys.iter().find_map(|key| {
-        value
-            .get(*key)
-            .and_then(serde_json::Value::as_str)
-            .and_then(trim_non_empty)
-    })
-}
-
-#[cfg(target_os = "macos")]
-fn normalize_macos_app_root_for_metadata(path: &Path) -> Option<PathBuf> {
-    let path_str = path.to_string_lossy();
-    let app_idx = path_str.find(".app")?;
-    let root = PathBuf::from(&path_str[..app_idx + 4]);
-    root.exists().then_some(root)
-}
-
-#[cfg(target_os = "macos")]
-fn read_macos_plist_string(path: &Path, key: &str) -> Option<String> {
-    let output = std::process::Command::new("plutil")
-        .arg("-p")
-        .arg(path)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-
-    let prefix = format!("\"{}\"", key);
-    let text = String::from_utf8_lossy(&output.stdout);
-    for line in text.lines() {
-        let line = line.trim();
-        if !line.starts_with(&prefix) {
-            continue;
-        }
-        let value = line.split("=>").nth(1)?.trim().trim_matches('"');
-        if !value.is_empty() {
-            return Some(value.to_string());
-        }
-    }
-    None
-}
-
-fn antigravity_product_json_candidates(root: &Path) -> Vec<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        vec![
-            root.join("Contents")
-                .join("Resources")
-                .join("app")
-                .join("product.json"),
-            root.join("resources").join("app").join("product.json"),
-            root.join("app").join("product.json"),
-        ]
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        vec![
-            root.join("resources").join("app").join("product.json"),
-            root.join("app").join("product.json"),
-        ]
-    }
-}
-
-fn read_antigravity_product_json_metadata(root: &Path) -> Option<AntigravityInstalledVersionInfo> {
-    for path in antigravity_product_json_candidates(root) {
-        let Ok(content) = fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&content) else {
-            continue;
-        };
-        let Some(version) = json_string_field(&value, &["ideVersion", "version"]) else {
-            continue;
-        };
-        let product_name = json_string_field(
-            &value,
-            &["nameShort", "nameLong", "productName", "applicationName"],
-        )
-        .unwrap_or_else(|| "Antigravity".to_string());
-        return Some(AntigravityInstalledVersionInfo {
-            product_name,
-            version,
-            app_path: root.to_string_lossy().to_string(),
-            source: "product.json".to_string(),
-        });
-    }
-    None
-}
-
-#[cfg(target_os = "macos")]
-fn read_antigravity_macos_bundle_metadata(root: &Path) -> Option<AntigravityInstalledVersionInfo> {
-    let plist_path = root.join("Contents").join("Info.plist");
-    if !plist_path.exists() {
-        return None;
-    }
-
-    let version = read_macos_plist_string(&plist_path, "CFBundleShortVersionString")
-        .or_else(|| read_macos_plist_string(&plist_path, "CFBundleVersion"))?;
-    let product_name = read_macos_plist_string(&plist_path, "CFBundleDisplayName")
-        .or_else(|| read_macos_plist_string(&plist_path, "CFBundleName"))
-        .unwrap_or_else(|| "Antigravity".to_string());
-
-    Some(AntigravityInstalledVersionInfo {
-        product_name,
-        version,
-        app_path: root.to_string_lossy().to_string(),
-        source: "Info.plist".to_string(),
-    })
-}
-
-#[cfg(target_os = "windows")]
-fn find_antigravity_windows_exe(root: &Path) -> Option<PathBuf> {
-    if root.is_file() {
-        return Some(root.to_path_buf());
-    }
-
-    let candidates = [
-        root.join("Antigravity.exe"),
-        root.join("Antigravity IDE.exe"),
-        root.join("antigravity.exe"),
-        root.join("antigravity-ide.exe"),
-        root.join("Electron.exe"),
-    ];
-    candidates.into_iter().find(|path| path.exists())
-}
-
-#[cfg(target_os = "windows")]
-fn read_powershell_json_for_antigravity_exe(
-    exe_path: &Path,
-    script: &str,
-) -> Option<serde_json::Value> {
-    let _spawn_guard = modules::app_lifecycle::acquire_process_spawn_guard("PowerShell").ok()?;
-    let mut command = std::process::Command::new("powershell");
-    {
-        use std::os::windows::process::CommandExt;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-
-    let output = command
-        .args([
-            "-NoProfile",
-            "-NonInteractive",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-Command",
-            script,
-        ])
-        .env("COCKPIT_ANTIGRAVITY_EXE_PATH", exe_path.as_os_str())
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        modules::logger::log_warn(&format!(
-            "[Antigravity] Windows version metadata PowerShell probe failed: status={}",
-            output.status
-        ));
-        return None;
-    }
-
-    serde_json::from_slice::<serde_json::Value>(&output.stdout).ok()
-}
-
-#[cfg(target_os = "windows")]
-fn build_antigravity_windows_version_info(
-    value: serde_json::Value,
-    exe_path: &Path,
-    source: &str,
-) -> Option<AntigravityInstalledVersionInfo> {
-    let version = json_string_field(&value, &["ProductVersion", "FileVersion", "DisplayVersion"])?;
-    let product_name = json_string_field(&value, &["ProductName", "DisplayName"])
-        .unwrap_or_else(|| "Antigravity".to_string());
-
-    Some(AntigravityInstalledVersionInfo {
-        product_name,
-        version,
-        app_path: exe_path.to_string_lossy().to_string(),
-        source: source.to_string(),
-    })
-}
-
-#[cfg(target_os = "windows")]
-fn read_antigravity_windows_uninstall_metadata(
-    exe_path: &Path,
-) -> Option<AntigravityInstalledVersionInfo> {
-    let script = r#"
-$ErrorActionPreference = 'Stop'
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$OutputEncoding = [System.Text.Encoding]::UTF8
-
-function Normalize-RegistryPath([string]$value) {
-  if ([string]::IsNullOrWhiteSpace($value)) { return $null }
-  $clean = $value.Trim().Trim('"')
-  $clean = $clean -replace ',\d+$',''
-  try { return [System.IO.Path]::GetFullPath($clean) } catch { return $clean }
-}
-
-$exe = [Environment]::GetEnvironmentVariable('COCKPIT_ANTIGRAVITY_EXE_PATH', 'Process')
-if ([string]::IsNullOrWhiteSpace($exe)) { exit 3 }
-$exe = [System.IO.Path]::GetFullPath($exe)
-
-$roots = @(
-  'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
-  'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
-  'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
-)
-
-$match = Get-ItemProperty -Path $roots -ErrorAction SilentlyContinue |
-  Where-Object {
-    $_.DisplayName -like 'Antigravity*' -and (
-      ((Normalize-RegistryPath $_.DisplayIcon) -ieq $exe) -or
-      ($_.InstallLocation -and $exe.StartsWith(
-        (Normalize-RegistryPath $_.InstallLocation).TrimEnd('\') + '\',
-        [System.StringComparison]::OrdinalIgnoreCase
-      ))
-    )
-  } |
-  Select-Object -First 1
-
-if (-not $match) { exit 4 }
-
-[pscustomobject]@{
-  DisplayName = $match.DisplayName
-  DisplayVersion = $match.DisplayVersion
-} | ConvertTo-Json -Compress
-"#;
-
-    let value = read_powershell_json_for_antigravity_exe(exe_path, script)?;
-    build_antigravity_windows_version_info(value, exe_path, "UninstallRegistry")
-}
-
-#[cfg(target_os = "windows")]
-fn read_antigravity_windows_exe_metadata(root: &Path) -> Option<AntigravityInstalledVersionInfo> {
-    let exe_path = find_antigravity_windows_exe(root)?;
-    let script = r#"
-$ErrorActionPreference = 'Stop'
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-$OutputEncoding = [System.Text.Encoding]::UTF8
-$p = [Environment]::GetEnvironmentVariable('COCKPIT_ANTIGRAVITY_EXE_PATH', 'Process')
-if ([string]::IsNullOrWhiteSpace($p)) { exit 3 }
-if (-not (Test-Path -LiteralPath $p -PathType Leaf)) { exit 2 }
-$v = (Get-Item -LiteralPath $p).VersionInfo
-if ([string]::IsNullOrWhiteSpace($v.ProductVersion) -and [string]::IsNullOrWhiteSpace($v.FileVersion)) { exit 4 }
-[pscustomobject]@{
-  ProductName = $v.ProductName
-  ProductVersion = $v.ProductVersion
-  FileVersion = $v.FileVersion
-} | ConvertTo-Json -Compress
-"#;
-
-    read_powershell_json_for_antigravity_exe(&exe_path, script)
-        .and_then(|value| build_antigravity_windows_version_info(value, &exe_path, "VersionInfo"))
-        .or_else(|| read_antigravity_windows_uninstall_metadata(&exe_path))
-}
-
-fn normalize_antigravity_metadata_root(path: &Path) -> Option<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        if let Some(root) = normalize_macos_app_root_for_metadata(path) {
-            return Some(root);
-        }
-    }
-
-    if path.is_file() {
-        return path.parent().map(Path::to_path_buf);
-    }
-    if path.is_dir() {
-        return Some(path.to_path_buf());
-    }
-    None
-}
-
-fn push_unique_antigravity_candidate(candidates: &mut Vec<PathBuf>, path: PathBuf) {
-    let normalized_key = path.to_string_lossy().to_ascii_lowercase();
-    let exists = candidates
-        .iter()
-        .any(|item| item.to_string_lossy().to_ascii_lowercase() == normalized_key);
-    if !exists {
-        candidates.push(path);
-    }
-}
-
-fn normalize_antigravity_metadata_target(target: Option<&str>) -> Option<&'static str> {
-    match target.unwrap_or("").trim().to_ascii_lowercase().as_str() {
-        "antigravity" => Some("antigravity"),
-        "antigravity_ide" | "antigravity-ide" | "ide" => Some("antigravity_ide"),
-        _ => None,
-    }
-}
-
-fn normalize_antigravity_version_scan_mode(raw: Option<&str>) -> AntigravityVersionScanMode {
-    match raw.unwrap_or("").trim().to_ascii_lowercase().as_str() {
-        "full" | "complete" => AntigravityVersionScanMode::Full,
-        _ => AntigravityVersionScanMode::Quick,
-    }
-}
-
-fn antigravity_version_cache() -> &'static Mutex<HashMap<String, AntigravityInstalledVersionInfo>> {
-    ANTIGRAVITY_VERSION_INFO_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn antigravity_version_cache_key(target: Option<&str>) -> String {
-    normalize_antigravity_metadata_target(target)
-        .unwrap_or("all")
-        .to_string()
-}
-
-fn cache_antigravity_installed_version_info(
-    target: Option<&str>,
-    info: &AntigravityInstalledVersionInfo,
-) {
-    if let Ok(mut cache) = antigravity_version_cache().lock() {
-        cache.insert(antigravity_version_cache_key(target), info.clone());
-    }
-}
-
-pub fn get_cached_antigravity_installed_version_info_for_target(
-    target: Option<&str>,
-) -> Option<AntigravityInstalledVersionInfo> {
-    antigravity_version_cache()
-        .lock()
-        .ok()
-        .and_then(|cache| cache.get(&antigravity_version_cache_key(target)).cloned())
-}
-
-fn antigravity_metadata_root_matches_target(root: &Path, target: Option<&str>) -> bool {
-    let Some(target) = normalize_antigravity_metadata_target(target) else {
-        return true;
-    };
-    let value = root.to_string_lossy().to_ascii_lowercase();
-    match target {
-        "antigravity" => {
-            value.contains("antigravity.app")
-                || value.ends_with("antigravity")
-                || value.ends_with("antigravity.exe")
-                || (root.is_dir()
-                    && (root.join("Antigravity.exe").exists()
-                        || root.join("antigravity.exe").exists()))
-        }
-        "antigravity_ide" => {
-            value.contains("antigravity ide.app")
-                || value.contains("antigravity ide")
-                || value.contains("antigravity-ide")
-                || (root.is_dir()
-                    && (root.join("Antigravity IDE.exe").exists()
-                        || root.join("antigravity-ide.exe").exists()))
-        }
-        _ => true,
-    }
-}
-
-fn antigravity_metadata_candidates(
-    target: Option<&str>,
-    scan_mode: AntigravityVersionScanMode,
-) -> Vec<PathBuf> {
-    #[cfg(not(target_os = "windows"))]
-    let _ = scan_mode;
-
-    let mut candidates = Vec::new();
-    let config_path = config::get_user_config().antigravity_app_path;
-    let config_path = config_path.trim();
-    if !config_path.is_empty() {
-        let config_path = Path::new(config_path);
-        if let Some(root) = normalize_antigravity_metadata_root(config_path) {
-            if antigravity_metadata_root_matches_target(&root, target) {
-                push_unique_antigravity_candidate(&mut candidates, root);
-            }
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        let paths: &[&str] = match normalize_antigravity_metadata_target(target) {
-            Some("antigravity") => &["/Applications/Antigravity.app"],
-            Some("antigravity_ide") => &["/Applications/Antigravity IDE.app"],
-            _ => &[
-                "/Applications/Antigravity.app",
-                "/Applications/Antigravity IDE.app",
-            ],
-        };
-        for path in paths {
-            let path = PathBuf::from(path);
-            if path.exists() {
-                push_unique_antigravity_candidate(&mut candidates, path);
-            }
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        let paths: &[&str] = match normalize_antigravity_metadata_target(target) {
-            Some("antigravity") => &["/usr/share/antigravity", "/opt/antigravity"],
-            Some("antigravity_ide") => &["/usr/share/antigravity-ide", "/opt/antigravity-ide"],
-            _ => &[
-                "/usr/share/antigravity",
-                "/usr/share/antigravity-ide",
-                "/opt/antigravity",
-                "/opt/antigravity-ide",
-            ],
-        };
-        for path in paths {
-            let path = PathBuf::from(path);
-            if path.exists() {
-                push_unique_antigravity_candidate(&mut candidates, path);
-            }
-        }
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        let mut roots: Vec<PathBuf> = Vec::new();
-        if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
-            let base = PathBuf::from(local_appdata).join("Programs");
-            match normalize_antigravity_metadata_target(target) {
-                Some("antigravity") => roots.push(base.join("Antigravity")),
-                Some("antigravity_ide") => roots.push(base.join("Antigravity IDE")),
-                _ => {
-                    roots.push(base.join("Antigravity"));
-                    roots.push(base.join("Antigravity IDE"));
-                }
-            }
-        }
-        if let Ok(program_files) = std::env::var("PROGRAMFILES") {
-            let base = PathBuf::from(program_files);
-            match normalize_antigravity_metadata_target(target) {
-                Some("antigravity") => roots.push(base.join("Antigravity")),
-                Some("antigravity_ide") => roots.push(base.join("Antigravity IDE")),
-                _ => {
-                    roots.push(base.join("Antigravity"));
-                    roots.push(base.join("Antigravity IDE"));
-                }
-            }
-        }
-        if let Ok(program_files_x86) = std::env::var("PROGRAMFILES(X86)") {
-            let base = PathBuf::from(program_files_x86);
-            match normalize_antigravity_metadata_target(target) {
-                Some("antigravity") => roots.push(base.join("Antigravity")),
-                Some("antigravity_ide") => roots.push(base.join("Antigravity IDE")),
-                _ => {
-                    roots.push(base.join("Antigravity"));
-                    roots.push(base.join("Antigravity IDE"));
-                }
-            }
-        }
-        for path in roots {
-            if path.exists() {
-                push_unique_antigravity_candidate(&mut candidates, path);
-            }
-        }
-
-        if scan_mode == AntigravityVersionScanMode::Full {
-            let push_detected_candidate = |candidates: &mut Vec<PathBuf>, path: PathBuf| {
-                if let Some(root) = normalize_antigravity_metadata_root(&path) {
-                    if antigravity_metadata_root_matches_target(&root, target) {
-                        push_unique_antigravity_candidate(candidates, root);
-                    }
-                }
-            };
-
-            match normalize_antigravity_metadata_target(target) {
-                Some("antigravity") => {
-                    if let Some(path) =
-                        crate::modules::process::detect_antigravity_legacy_exec_path()
-                    {
-                        push_detected_candidate(&mut candidates, path);
-                    }
-                }
-                Some("antigravity_ide") => {
-                    if let Some(path) = crate::modules::process::detect_antigravity_exec_path() {
-                        push_detected_candidate(&mut candidates, path);
-                    }
-                }
-                _ => {
-                    if let Some(path) =
-                        crate::modules::process::detect_antigravity_legacy_exec_path()
-                    {
-                        push_detected_candidate(&mut candidates, path);
-                    }
-                    if let Some(path) = crate::modules::process::detect_antigravity_exec_path() {
-                        push_detected_candidate(&mut candidates, path);
-                    }
-                }
-            }
-        }
-    }
-
-    candidates
-}
-
-fn resolve_antigravity_installed_version_info_for_target_with_mode(
-    target: Option<&str>,
-    scan_mode: AntigravityVersionScanMode,
-) -> Option<AntigravityInstalledVersionInfo> {
-    for root in antigravity_metadata_candidates(target, scan_mode) {
-        if let Some(info) = read_antigravity_product_json_metadata(&root) {
-            return Some(info);
-        }
-
-        #[cfg(target_os = "macos")]
-        if let Some(info) = read_antigravity_macos_bundle_metadata(&root) {
-            return Some(info);
-        }
-
-        #[cfg(target_os = "windows")]
-        if scan_mode == AntigravityVersionScanMode::Full {
-            if let Some(info) = read_antigravity_windows_exe_metadata(&root) {
-                return Some(info);
-            }
-        }
-    }
-
-    None
-}
-
-fn detect_and_cache_antigravity_installed_version_info_for_target(
-    target: Option<&str>,
-    scan_mode: AntigravityVersionScanMode,
-) -> Option<AntigravityInstalledVersionInfo> {
-    let info = resolve_antigravity_installed_version_info_for_target_with_mode(target, scan_mode);
-    if let Some(ref value) = info {
-        cache_antigravity_installed_version_info(target, value);
-    }
-    info
-}
-
-pub fn resolve_antigravity_installed_version_info_for_target(
-    target: Option<&str>,
-) -> Option<AntigravityInstalledVersionInfo> {
-    detect_and_cache_antigravity_installed_version_info_for_target(
-        target,
-        AntigravityVersionScanMode::Full,
-    )
-}
-
-fn resolve_antigravity_installed_version_info_quick_for_target(
-    target: Option<&str>,
-) -> Option<AntigravityInstalledVersionInfo> {
-    detect_and_cache_antigravity_installed_version_info_for_target(
-        target,
-        AntigravityVersionScanMode::Quick,
-    )
-}
 
 fn sanitize_startup_wakeup_delay_seconds(raw: i32) -> i32 {
     raw.clamp(0, MAX_STARTUP_WAKEUP_DELAY_SECONDS)
@@ -1410,63 +810,6 @@ fn build_auto_backup_settings(config: &UserConfig) -> Result<AutoBackupSettings,
         last_backup_at: config.auto_backup_last_backup_at.clone(),
         directory_path: get_auto_backup_dir_path()?.to_string_lossy().to_string(),
     })
-}
-
-fn build_webdav_sync_settings(config: &UserConfig) -> WebdavSyncSettings {
-    let url = modules::webdav_sync::normalize_base_url(&config.webdav_sync_url)
-        .unwrap_or_else(|_| config::default_webdav_sync_url());
-    let remote_dir = modules::webdav_sync::normalize_remote_dir(&config.webdav_sync_remote_dir)
-        .unwrap_or_else(|_| config::default_webdav_sync_remote_dir());
-
-    WebdavSyncSettings {
-        enabled: config.webdav_sync_enabled,
-        url,
-        username: config.webdav_sync_username.clone(),
-        has_password: !config.webdav_sync_password.is_empty(),
-        remote_dir,
-        last_upload_at: config.webdav_sync_last_upload_at.clone(),
-        last_upload_file_name: config.webdav_sync_last_upload_file_name.clone(),
-        last_download_at: config.webdav_sync_last_download_at.clone(),
-        last_download_file_name: config.webdav_sync_last_download_file_name.clone(),
-        retention_days: config.webdav_sync_retention_days,
-    }
-}
-
-fn resolve_webdav_password_update(
-    current_password: &str,
-    password: Option<String>,
-    clear_password: Option<bool>,
-) -> String {
-    if clear_password.unwrap_or(false) {
-        return String::new();
-    }
-    password
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| current_password.to_string())
-}
-
-fn validate_webdav_sync_config(
-    enabled: bool,
-    url: &str,
-    username: &str,
-    password: &str,
-    remote_dir: &str,
-) -> Result<(String, String, String), String> {
-    let normalized_url = modules::webdav_sync::normalize_base_url(url)?;
-    let normalized_remote_dir = modules::webdav_sync::normalize_remote_dir(remote_dir)?;
-    let normalized_username = username.trim().to_string();
-
-    if enabled {
-        if normalized_username.is_empty() {
-            return Err("启用 WebDAV 同步时账号不能为空".to_string());
-        }
-        if password.is_empty() {
-            return Err("启用 WebDAV 同步时应用密码不能为空".to_string());
-        }
-    }
-
-    Ok((normalized_url, normalized_username, normalized_remote_dir))
 }
 
 fn sanitize_auto_backup_file_name(file_name: &str) -> Result<String, String> {
@@ -2118,158 +1461,11 @@ pub fn open_auto_backup_dir() -> Result<(), String> {
     open_path_in_system(path.as_path())
 }
 
-#[tauri::command]
-pub fn get_webdav_sync_settings() -> Result<WebdavSyncSettings, String> {
-    let config = config::get_user_config();
-    Ok(build_webdav_sync_settings(&config))
-}
-
-#[tauri::command]
-pub fn save_webdav_sync_settings(
-    enabled: bool,
-    url: String,
-    username: String,
-    password: Option<String>,
-    clear_password: Option<bool>,
-    remote_dir: String,
-    retention_days: i32,
-) -> Result<WebdavSyncSettings, String> {
-    let new_config = config::patch_user_config(move |current| {
-        let next_password =
-            resolve_webdav_password_update(&current.webdav_sync_password, password, clear_password);
-        let (next_url, next_username, next_remote_dir) =
-            validate_webdav_sync_config(enabled, &url, &username, &next_password, &remote_dir)?;
-
-        current.webdav_sync_enabled = enabled;
-        current.webdav_sync_url = next_url;
-        current.webdav_sync_username = next_username;
-        current.webdav_sync_password = next_password;
-        current.webdav_sync_remote_dir = next_remote_dir;
-        current.webdav_sync_retention_days =
-            config::sanitize_webdav_sync_retention_days(retention_days);
-        Ok(())
-    })?;
-    Ok(build_webdav_sync_settings(&new_config))
-}
-
-#[tauri::command]
-pub async fn test_webdav_sync_connection(
-    url: String,
-    username: String,
-    password: Option<String>,
-    clear_password: Option<bool>,
-    remote_dir: String,
-) -> Result<modules::webdav_sync::WebdavTestResult, String> {
-    let current = config::get_user_config();
-    let next_password =
-        resolve_webdav_password_update(&current.webdav_sync_password, password, clear_password);
-    let connection =
-        modules::webdav_sync::connection_from_parts(&url, &username, &next_password, &remote_dir)?;
-    modules::webdav_sync::test_connection(&connection).await
-}
-
-#[tauri::command]
-pub async fn upload_auto_backup_to_webdav(
-    file_name: String,
-) -> Result<modules::webdav_sync::WebdavUploadResult, String> {
-    let config = config::get_user_config();
-    if !config.webdav_sync_enabled {
-        return Err("WebDAV 同步未启用".to_string());
-    }
-
-    let connection = modules::webdav_sync::connection_from_config(&config)?;
-    let safe_name = sanitize_auto_backup_file_name(&file_name)?;
-    if !safe_name.ends_with(".json") {
-        return Err("WebDAV 同步入口文件必须为 JSON 备份".to_string());
-    }
-
-    let archive_name = auto_backup_archive_file_name(&safe_name)
-        .ok_or_else(|| "无法获取对应的压缩包名称".to_string())?;
-    let archive_path = resolve_auto_backup_file_path(&archive_name)?;
-    if !archive_path.exists() {
-        return Err("本地备份压缩包不存在".to_string());
-    }
-
-    let archive_bytes =
-        fs::read(&archive_path).map_err(|err| format!("读取本地备份压缩包失败: {}", err))?;
-
-    let sync_client = modules::webdav_sync::WebdavSyncClient::new(&connection)?;
-
-    let mut uploaded_files = Vec::new();
-    uploaded_files.push(
-        sync_client
-            .upload_backup_bytes(&archive_name, archive_bytes)
-            .await?,
-    );
-
-    let deleted_files = sync_client
-        .cleanup_remote_backups(config::sanitize_webdav_sync_retention_days(
-            config.webdav_sync_retention_days,
-        ))
-        .await?;
-    let uploaded_at = chrono::Utc::now().to_rfc3339();
-    let remote_dir = connection.remote_dir.clone();
-
-    config::patch_user_config(|current| {
-        current.webdav_sync_last_upload_at = Some(uploaded_at.clone());
-        current.webdav_sync_last_upload_file_name = Some(archive_name.clone());
-        Ok(())
-    })?;
-
-    Ok(modules::webdav_sync::WebdavUploadResult {
-        uploaded_files,
-        deleted_files,
-        uploaded_at,
-        remote_dir,
-    })
-}
-
-#[tauri::command]
-pub async fn list_webdav_backup_files(
-) -> Result<Vec<modules::webdav_sync::WebdavBackupFileEntry>, String> {
-    let config = config::get_user_config();
-    let connection = modules::webdav_sync::connection_from_config(&config)?;
-    modules::webdav_sync::list_remote_backups(&connection).await
-}
-
-#[tauri::command]
-pub async fn read_webdav_backup_file(file_name: String) -> Result<String, String> {
-    let config = config::get_user_config();
-    let safe_name = sanitize_auto_backup_file_name(&file_name)?;
-    let connection = modules::webdav_sync::connection_from_config(&config)?;
-
-    let downloaded_at = chrono::Utc::now().to_rfc3339();
-    let content = if safe_name.ends_with(".zip") {
-        let bytes = modules::webdav_sync::read_remote_backup_bytes(&connection, &safe_name).await?;
-        backup_json_from_zip_bytes(&bytes)?
-    } else if safe_name.ends_with(".json") {
-        modules::webdav_sync::read_remote_backup(&connection, &safe_name).await?
-    } else {
-        return Err("不支持的备份文件格式".to_string());
-    };
-
-    config::patch_user_config(move |current| {
-        current.webdav_sync_last_download_at = Some(downloaded_at);
-        current.webdav_sync_last_download_file_name = Some(safe_name);
-        Ok(())
-    })?;
-    Ok(content)
-}
-
-#[tauri::command]
-pub async fn delete_webdav_backup_file(file_name: String) -> Result<(), String> {
-    let config = config::get_user_config();
-    let safe_name = sanitize_auto_backup_file_name(&file_name)?;
-    let connection = modules::webdav_sync::connection_from_config(&config)?;
-    modules::webdav_sync::delete_remote_backup(&connection, &safe_name).await
-}
-
 /// 获取网络服务配置
 #[tauri::command]
 pub fn get_network_config() -> Result<NetworkConfig, String> {
     let user_config = config::get_user_config();
     let ws_actual_port = config::get_actual_port();
-    let report_actual_port = web_report::get_actual_port();
 
     Ok(NetworkConfig {
         ws_enabled: user_config.ws_enabled,
@@ -2278,7 +1474,7 @@ pub fn get_network_config() -> Result<NetworkConfig, String> {
         default_port: DEFAULT_WS_PORT,
         report_enabled: user_config.report_enabled,
         report_port: user_config.report_port,
-        report_actual_port,
+        report_actual_port: None,
         report_default_port: DEFAULT_REPORT_PORT,
         report_token: user_config.report_token,
         global_proxy_enabled: user_config.global_proxy_enabled,
@@ -2775,8 +1971,6 @@ pub fn patch_general_config(
     }
 
     let mut language_changed = false;
-    let mut token_keeper_enabled_changed = false;
-    let mut auto_import_from_local_enabled_changed = false;
     let mut floating_always_on_top_changed = false;
     #[cfg(target_os = "macos")]
     let mut hide_dock_icon_changed = false;
@@ -2787,8 +1981,6 @@ pub fn patch_general_config(
 
     let patch_result = config::patch_user_config(|current| {
         let previous_language = current.language.clone();
-        let previous_token_keeper_enabled = current.token_keeper_enabled;
-        let previous_auto_import_from_local_enabled = current.auto_import_from_local_enabled;
         let previous_floating_always_on_top = current.floating_card_always_on_top;
         #[cfg(target_os = "macos")]
         let previous_hide_dock_icon = current.hide_dock_icon;
@@ -2804,10 +1996,6 @@ pub fn patch_general_config(
         apply_general_config_updates(current, &updates)?;
 
         language_changed = previous_language != current.language;
-        token_keeper_enabled_changed =
-            previous_token_keeper_enabled != current.token_keeper_enabled;
-        auto_import_from_local_enabled_changed =
-            previous_auto_import_from_local_enabled != current.auto_import_from_local_enabled;
         floating_always_on_top_changed =
             previous_floating_always_on_top != current.floating_card_always_on_top;
         #[cfg(target_os = "macos")]
@@ -2841,18 +2029,6 @@ pub fn patch_general_config(
         }
     };
 
-    if token_keeper_enabled_changed {
-        modules::provider_token_keeper::notify_config_changed(
-            app.clone(),
-            new_config.token_keeper_enabled,
-        );
-    }
-
-    if auto_import_from_local_enabled_changed {
-        modules::auto_local_import::notify_config_changed(
-            new_config.auto_import_from_local_enabled,
-        );
-    }
 
     if floating_always_on_top_changed {
         if let Err(err) = modules::floating_card_window::apply_floating_card_always_on_top(&app) {
@@ -2883,7 +2059,6 @@ pub fn patch_general_config(
     }
 
     if language_changed {
-        websocket::broadcast_language_changed(&new_config.language, "desktop");
         modules::sync_settings::write_sync_setting("language", &new_config.language);
         if let Err(err) = modules::tray::update_tray_menu(&app) {
             modules::logger::log_warn(&format!("[Tray] 语言变更后刷新托盘失败: {}", err));
@@ -2891,66 +2066,6 @@ pub fn patch_general_config(
     }
 
     Ok(())
-}
-
-/// 立即扫描并导入本机当前登录账号（开启「本机账号自动导入」后调用）。
-#[tauri::command]
-pub async fn scan_auto_local_import(
-    app: tauri::AppHandle,
-) -> Result<modules::auto_local_import::AutoLocalImportScanResult, String> {
-    modules::auto_local_import::scan_now(app).await
-}
-
-// --- Codex SSH sync (#1404 vertical slice) ---
-#[tauri::command]
-pub fn codex_ssh_list_servers() -> Result<modules::codex_ssh::CodexSshListResult, String> {
-    let (servers, selected_id) = modules::codex_ssh::list_servers()?;
-    Ok(modules::codex_ssh::CodexSshListResult {
-        servers,
-        selected_id,
-    })
-}
-
-#[tauri::command]
-pub fn codex_ssh_upsert_server(
-    server: modules::codex_ssh::CodexSshServer,
-) -> Result<modules::codex_ssh::CodexSshServer, String> {
-    modules::codex_ssh::upsert_server(server)
-}
-
-#[tauri::command]
-pub fn codex_ssh_delete_server(id: String) -> Result<(), String> {
-    modules::codex_ssh::delete_server(&id)
-}
-
-#[tauri::command]
-pub fn codex_ssh_select_server(id: String) -> Result<(), String> {
-    modules::codex_ssh::select_server(&id)
-}
-
-#[tauri::command]
-pub fn codex_ssh_test_connection(id: String) -> Result<String, String> {
-    modules::codex_ssh::test_connection(&id)
-}
-
-#[tauri::command]
-pub fn codex_ssh_sync_current(id: String) -> Result<String, String> {
-    modules::codex_ssh::sync_current_account(&id)
-}
-
-/// Managed provider id for local API LB (#980 vertical slice).
-#[tauri::command]
-pub fn codex_managed_lb_provider_id() -> String {
-    "cockpit-codex-lb".to_string()
-}
-
-#[tauri::command]
-pub fn codebuddy_list_local_session_files(
-    limit: Option<u32>,
-) -> Result<Vec<modules::codebuddy_session_list::CodebuddySessionFileEntry>, String> {
-    Ok(modules::codebuddy_session_list::list_local_session_files(
-        limit.unwrap_or(100) as usize,
-    ))
 }
 
 /// 保存完整通用设置配置（兼容旧前端调用）。
@@ -3091,7 +2206,6 @@ pub fn save_general_config(
     workbuddy_quota_alert_threshold: Option<i32>,
 ) -> Result<(), String> {
     let normalized_language = language.to_lowercase();
-    let language_for_broadcast = normalized_language.clone();
     let normalized_opencode_path =
         modules::process::normalize_windows_user_facing_path(&opencode_app_path);
     let normalized_antigravity_path =
@@ -3155,8 +2269,6 @@ pub fn save_general_config(
     let tray_icon_style_value = tray_icon_style.as_deref().map(TrayIconStyle::from_str);
 
     let mut language_changed = false;
-    let mut token_keeper_enabled_changed = false;
-    let mut auto_import_from_local_enabled_changed = false;
     let mut current_app_auto_launch_enabled = false;
     #[cfg(target_os = "macos")]
     let mut hide_dock_icon_changed = false;
@@ -3165,12 +2277,6 @@ pub fn save_general_config(
 
     let new_config = config::patch_user_config(|current| {
         language_changed = current.language != normalized_language;
-        token_keeper_enabled_changed = token_keeper_enabled
-            .map(|enabled| current.token_keeper_enabled != enabled)
-            .unwrap_or(false);
-        auto_import_from_local_enabled_changed = auto_import_from_local_enabled
-            .map(|enabled| current.auto_import_from_local_enabled != enabled)
-            .unwrap_or(false);
         current_app_auto_launch_enabled = current.app_auto_launch_enabled;
         #[cfg(target_os = "macos")]
         {
@@ -3578,18 +2684,6 @@ pub fn save_general_config(
         Ok(())
     })?;
 
-    if token_keeper_enabled_changed {
-        modules::provider_token_keeper::notify_config_changed(
-            app.clone(),
-            new_config.token_keeper_enabled,
-        );
-    }
-
-    if auto_import_from_local_enabled_changed {
-        modules::auto_local_import::notify_config_changed(
-            new_config.auto_import_from_local_enabled,
-        );
-    }
 
     if current_app_auto_launch_enabled != new_config.app_auto_launch_enabled {
         apply_app_auto_launch_enabled(&app, new_config.app_auto_launch_enabled)?;
@@ -3615,7 +2709,6 @@ pub fn save_general_config(
     }
 
     if language_changed {
-        websocket::broadcast_language_changed(&language_for_broadcast, "desktop");
         modules::sync_settings::write_sync_setting("language", &normalized_language);
         if let Err(err) = modules::tray::update_tray_menu(&app) {
             modules::logger::log_warn(&format!("[Tray] 语言变更后刷新托盘失败: {}", err));
@@ -3639,225 +2732,6 @@ pub fn save_refresh_interval_config(
         }
         Ok(())
     })?;
-    Ok(())
-}
-
-#[tauri::command]
-pub fn save_tray_platform_layout(
-    app: tauri::AppHandle,
-    sort_mode: String,
-    ordered_platform_ids: Vec<String>,
-    tray_platform_ids: Vec<String>,
-    ordered_entry_ids: Option<Vec<String>>,
-    platform_groups: Option<Vec<modules::tray_layout::TrayLayoutGroup>>,
-) -> Result<(), String> {
-    modules::tray_layout::save_tray_layout(
-        sort_mode,
-        ordered_platform_ids,
-        tray_platform_ids,
-        ordered_entry_ids,
-        platform_groups,
-    )?;
-    modules::tray::update_tray_menu(&app)?;
-    Ok(())
-}
-
-#[tauri::command]
-pub fn set_app_path(app: String, path: String) -> Result<(), String> {
-    let normalized_path = modules::process::normalize_windows_user_facing_path(&path);
-    config::patch_user_config(move |current| {
-        match app.as_str() {
-            "antigravity" | "antigravity_ide" | "antigravity_legacy" => {
-                current.antigravity_app_path = normalized_path
-            }
-            "codex" => current.codex_app_path = normalized_path,
-            "claude" => current.claude_app_path = normalized_path,
-            "zed" => current.zed_app_path = normalized_path,
-            "vscode" => current.vscode_app_path = normalized_path,
-            "windsurf" => current.windsurf_app_path = normalized_path,
-            "kiro" => current.kiro_app_path = normalized_path,
-            "cursor" => current.cursor_app_path = normalized_path,
-            "codebuddy" => current.codebuddy_app_path = normalized_path,
-            "codebuddy_cn" => current.codebuddy_cn_app_path = normalized_path,
-            "qoder" => current.qoder_app_path = normalized_path,
-            "zcode" => current.zcode_app_path = normalized_path,
-            "trae" => current.trae_app_path = normalized_path,
-            "trae_solo" => current.trae_solo_app_path = normalized_path,
-            "trae_cn" => current.trae_cn_app_path = normalized_path,
-            "trae_solo_cn" => current.trae_solo_cn_app_path = normalized_path,
-            "workbuddy" => current.workbuddy_app_path = normalized_path,
-            "opencode" => current.opencode_app_path = normalized_path,
-            _ => return Err("未知应用类型".to_string()),
-        }
-        Ok(())
-    })?;
-    Ok(())
-}
-
-#[tauri::command]
-pub fn set_claude_app_scan_roots(scan_roots: String) -> Result<(), String> {
-    let normalized = scan_roots.trim().to_string();
-    config::patch_user_config(move |current| {
-        current.claude_app_scan_roots = normalized;
-        Ok(())
-    })?;
-    Ok(())
-}
-
-#[tauri::command]
-pub fn set_trae_app_scan_roots(app: Option<String>, scan_roots: String) -> Result<(), String> {
-    let normalized = scan_roots.trim().to_string();
-    let target = app
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .unwrap_or("trae")
-        .to_string();
-    config::patch_user_config(move |current| {
-        match target.as_str() {
-            "trae" => current.trae_app_scan_roots = normalized,
-            "trae_solo" => current.trae_solo_app_scan_roots = normalized,
-            "trae_cn" => current.trae_cn_app_scan_roots = normalized,
-            "trae_solo_cn" => current.trae_solo_cn_app_scan_roots = normalized,
-            _ => return Err("鏈煡搴旂敤绫诲瀷".to_string()),
-        }
-        Ok(())
-    })?;
-    Ok(())
-}
-
-#[tauri::command]
-pub fn set_codex_launch_on_switch(enabled: bool) -> Result<(), String> {
-    config::patch_user_config(|current| {
-        current.codex_launch_on_switch = enabled;
-        Ok(())
-    })?;
-    Ok(())
-}
-
-#[tauri::command]
-pub fn set_codex_local_access_entry_visible(enabled: bool) -> Result<(), String> {
-    config::patch_user_config(|current| {
-        current.codex_local_access_entry_visible = enabled;
-        Ok(())
-    })?;
-    Ok(())
-}
-
-#[tauri::command]
-pub fn detect_app_path(app: String, force: Option<bool>) -> Result<Option<String>, String> {
-    let force = force.unwrap_or(false);
-    match app.as_str() {
-        "windsurf" => Ok(modules::windsurf_instance::detect_and_save_windsurf_launch_path(force)),
-        "kiro" => Ok(modules::kiro_instance::detect_and_save_kiro_launch_path(
-            force,
-        )),
-        "cursor" => Ok(modules::cursor_instance::detect_and_save_cursor_launch_path(force)),
-        "claude" => Ok(modules::claude_instance::detect_and_save_claude_launch_path(force)),
-        "antigravity" | "antigravity_ide" | "antigravity_legacy" | "codex" | "zed" | "vscode"
-        | "codebuddy" | "codebuddy_cn" | "qoder" | "zcode" | "trae" | "trae_solo" | "trae_cn"
-        | "trae_solo_cn" | "opencode" | "workbuddy" => Ok(
-            modules::process::detect_and_save_app_path(app.as_str(), force),
-        ),
-        _ => Err("未知应用类型".to_string()),
-    }
-}
-
-#[tauri::command]
-pub async fn scan_claude_desktop_launch_targets(
-    scan_roots: Option<String>,
-) -> Result<Vec<modules::claude_instance::ClaudeDesktopLaunchCandidate>, String> {
-    #[cfg(target_os = "windows")]
-    {
-        let _ = scan_roots;
-        let task = tauri::async_runtime::spawn_blocking(|| {
-            modules::process::scan_app_launch_targets("claude", None)
-        });
-        let candidates = match tokio::time::timeout(Duration::from_secs(2), task).await {
-            Ok(Ok(result)) => result?,
-            Ok(Err(error)) => return Err(format!("检测运行中的 Claude 任务失败: {error}")),
-            Err(_) => return Err("检测运行中的 Claude 超时，请重试".to_string()),
-        };
-        return Ok(candidates
-            .into_iter()
-            .map(
-                |candidate| modules::claude_instance::ClaudeDesktopLaunchCandidate {
-                    target_type: candidate.target_type,
-                    label: candidate.label,
-                    target: candidate.target,
-                    source: candidate.source,
-                    supports_multi_instance: candidate.supports_multi_instance,
-                },
-            )
-            .collect());
-    }
-
-    #[cfg(not(target_os = "windows"))]
-    {
-        let roots = scan_roots
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-        Ok(modules::claude_instance::scan_claude_desktop_launch_targets(roots))
-    }
-}
-
-#[tauri::command]
-pub async fn scan_app_launch_targets(
-    app: String,
-    scan_roots: Option<String>,
-) -> Result<Vec<modules::process::AppLaunchCandidate>, String> {
-    match app.as_str() {
-        "antigravity" | "antigravity_ide" | "antigravity_legacy" | "codex" | "claude"
-        | "vscode" | "windsurf" | "kiro" | "cursor" | "codebuddy" | "codebuddy_cn" | "qoder"
-        | "zcode" | "trae" | "trae_solo" | "trae_cn" | "trae_solo_cn" | "workbuddy" | "zed"
-        | "opencode" => {}
-        _ => return Err("未知应用类型".to_string()),
-    }
-    let _ = scan_roots;
-
-    let task = tauri::async_runtime::spawn_blocking(move || {
-        modules::process::scan_app_launch_targets(app.as_str(), None)
-    });
-    match tokio::time::timeout(Duration::from_secs(2), task).await {
-        Ok(Ok(result)) => result,
-        Ok(Err(error)) => Err(format!("检测运行中的应用任务失败: {error}")),
-        Err(_) => Err("检测运行中的应用超时，请重试".to_string()),
-    }
-}
-
-#[tauri::command]
-pub async fn get_antigravity_installed_version_info(
-    target: Option<String>,
-    scan_mode: Option<String>,
-) -> Result<Option<AntigravityInstalledVersionInfo>, String> {
-    let scan_mode = normalize_antigravity_version_scan_mode(scan_mode.as_deref());
-    let timeout_ms = match scan_mode {
-        AntigravityVersionScanMode::Quick => ANTIGRAVITY_VERSION_BADGE_TIMEOUT_MS,
-        AntigravityVersionScanMode::Full => ANTIGRAVITY_VERSION_FULL_SCAN_TIMEOUT_MS,
-    };
-    let target_for_task = target.clone();
-
-    let task = tauri::async_runtime::spawn_blocking(move || match scan_mode {
-        AntigravityVersionScanMode::Quick => {
-            resolve_antigravity_installed_version_info_quick_for_target(target_for_task.as_deref())
-        }
-        AntigravityVersionScanMode::Full => {
-            resolve_antigravity_installed_version_info_for_target(target_for_task.as_deref())
-        }
-    });
-
-    match tokio::time::timeout(Duration::from_millis(timeout_ms), task).await {
-        Ok(Ok(result)) => Ok(result),
-        Ok(Err(error)) => Err(format!("Antigravity 版本检测任务失败: {}", error)),
-        Err(_) => Ok(None),
-    }
-}
-
-/// 通知插件关闭/开启唤醒功能（互斥）
-#[tauri::command]
-pub fn set_wakeup_override(enabled: bool) -> Result<(), String> {
-    websocket::broadcast_wakeup_override(enabled);
     Ok(())
 }
 
@@ -3995,52 +2869,6 @@ pub async fn show_main_window_and_navigate(
     page: String,
 ) -> Result<(), String> {
     modules::floating_card_window::show_main_window_and_navigate_async(app, page).await
-}
-
-#[tauri::command]
-pub fn external_import_take_pending(
-) -> Option<modules::external_import::ExternalProviderImportPayload> {
-    modules::external_import::take_pending_external_import()
-}
-
-#[tauri::command]
-pub async fn external_import_fetch_import_url(import_url: String) -> Result<String, String> {
-    const MAX_IMPORT_BUNDLE_BYTES: usize = 8 * 1024 * 1024;
-
-    let import_url = import_url.trim();
-    if import_url.is_empty() {
-        return Err("导入包地址为空".to_string());
-    }
-
-    let parsed = Url::parse(import_url).map_err(|err| format!("导入包地址无效: {}", err))?;
-    if !matches!(parsed.scheme(), "https" | "http") {
-        return Err("导入包地址仅支持 http/https".to_string());
-    }
-
-    let response = reqwest::Client::builder()
-        .timeout(Duration::from_secs(20))
-        .build()
-        .map_err(|err| format!("创建网络客户端失败: {}", err))?
-        .get(parsed)
-        .header(reqwest::header::ACCEPT, "application/json")
-        .send()
-        .await
-        .map_err(|err| format!("拉取导入包失败: {}", err))?;
-
-    let status = response.status();
-    if !status.is_success() {
-        return Err(format!("拉取导入包失败: HTTP {}", status.as_u16()));
-    }
-
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|err| format!("读取导入包失败: {}", err))?;
-    if bytes.len() > MAX_IMPORT_BUNDLE_BYTES {
-        return Err("导入包过大".to_string());
-    }
-
-    String::from_utf8(bytes.to_vec()).map_err(|_| "导入包不是有效 UTF-8 文本".to_string())
 }
 
 /// 打开指定文件夹（如不存在则创建）

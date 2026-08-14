@@ -74,12 +74,8 @@ fn env_quality_is_insider_or_dev() -> bool {
 }
 
 fn official_antigravity_version_for_cloud_code() -> String {
-    let version = crate::modules::wakeup_gateway::official_antigravity_app_version();
-    let trimmed = version.trim();
-    if trimmed.is_empty() {
-        return DEFAULT_CLOUD_CODE_IDE_VERSION.to_string();
-    }
-    trimmed.to_string()
+    // Antigravity 平台已随阶段 8 移除；固定返回默认版本号，避免依赖 wakeup_gateway。
+    DEFAULT_CLOUD_CODE_IDE_VERSION.to_string()
 }
 
 fn load_code_assist_user_agent_os() -> &'static str {
@@ -111,31 +107,7 @@ fn read_json_version_field(path: &std::path::Path) -> Option<String> {
 }
 
 fn google_api_nodejs_client_version_for_load_code_assist() -> String {
-    if let Some(root) = crate::modules::wakeup_gateway::official_antigravity_root_for_version() {
-        let candidates = [
-            root.join("Contents")
-                .join("Resources")
-                .join("app")
-                .join("node_modules")
-                .join("google-auth-library")
-                .join("package.json"),
-            root.join("resources")
-                .join("app")
-                .join("node_modules")
-                .join("google-auth-library")
-                .join("package.json"),
-            root.join("node_modules")
-                .join("google-auth-library")
-                .join("package.json"),
-        ];
-
-        for candidate in candidates {
-            if let Some(version) = read_json_version_field(&candidate) {
-                return version;
-            }
-        }
-    }
-
+    // Antigravity 平台已随阶段 8 移除；固定返回默认版本号，避免依赖 wakeup_gateway。
     DEFAULT_GOOGLE_API_NODEJS_CLIENT_VERSION.to_string()
 }
 

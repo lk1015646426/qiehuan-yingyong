@@ -1,5 +1,6 @@
 import { create } from 'zustand';
 import {
+  clearWorkCnCredentials,
   getWorkCnCredits,
   getWorkCnGitHubCliStatus,
   getWorkCnGitHubConfig,
@@ -45,6 +46,7 @@ interface WorkCnState {
   syncGitHub: (accountId: string) => Promise<void>;
   loadSessionWatchStatus: () => Promise<void>;
   applySessionWatchStatus: (status: WorkCnSessionWatchStatus) => void;
+  clearCredentials: () => Promise<void>;
   loadAccounts: () => Promise<void>;
   importCurrent: (label?: string | null) => Promise<void>;
   switchTo: (accountId: string) => Promise<void>;
@@ -214,6 +216,18 @@ export const useWorkCnStore = create<WorkCnState>((set, get) => ({
       void get().loadAccounts();
       void get().loadGitHubConfig();
     }
+  },
+  async clearCredentials() {
+    await clearWorkCnCredentials();
+    set({
+      accounts: [],
+      creditsById: {},
+      creditsErrorById: {},
+      githubConfig: { enabled: false, repository: '', slots: [] },
+      githubSyncResultById: {},
+      lastImportWarning: null,
+      lastSwitchResult: null,
+    });
   },
   clearError() {
     set({ error: null });

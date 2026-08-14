@@ -1579,7 +1579,7 @@ fn managed_proxy_env_pairs() -> Vec<(&'static str, String)> {
     .filter(|value| !value.trim().is_empty())
     .collect::<Vec<_>>()
     .join(",");
-    let no_proxy = crate::modules::codex_protocol::merge_local_no_proxy(&no_proxy_seed);
+    let no_proxy = no_proxy_seed;
     if !no_proxy.is_empty() {
         pairs.push(("no_proxy", no_proxy.clone()));
         pairs.push(("NO_PROXY", no_proxy));
@@ -5627,10 +5627,7 @@ fn get_default_antigravity_user_data_dir() -> Option<String> {
 }
 
 fn get_default_antigravity_legacy_user_data_dir() -> Option<String> {
-    crate::modules::antigravity_legacy_instance::get_default_user_data_dir()
-        .ok()
-        .map(|value| normalize_path_for_compare(&value.to_string_lossy()))
-        .filter(|value| !value.is_empty())
+    None
 }
 
 fn resolve_antigravity_target_and_fallback(user_data_dir: Option<&str>) -> Option<(String, bool)> {
@@ -5709,10 +5706,7 @@ fn resolve_workbuddy_target_and_fallback(user_data_dir: Option<&str>) -> Option<
         if trimmed.is_empty() {
             return None;
         }
-        crate::modules::workbuddy_instance::resolve_workbuddy_runtime_dirs(trimmed)
-            .ok()
-            .map(|(_, electron_dir)| electron_dir.to_string_lossy().to_string())
-            .or_else(|| Some(trimmed.to_string()))
+        Some(trimmed.to_string())
     });
     build_user_data_dir_match_target(
         normalized_request.as_deref(),
@@ -5742,9 +5736,7 @@ fn get_managed_codex_windows_app_user_data_dir(codex_home: &str) -> Option<Strin
     if trimmed.is_empty() {
         return None;
     }
-    crate::modules::codex_instance::get_windows_app_user_data_dir(Path::new(trimmed))
-        .ok()
-        .map(|value| value.to_string_lossy().to_string())
+    Some(trimmed.to_string())
 }
 
 #[cfg(target_os = "windows")]
@@ -7724,9 +7716,7 @@ fn get_default_codebuddy_cn_user_data_dir_for_os() -> Option<String> {
 }
 
 fn get_default_qoder_user_data_dir_for_os() -> Option<String> {
-    crate::modules::qoder_instance::get_default_qoder_user_data_dir()
-        .ok()
-        .map(|value| value.to_string_lossy().to_string())
+    None
 }
 
 fn get_default_trae_user_data_dir_for_os() -> Option<String> {
@@ -7744,9 +7734,7 @@ fn get_default_trae_user_data_dir_for_platform_for_os(
 }
 
 fn get_default_workbuddy_user_data_dir_for_os() -> Option<String> {
-    crate::modules::workbuddy_instance::get_default_workbuddy_user_data_dir()
-        .ok()
-        .map(|value| value.to_string_lossy().to_string())
+    None
 }
 
 pub fn focus_vscode_instance(
@@ -8529,10 +8517,7 @@ pub fn close_workbuddy_instances(
             if trimmed.is_empty() {
                 return None;
             }
-            crate::modules::workbuddy_instance::resolve_workbuddy_runtime_dirs(trimmed)
-                .ok()
-                .map(|(_, electron)| electron.to_string_lossy().to_string())
-                .or_else(|| Some(trimmed.to_string()))
+            Some(trimmed.to_string())
         })
         .collect();
     close_user_data_dir_scoped_instances(
@@ -9912,10 +9897,7 @@ pub fn start_codex_with_args(codex_home: &str, extra_args: &[String]) -> Result<
         // CODEX_HOME 与独立 Electron user-data-dir 都可以随启动请求传入。
         if !codex_home_trimmed.is_empty() {
             if resolve_codex_launch_path().is_ok() {
-                let app_user_data_dir =
-                    crate::modules::codex_instance::get_macos_app_user_data_dir(Path::new(
-                        codex_home_trimmed,
-                    ))?;
+                let app_user_data_dir = Path::new(codex_home_trimmed).to_path_buf();
                 std::fs::create_dir_all(&app_user_data_dir).map_err(|e| {
                     format!(
                         "创建 Codex macOS 实例运行目录失败 ({}): {}",
@@ -9990,9 +9972,7 @@ pub fn start_codex_with_args(codex_home: &str, extra_args: &[String]) -> Result<
         }
 
         let launch_path = resolve_codex_launch_path()?;
-        let app_user_data_dir = crate::modules::codex_instance::get_windows_app_user_data_dir(
-            Path::new(codex_home_trimmed),
-        )?;
+        let app_user_data_dir = Path::new(codex_home_trimmed).to_path_buf();
         std::fs::create_dir_all(&app_user_data_dir).map_err(|e| {
             format!(
                 "创建 Codex Windows 实例运行目录失败 ({}): {}",
@@ -10398,10 +10378,16 @@ pub fn close_codex_default_fast_by_pid(
     }
 }
 
+fn get_default_codex_home() -> std::path::PathBuf {
+    dirs::home_dir()
+        .map(|home| home.join(".codex"))
+        .unwrap_or_default()
+}
+
 pub fn close_codex_default(timeout_secs: u64) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        let default_home = crate::modules::codex_account::get_codex_home()
+        let default_home = get_default_codex_home()
             .to_string_lossy()
             .to_string();
         return close_codex_instances(&[default_home], timeout_secs);
@@ -10409,7 +10395,7 @@ pub fn close_codex_default(timeout_secs: u64) -> Result<(), String> {
 
     #[cfg(target_os = "windows")]
     {
-        let default_home = crate::modules::codex_account::get_codex_home()
+        let default_home = get_default_codex_home()
             .to_string_lossy()
             .to_string();
         return close_codex_instances(&[default_home], timeout_secs);
@@ -10542,7 +10528,7 @@ pub fn close_codex_instances(codex_homes: &[String], timeout_secs: u64) -> Resul
         }
 
         let default_home = normalize_path_for_compare(
-            &crate::modules::codex_account::get_codex_home()
+            &get_default_codex_home()
                 .to_string_lossy()
                 .to_string(),
         );
@@ -10628,7 +10614,7 @@ pub fn close_codex_instances(codex_homes: &[String], timeout_secs: u64) -> Resul
         crate::modules::logger::log_info("正在关闭受管 Codex 实例...");
 
         let default_home = normalize_path_for_compare(
-            &crate::modules::codex_account::get_codex_home()
+            &get_default_codex_home()
                 .to_string_lossy()
                 .to_string(),
         );
@@ -10659,7 +10645,7 @@ pub fn close_codex_instances(codex_homes: &[String], timeout_secs: u64) -> Resul
 
         let current_default_app_dirs = if includes_default {
             get_default_codex_windows_app_user_data_dirs(
-                crate::modules::codex_account::get_codex_home()
+                get_default_codex_home()
                     .to_string_lossy()
                     .as_ref(),
             )
@@ -12053,8 +12039,8 @@ pub fn start_workbuddy_with_args_with_new_window(
     extra_args: &[String],
     use_new_window: bool,
 ) -> Result<u32, String> {
-    let (config_dir, electron_user_data_dir) =
-        crate::modules::workbuddy_instance::resolve_workbuddy_runtime_dirs(user_data_dir)?;
+    let config_dir = std::path::PathBuf::from(user_data_dir);
+    let electron_user_data_dir = config_dir.join("app");
     std::fs::create_dir_all(&config_dir).map_err(|e| {
         format!(
             "创建 WorkBuddy 配置目录失败 ({}): {}",

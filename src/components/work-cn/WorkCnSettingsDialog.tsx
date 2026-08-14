@@ -94,12 +94,15 @@ export function WorkCnSettingsDialog({ open, onClose }: Props) {
   const loadGitHubConfig = useWorkCnStore((s) => s.loadGitHubConfig);
   const saveGitHubConfig = useWorkCnStore((s) => s.saveGitHubConfig);
   const refreshGitHubCliStatus = useWorkCnStore((s) => s.refreshGitHubCliStatus);
+  const clearCredentials = useWorkCnStore((s) => s.clearCredentials);
 
   const [enabled, setEnabled] = useState(false);
   const [repository, setRepository] = useState('');
   const [slotByAccount, setSlotByAccount] = useState<Record<string, number>>({});
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [confirmClear, setConfirmClear] = useState(false);
+  const [clearing, setClearing] = useState(false);
 
   useEffect(() => {
     if (!open) return;
@@ -164,6 +167,20 @@ export function WorkCnSettingsDialog({ open, onClose }: Props) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleClear = async () => {
+    setError(null);
+    setClearing(true);
+    try {
+      await clearCredentials();
+      setConfirmClear(false);
+      onClose();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setClearing(false);
     }
   };
 
@@ -236,6 +253,69 @@ export function WorkCnSettingsDialog({ open, onClose }: Props) {
                 </select>
               </div>
             ))
+          )}
+        </div>
+
+        <div
+          style={{
+            marginTop: 24,
+            paddingTop: 16,
+            borderTop: '1px solid #f0f1f4',
+          }}
+        >
+          <div style={{ fontSize: 13, fontWeight: 600, color: '#b91c1c' }}>危险操作</div>
+          <p style={noteStyle}>
+            清除本地保存的全部账号凭证与 GitHub 同步配置。此操作不可撤销，清除后需重新导入账号。
+          </p>
+          {confirmClear ? (
+            <div
+              style={{
+                padding: '10px 12px',
+                border: '1px solid #fecaca',
+                borderRadius: 6,
+                background: '#fef2f2',
+              }}
+            >
+              <div style={{ fontSize: 12, color: '#b91c1c', marginBottom: 8 }}>
+                确认要清除全部本地凭证吗？此操作不可撤销。
+              </div>
+              <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+                <button
+                  type="button"
+                  style={buttonStyle}
+                  onClick={() => setConfirmClear(false)}
+                  disabled={clearing}
+                >
+                  取消
+                </button>
+                <button
+                  type="button"
+                  style={{
+                    ...buttonStyle,
+                    color: '#ffffff',
+                    background: '#dc2626',
+                    border: '1px solid #dc2626',
+                  }}
+                  onClick={handleClear}
+                  disabled={clearing}
+                >
+                  {clearing ? '清除中…' : '确认清除'}
+                </button>
+              </div>
+            </div>
+          ) : (
+            <button
+              type="button"
+              style={{
+                ...buttonStyle,
+                color: '#dc2626',
+                borderColor: '#fecaca',
+                background: '#fef2f2',
+              }}
+              onClick={() => setConfirmClear(true)}
+            >
+              清除本地凭证
+            </button>
           )}
         </div>
 

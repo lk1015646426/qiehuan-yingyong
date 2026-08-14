@@ -117,3 +117,11 @@ export async function syncWorkCnGitHubAccount(accountId: string): Promise<WorkCn
 export function getWorkCnSessionWatchStatus(): Promise<WorkCnSessionWatchStatus> {
   return invoke<WorkCnSessionWatchStatus>('get_work_cn_session_watch_status');
 }
+
+// ---- Stage 8: 清除本地凭证 ----
+
+// 清除本地保存的全部 TRAE Work CN 凭证（账号库 + GitHub 同步配置）。
+// 危险操作，设置弹窗必须二次确认后才可调用。
+export function clearWorkCnCredentials(): Promise<void> {
+  return invoke<void>('clear_work_cn_credentials');
+}

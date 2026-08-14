@@ -77,11 +77,15 @@ pub fn update_default_settings(
 }
 
 pub fn get_default_user_data_dir() -> Result<PathBuf, String> {
-    modules::antigravity_paths::default_user_data_dir()
+    dirs::home_dir()
+        .map(|home| home.join(".antigravity"))
+        .ok_or_else(|| "无法获取 Home 目录".to_string())
 }
 
 pub fn get_default_instances_root_dir() -> Result<PathBuf, String> {
-    modules::antigravity_paths::managed_instances_root_dir()
+    dirs::home_dir()
+        .map(|home| home.join(".antigravity").join("instances"))
+        .ok_or_else(|| "无法获取 Home 目录".to_string())
 }
 
 pub fn get_instance_defaults() -> Result<InstanceDefaults, String> {

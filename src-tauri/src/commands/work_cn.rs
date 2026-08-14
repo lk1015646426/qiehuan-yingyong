@@ -134,3 +134,29 @@ pub async fn get_work_cn_credits(
 pub fn get_work_cn_session_watch_status() -> WorkCnSessionWatchStatus {
     crate::modules::work_cn_session_watcher::get_work_cn_session_watch_status()
 }
+
+/// 清除本地保存的全部 TRAE Work CN 凭证（账号库 + GitHub 同步配置）。
+///
+/// 删除 `trae_accounts/` 目录、`trae_accounts.json` 索引与 `github.json`。
+/// 危险操作：前端必须在二次确认后才可调用。
+#[tauri::command]
+pub fn clear_work_cn_credentials() -> Result<(), String> {
+    let data_dir = crate::modules::account::get_data_dir()?;
+    let accounts_dir = data_dir.join("trae_accounts");
+    let index_path = data_dir.join("trae_accounts.json");
+    let github_config_path = data_dir.join("github.json");
+
+    if accounts_dir.exists() {
+        std::fs::remove_dir_all(&accounts_dir).map_err(|e| format!("删除账号库失败: {}", e))?;
+    }
+    if index_path.exists() {
+        std::fs::remove_file(&index_path).map_err(|e| format!("删除账号索引失败: {}", e))?;
+    }
+    if github_config_path.exists() {
+        std::fs::remove_file(&github_config_path)
+            .map_err(|e| format!("删除 GitHub 同步配置失败: {}", e))?;
+    }
+
+    logger::log_info("[Work CN] 已清除本地凭证");
+    Ok(())
+}
