@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "TRAE Work CN 账号切换器",
+  "productName": "切换工具",
   "version": "0.1.0",
   "identifier": "com.lk.trae-work-cn-switcher",
   "build": {
@@ -14,7 +14,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "TRAE Work CN 账号切换器",
+        "title": "切换工具",
         "width": 960,
         "height": 680,
         "minWidth": 820,
@@ -27,7 +27,7 @@
       },
       {
         "label": "floating-card",
-        "title": "TRAE Work CN 账号切换器",
+        "title": "切换工具",
         "create": false,
         "width": 250,
         "height": 290,
@@ -71,7 +71,7 @@
       "../src/assets/icons/trae-solo-cn.png": "native-menu-icons/trae-solo-cn.png"
     },
     "macOS": {
-      "bundleName": "TRAE Work CN 账号切换器",
+      "bundleName": "切换工具",
       "infoPlist": "Info.plist"
     }
   },

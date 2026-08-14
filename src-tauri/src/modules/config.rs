@@ -560,7 +560,9 @@ pub enum CloseWindowBehavior {
 
 impl Default for CloseWindowBehavior {
     fn default() -> Self {
-        CloseWindowBehavior::Ask
+        // 阶段 8 清理后不再有关闭确认弹窗（CloseConfirmDialog 已删），
+        // Ask 模式会拦截关闭且无人应答，表现为“点了没反应”。默认改为直接退出。
+        CloseWindowBehavior::Quit
     }
 }
 
@@ -744,7 +746,7 @@ fn default_trae_auto_refresh() -> i32 {
     10
 }
 fn default_close_behavior() -> CloseWindowBehavior {
-    CloseWindowBehavior::Ask
+    CloseWindowBehavior::Quit
 }
 fn default_minimize_behavior() -> MinimizeWindowBehavior {
     MinimizeWindowBehavior::DockAndTray

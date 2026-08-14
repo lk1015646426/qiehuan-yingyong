@@ -378,9 +378,11 @@ pub fn run() {
                         window.app_handle().exit(0);
                     }
                     CloseWindowBehavior::Ask => {
-                        api.prevent_close();
-                        let _ = window.emit("window:close_requested", ());
-                        info!("[Window] 等待用户选择关闭行为");
+                        // 阶段 8 删除了关闭确认弹窗（前端无监听者），
+                        // Ask 与 Quit 行为一致：直接退出，避免“点了没反应”。
+                        modules::floating_card_window::request_app_exit();
+                        info!("[Window] 用户选择退出应用（Ask 兼容为 Quit）");
+                        window.app_handle().exit(0);
                     }
                 }
             }

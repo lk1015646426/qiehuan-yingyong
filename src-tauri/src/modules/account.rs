@@ -252,12 +252,18 @@ pub fn resolve_data_dir() -> Result<PathBuf, String> {
     }
 
     let home = dirs::home_dir().ok_or("无法获取用户主目录")?;
-    let dir_name = if is_dev_profile() {
-        DEV_DATA_DIR
-    } else {
-        DATA_DIR
-    };
-    Ok(home.join(dir_name))
+    // dev 与 release 统一使用同一数据目录：此前 dev 构建写
+    // `~/.trae_work_cn_switcher_dev`、安装包读 `~/.trae_work_cn_switcher`，
+    // 目录分裂导致“重启后数据丢失”的观感。首次统一时把旧 dev 目录
+    // 迁移过来（同盘 rename，失败则忽略，用户重新导入即可）。
+    let data_dir = home.join(DATA_DIR);
+    if !data_dir.exists() {
+        let dev_dir = home.join(DEV_DATA_DIR);
+        if dev_dir.exists() {
+            let _ = fs::rename(&dev_dir, &data_dir);
+        }
+    }
+    Ok(data_dir)
 }
 
 pub fn get_data_dir() -> Result<PathBuf, String> {

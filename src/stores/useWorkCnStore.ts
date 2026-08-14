@@ -75,16 +75,25 @@ export const useWorkCnStore = create<WorkCnState>((set, get) => ({
     try {
       const accounts = await listWorkCnAccounts();
       set({ accounts, loading: false });
-      // 载入时仅解析各账号已缓存的积分（本地解析，不联网、不签到）。
+      // 载入时先本地解析缓存积分快速展示，再静默联网刷新一次真实余额
+      // （仅查询用量接口，绝不签到/领取）。
       void Promise.all(
         accounts.map(async (account) => {
           try {
-            const summary = await getWorkCnCredits(account.id, false);
+            const cached = await getWorkCnCredits(account.id, false);
             set((state) => ({
-              creditsById: { ...state.creditsById, [account.id]: summary },
+              creditsById: { ...state.creditsById, [account.id]: cached },
             }));
           } catch {
-            // 查询失败不影响列表展示，等用户点击“刷新积分”。
+            // 缓存解析失败不影响列表展示。
+          }
+          try {
+            const fresh = await getWorkCnCredits(account.id, true);
+            set((state) => ({
+              creditsById: { ...state.creditsById, [account.id]: fresh },
+            }));
+          } catch {
+            // 联网刷新失败保留缓存值，等用户点击“刷新积分”重试。
           }
         }),
       );
