@@ -3,6 +3,7 @@ import {
   getWorkCnCredits,
   getWorkCnGitHubCliStatus,
   getWorkCnGitHubConfig,
+  getWorkCnSessionWatchStatus,
   importCurrentWorkCnAccount,
   listWorkCnAccounts,
   saveWorkCnGitHubConfig,
@@ -16,6 +17,7 @@ import type {
   WorkCnGitHubConfig,
   WorkCnGitHubCliStatus,
   WorkCnGitHubSyncResult,
+  WorkCnSessionWatchStatus,
 } from '../types/workCn';
 
 interface WorkCnState {
@@ -35,10 +37,14 @@ interface WorkCnState {
   githubCliStatus: WorkCnGitHubCliStatus | null;
   githubSyncingById: Record<string, boolean>;
   githubSyncResultById: Record<string, WorkCnGitHubSyncResult | null>;
+  // 后台会话监测（阶段 7）。
+  sessionWatchStatus: WorkCnSessionWatchStatus | null;
   loadGitHubConfig: () => Promise<void>;
   saveGitHubConfig: (config: WorkCnGitHubConfig) => Promise<void>;
   refreshGitHubCliStatus: () => Promise<void>;
   syncGitHub: (accountId: string) => Promise<void>;
+  loadSessionWatchStatus: () => Promise<void>;
+  applySessionWatchStatus: (status: WorkCnSessionWatchStatus) => void;
   loadAccounts: () => Promise<void>;
   importCurrent: (label?: string | null) => Promise<void>;
   switchTo: (accountId: string) => Promise<void>;
@@ -46,7 +52,7 @@ interface WorkCnState {
   clearError: () => void;
 }
 
-export const useWorkCnStore = create<WorkCnState>((set) => ({
+export const useWorkCnStore = create<WorkCnState>((set, get) => ({
   accounts: [],
   loading: false,
   importing: false,
@@ -61,6 +67,7 @@ export const useWorkCnStore = create<WorkCnState>((set) => ({
   githubCliStatus: null,
   githubSyncingById: {},
   githubSyncResultById: {},
+  sessionWatchStatus: null,
   async loadAccounts() {
     set({ loading: true, error: null });
     try {
@@ -190,6 +197,22 @@ export const useWorkCnStore = create<WorkCnState>((set) => ({
         },
         githubSyncingById: { ...state.githubSyncingById, [accountId]: false },
       }));
+    }
+  },
+  async loadSessionWatchStatus() {
+    try {
+      const status = await getWorkCnSessionWatchStatus();
+      set({ sessionWatchStatus: status });
+    } catch {
+      // 后台命令不可用时保持 null，横幅按「未启动」展示。
+    }
+  },
+  applySessionWatchStatus(status) {
+    set({ sessionWatchStatus: status });
+    // Token 更新后刷新账号卡（含积分/快照完整度）与 GitHub 绑定状态。
+    if (status.outcome === 'TOKEN_UPDATED') {
+      void get().loadAccounts();
+      void get().loadGitHubConfig();
     }
   },
   clearError() {

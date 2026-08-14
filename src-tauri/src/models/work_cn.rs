@@ -197,6 +197,64 @@ impl WorkCnCommandError {
     }
 }
 
+/// 后台会话监测器的对外状态（阶段 7）。仅含脱敏信息，绝不含 token。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkCnSessionWatchStatus {
+    /// 监测器是否已启动。
+    pub running: bool,
+    /// 上次检查时间戳（秒）。
+    pub last_check_at: i64,
+    pub outcome: WorkCnSessionWatchOutcome,
+    /// 命中的账号 id（脱敏后仍安全）。
+    pub account_id: Option<String>,
+    /// 本次是否检测到 token 轮换。
+    pub token_changed: bool,
+    pub github_synced: bool,
+    pub github_skipped: bool,
+    pub github_error: Option<String>,
+    /// 给人看的摘要（不含 token）。
+    pub message: String,
+}
+
+/// 一次监测的结果枚举。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum WorkCnSessionWatchOutcome {
+    /// 尚未执行过检查 / 命令层默认值。
+    Idle,
+    /// storage 不存在 / 未登录。
+    NoStorage,
+    /// mtime 未变化，跳过解密。
+    Unchanged,
+    /// 切号锁被占用，跳过。
+    SwitchBusy,
+    /// UID 不在账号库。
+    NoMatch,
+    /// 匹配但 token 未变化。
+    NoChange,
+    /// token 变化，已回写账号库。
+    TokenUpdated,
+    /// 读取/解密/回写失败。
+    Failed,
+}
+
+impl Default for WorkCnSessionWatchStatus {
+    fn default() -> Self {
+        Self {
+            running: false,
+            last_check_at: 0,
+            outcome: WorkCnSessionWatchOutcome::Idle,
+            account_id: None,
+            token_changed: false,
+            github_synced: false,
+            github_skipped: false,
+            github_error: None,
+            message: String::new(),
+        }
+    }
+}
+
 /// Serialize a `WorkCnCommandError` into the JSON-string form Tauri commands use
 /// for `Err`, so the frontend can `JSON.parse` it back into a structured error.
 pub fn command_error_to_string(err: &WorkCnCommandError) -> String {
@@ -207,5 +265,30 @@ pub fn command_error_to_string(err: &WorkCnCommandError) -> String {
             serde_json::to_string(&err.message).unwrap_or_else(|_| "\"error\"".to_string())
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::WorkCnSessionWatchOutcome;
+
+    #[test]
+    fn work_cn_watch_outcome_serializes_screaming_snake_case() {
+        assert_eq!(
+            serde_json::to_value(WorkCnSessionWatchOutcome::TokenUpdated).unwrap(),
+            serde_json::json!("TOKEN_UPDATED")
+        );
+        assert_eq!(
+            serde_json::to_value(WorkCnSessionWatchOutcome::NoStorage).unwrap(),
+            serde_json::json!("NO_STORAGE")
+        );
+        assert_eq!(
+            serde_json::to_value(WorkCnSessionWatchOutcome::SwitchBusy).unwrap(),
+            serde_json::json!("SWITCH_BUSY")
+        );
+        assert_eq!(
+            serde_json::to_value(WorkCnSessionWatchOutcome::Idle).unwrap(),
+            serde_json::json!("IDLE")
+        );
+    }
 }
 

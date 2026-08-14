@@ -5,8 +5,8 @@ use crate::models::work_cn::{
 };
 use crate::modules::trae_account::load_account;
 use crate::modules::work_cn_github::{
-    cli_status, find_slot_for_account, load_github_config, save_github_config,
-    sync_account_secrets, RealGitHubRunner,
+    cli_status, load_github_config, save_github_config, sync_account_secrets_if_bound,
+    RealGitHubRunner,
 };
 
 /// Read the persisted GitHub Secrets sync configuration for the settings dialog.
@@ -32,30 +32,6 @@ pub fn github_cli_status() -> Result<WorkCnGitHubCliStatus, String> {
 /// `Ok(skipped)`; hard failures (gh not authed, secret-set error) return `Err`.
 #[tauri::command]
 pub fn sync_work_cn_github_account(account_id: String) -> Result<WorkCnGitHubSyncResult, String> {
-    let config = load_github_config();
-    if !config.enabled {
-        return Ok(WorkCnGitHubSyncResult {
-            account_id,
-            synced: false,
-            skipped: true,
-            skip_reason: Some("GitHub 同步未启用".to_string()),
-            error: None,
-            synced_at: chrono::Utc::now().timestamp(),
-        });
-    }
-    let slot = match find_slot_for_account(&config, &account_id) {
-        Some(s) => s,
-        None => {
-            return Ok(WorkCnGitHubSyncResult {
-                account_id,
-                synced: false,
-                skipped: true,
-                skip_reason: Some("该账号未绑定 GitHub 槽位".to_string()),
-                error: None,
-                synced_at: chrono::Utc::now().timestamp(),
-            });
-        }
-    };
     let account = load_account(&account_id).ok_or_else(|| "账号不存在".to_string())?;
-    sync_account_secrets(&RealGitHubRunner, &account, slot, &config.repository)
+    sync_account_secrets_if_bound(&account)
 }

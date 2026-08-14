@@ -370,6 +370,7 @@ pub fn run() {
 
             modules::provider_token_keeper::ensure_started(app.handle().clone());
             modules::auto_local_import::ensure_started(app.handle().clone());
+            modules::work_cn_session_watcher::ensure_started(app.handle().clone());
 
             // Wakeup restore/start and Deep Link registration/read can hit disk or OS
             // APIs — never block setup (window + skeleton tray first).
@@ -1132,6 +1133,7 @@ pub fn run() {
             commands::work_cn::validate_work_cn_account,
             commands::work_cn::switch_work_cn_account,
             commands::work_cn::get_work_cn_credits,
+            commands::work_cn::get_work_cn_session_watch_status,
             commands::work_cn_github::get_work_cn_github_config,
             commands::work_cn_github::save_work_cn_github_config,
             commands::work_cn_github::github_cli_status,

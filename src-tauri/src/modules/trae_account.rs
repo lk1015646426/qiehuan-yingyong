@@ -488,7 +488,7 @@ pub fn load_account(account_id: &str) -> Option<TraeAccount> {
     }
 }
 
-fn save_account_file(account: &TraeAccount) -> Result<(), String> {
+pub(crate) fn save_account_file(account: &TraeAccount) -> Result<(), String> {
     let path = resolve_account_file_path(account.id.as_str())?;
     let content = crate::modules::secure_account_storage::serialize_account_file("trae", account)?;
     crate::modules::atomic_write::write_string_atomic(&path, &content)
@@ -3626,7 +3626,7 @@ fn ensure_entitlement_raw_for_inject(account: &TraeAccount) -> Option<Value> {
     account.trae_entitlement_raw.clone()
 }
 
-fn read_local_trae_auth_from_storage_path(
+pub(crate) fn read_local_trae_auth_from_storage_path(
     storage_path: &Path,
 ) -> Result<Option<TraeImportPayload>, String> {
     if !storage_path.exists() {
@@ -4013,6 +4013,28 @@ pub fn list_work_cn_accounts() -> Result<Vec<crate::models::work_cn::WorkCnAccou
         .collect())
 }
 
+/// 在账号库中按 UID（优先）→ email 匹配给定 payload 对应的 Work CN 账号 id。
+/// 找不到就返回 `None`（由调用方映射为 NoMatch），**不回填** UID（主理人拍板）。
+pub(crate) fn find_work_cn_account_id_for_payload(
+    payload: &TraeImportPayload,
+) -> Option<String> {
+    let platform = TraePlatformKind::TraeSoloCn;
+    let normalized_user_id = normalize_non_empty(payload.user_id.as_deref());
+    let normalized_email = normalize_identity_email(Some(payload.email.as_str()));
+    let accounts = list_accounts_checked().ok()?;
+    accounts
+        .iter()
+        .find(|account| {
+            resolve_account_platform_kind(account) == platform
+                && account_matches_import_identity(
+                    account,
+                    normalized_user_id.as_deref(),
+                    normalized_email.as_deref(),
+                )
+        })
+        .map(|account| account.id.clone())
+}
+
 // ===== 阶段 4：安全的一键切换与回滚 =====
 //
 // 严格遵循开发指南 §8.3 的状态机：获取全局锁 → 校验 → 保存当前会话 →
@@ -4027,11 +4049,27 @@ pub fn list_work_cn_accounts() -> Result<Vec<crate::models::work_cn::WorkCnAccou
 
 static WORK_CN_SWITCH_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
 
+/// 尝试获取 Work CN 全局切号锁（非阻塞）。占用即返回 `None`，供后台会话监测
+/// 与切换命令共用同一把锁实现互斥。返回 `'static` 的 `MutexGuard`（`WORK_CN_SWITCH_LOCK`
+/// 为静态 `LazyLock`，deref 生命周期为 `'static`），在同步 `watch_once` 中跨阻塞 I/O 安全。
+pub(crate) fn try_lock_work_cn_switch() -> Option<tokio::sync::MutexGuard<'static, ()>> {
+    WORK_CN_SWITCH_LOCK.try_lock().ok()
+}
+
 fn work_cn_switch_storage_path_override() -> Option<PathBuf> {
     std::env::var("WORK_CN_SWITCH_STORAGE_OVERRIDE")
         .ok()
         .filter(|value| !value.trim().is_empty())
         .map(PathBuf::from)
+}
+
+/// 解析当前 Work CN 官方客户端 storage 路径（含测试 override），与切换链路
+/// 共用同一路径语义。
+pub(crate) fn resolve_current_work_cn_storage_path() -> Result<PathBuf, String> {
+    if let Some(path) = work_cn_switch_storage_path_override() {
+        return Ok(path);
+    }
+    get_default_trae_storage_path_for_platform(TraePlatformKind::TraeSoloCn)
 }
 
 fn work_cn_switch_skip_process() -> bool {
@@ -4286,9 +4324,17 @@ pub async fn verify_work_cn_switched_account(
 }
 
 /// 切换成功后把最新签到凭证同步到 GitHub（开发指南 §8.5）。阶段 6 落地；
-/// 当前为占位，返回 false 且绝不阻止本地切号。
-async fn sync_work_cn_github_for_switch(_account: &TraeAccount) -> bool {
-    false
+/// 失败绝不阻止本地切号，仅在日志记录。
+async fn sync_work_cn_github_for_switch(account: &TraeAccount) -> bool {
+    match crate::modules::work_cn_github::sync_account_secrets_if_bound(account) {
+        Ok(result) => result.synced,
+        Err(err) => {
+            logger::log_warn(&format!(
+                "[Work CN Switch] GitHub 同步失败（不阻止本地切号）: {err}"
+            ));
+            false
+        }
+    }
 }
 
 /// 一键切换并打开官方客户端（原子命令核心）。命令层 `switch_work_cn_account`
@@ -5799,7 +5845,7 @@ fn apply_runtime_storage_payload_for_usage_refresh(
 /// Pull fresher tokens from Trae `storage.json` when identity matches.
 /// Critical for avoiding refresh-token races: Trae may have already rotated
 /// refresh tokens on disk while Cockpit still holds a stale copy.
-fn sync_account_tokens_from_storage_path(
+pub(crate) fn sync_account_tokens_from_storage_path(
     account: &mut TraeAccount,
     storage_path: &Path,
     source_label: &str,
@@ -7545,6 +7591,87 @@ mod tests {
             status: None,
             status_reason: None,
         }
+    }
+
+    #[test]
+    fn work_cn_try_lock_switch_free_then_busy() {
+        let _lock = crate::modules::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let guard = super::try_lock_work_cn_switch().expect("空闲时应可获取切号锁");
+        assert!(
+            super::try_lock_work_cn_switch().is_none(),
+            "已持有时再次 try_lock 应返回 None"
+        );
+        drop(guard);
+        assert!(
+            super::try_lock_work_cn_switch().is_some(),
+            "释放后应可再次获取切号锁"
+        );
+    }
+
+    #[test]
+    fn work_cn_resolve_current_storage_path_honors_override() {
+        let _lock = crate::modules::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let override_path = std::env::temp_dir().join("work-cn-override-storage.json");
+        std::env::set_var("WORK_CN_SWITCH_STORAGE_OVERRIDE", &override_path);
+
+        let resolved = super::resolve_current_work_cn_storage_path()
+            .expect("override 路径应可解析");
+        assert_eq!(resolved, override_path);
+
+        std::env::remove_var("WORK_CN_SWITCH_STORAGE_OVERRIDE");
+    }
+
+    #[test]
+    fn work_cn_find_account_id_prefers_uid_then_email() {
+        let _guard = WORK_CN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::modules::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let dir = std::env::temp_dir().join(format!(
+            "work-cn-find-id-test-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::env::set_var("COCKPIT_TOOLS_TEST_DATA_DIR", &dir);
+
+        let account_a =
+            super::import_work_cn_account_from_payload(make_switch_payload("uid-a", "tok-a"), None)
+                .expect("import A");
+        let account_b =
+            super::import_work_cn_account_from_payload(make_switch_payload("uid-b", "tok-b"), None)
+                .expect("import B");
+
+        // UID 优先命中 A（即使 email 完全不同）。
+        let mut by_uid = make_switch_payload("uid-a", "tok-a");
+        by_uid.email = "totally-different@example.com".to_string();
+        assert_eq!(
+            super::find_work_cn_account_id_for_payload(&by_uid).as_deref(),
+            Some(account_a.id.as_str())
+        );
+
+        // 无 UID 时按 email 命中 B。
+        let mut by_email = make_switch_payload("uid-b", "tok-b");
+        by_email.user_id = None;
+        by_email.email = "uid-b@example.com".to_string();
+        assert_eq!(
+            super::find_work_cn_account_id_for_payload(&by_email).as_deref(),
+            Some(account_b.id.as_str())
+        );
+
+        // 不存在的身份 → None。
+        let unknown = make_switch_payload("uid-none", "tok-none");
+        assert!(super::find_work_cn_account_id_for_payload(&unknown).is_none());
+
+        std::env::remove_var("COCKPIT_TOOLS_TEST_DATA_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

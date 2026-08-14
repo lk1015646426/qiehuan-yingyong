@@ -2,7 +2,7 @@ use std::path::Path;
 
 use crate::models::work_cn::{
     command_error_to_string, WorkCnAccountView, WorkCnCreditsSummary, WorkCnInstallation,
-    WorkCnSnapshotValidation, WorkCnSwitchResult,
+    WorkCnSessionWatchStatus, WorkCnSnapshotValidation, WorkCnSwitchResult,
 };
 use crate::modules::{logger, process, trae_account};
 
@@ -126,4 +126,11 @@ pub async fn get_work_cn_credits(
     trae_account::get_work_cn_credits(&account_id, force_refresh)
         .await
         .map_err(|error| command_error_to_string(&error))
+}
+
+/// Read the current background session-watch status (阶段 7). Desensitized only;
+/// never contains tokens.
+#[tauri::command]
+pub fn get_work_cn_session_watch_status() -> WorkCnSessionWatchStatus {
+    crate::modules::work_cn_session_watcher::get_work_cn_session_watch_status()
 }

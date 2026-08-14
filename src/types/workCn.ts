@@ -123,3 +123,27 @@ export interface WorkCnGitHubCliStatus {
   authed: boolean;
   detail: string | null;
 }
+
+// 后台会话监测结果枚举（阶段 7）。Mirrors `WorkCnSessionWatchOutcome` (SCREAMING_SNAKE_CASE).
+export type WorkCnSessionWatchOutcome =
+  | 'IDLE'
+  | 'NO_STORAGE'
+  | 'UNCHANGED'
+  | 'SWITCH_BUSY'
+  | 'NO_MATCH'
+  | 'NO_CHANGE'
+  | 'TOKEN_UPDATED'
+  | 'FAILED';
+
+// 后台会话监测器对外状态（脱敏，不含 token）。Mirrors `WorkCnSessionWatchStatus`.
+export interface WorkCnSessionWatchStatus {
+  running: boolean;
+  lastCheckAt: number;
+  outcome: WorkCnSessionWatchOutcome;
+  accountId: string | null;
+  tokenChanged: boolean;
+  githubSynced: boolean;
+  githubSkipped: boolean;
+  githubError: string | null;
+  message: string;
+}

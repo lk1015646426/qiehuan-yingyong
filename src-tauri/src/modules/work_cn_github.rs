@@ -238,6 +238,41 @@ pub fn find_slot_for_account<'a>(
     config.slots.iter().find(|s| s.account_id == account_id)
 }
 
+/// 供 watcher/切换链路注入 FakeRunner 的可测版本：读取配置 → 启用校验 →
+/// 槽位绑定校验 → 真实同步。未启用/未绑定返回 `Ok(skipped)`，不触任何 gh 调用。
+pub(crate) fn sync_account_secrets_if_bound_with(
+    runner: &dyn GitHubRunner,
+    account: &TraeAccount,
+) -> Result<WorkCnGitHubSyncResult, String> {
+    let config = load_github_config();
+    if !config.enabled {
+        return Ok(skip_result(&account.id, "GitHub 同步未启用"));
+    }
+    let Some(slot) = find_slot_for_account(&config, &account.id) else {
+        return Ok(skip_result(&account.id, "该账号未绑定 GitHub 槽位"));
+    };
+    sync_account_secrets(runner, account, slot, &config.repository)
+}
+
+/// 生产入口（命令层、切换链路、watcher 均走这里）。
+pub(crate) fn sync_account_secrets_if_bound(
+    account: &TraeAccount,
+) -> Result<WorkCnGitHubSyncResult, String> {
+    sync_account_secrets_if_bound_with(&RealGitHubRunner, account)
+}
+
+/// 构造「跳过」结果，与命令层原逻辑保持一致。
+fn skip_result(account_id: &str, reason: &str) -> WorkCnGitHubSyncResult {
+    WorkCnGitHubSyncResult {
+        account_id: account_id.to_string(),
+        synced: false,
+        skipped: true,
+        skip_reason: Some(reason.to_string()),
+        error: None,
+        synced_at: chrono::Utc::now().timestamp(),
+    }
+}
+
 /// Is the GitHub CLI installed?
 pub fn github_cli_available(runner: &dyn GitHubRunner) -> bool {
     runner
@@ -626,5 +661,142 @@ mod tests {
         let redacted = redact_for_log(log);
         assert!(!redacted.contains("eyJabcDEF1234567890xyz"), "长 secret 必须被脱敏");
         assert!(redacted.contains("ok"));
+    }
+
+    #[test]
+    fn work_cn_github_sync_if_bound_disabled_returns_skipped() {
+        let _lock = crate::modules::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "work-cn-gh-disabled-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::env::set_var("COCKPIT_TOOLS_TEST_DATA_DIR", &dir);
+
+        let runner = FakeGitHubRunner::new();
+        let account = make_account("acc1", "tok", Some("dev"));
+        let result = sync_account_secrets_if_bound_with(&runner, &account).unwrap();
+        assert!(!result.synced);
+        assert!(result.skipped);
+        assert_eq!(result.skip_reason.as_deref(), Some("GitHub 同步未启用"));
+        assert!(runner.recorded_calls().is_empty());
+
+        std::env::remove_var("COCKPIT_TOOLS_TEST_DATA_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn work_cn_github_sync_if_bound_unbound_returns_skipped() {
+        let _lock = crate::modules::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "work-cn-gh-unbound-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::env::set_var("COCKPIT_TOOLS_TEST_DATA_DIR", &dir);
+
+        save_github_config(&WorkCnGitHubConfig {
+            enabled: true,
+            repository: "o/r".to_string(),
+            slots: vec![],
+        })
+        .expect("save config");
+
+        let runner = FakeGitHubRunner::new();
+        let account = make_account("acc1", "tok", Some("dev"));
+        let result = sync_account_secrets_if_bound_with(&runner, &account).unwrap();
+        assert!(!result.synced);
+        assert!(result.skipped);
+        assert_eq!(result.skip_reason.as_deref(), Some("该账号未绑定 GitHub 槽位"));
+        assert!(runner.recorded_calls().is_empty());
+
+        std::env::remove_var("COCKPIT_TOOLS_TEST_DATA_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn work_cn_github_sync_if_bound_bound_calls_sync() {
+        let _lock = crate::modules::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "work-cn-gh-bound-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::env::set_var("COCKPIT_TOOLS_TEST_DATA_DIR", &dir);
+
+        save_github_config(&WorkCnGitHubConfig {
+            enabled: true,
+            repository: "o/r".to_string(),
+            slots: vec![WorkCnGitHubSlot {
+                slot: 1,
+                account_id: "acc1".to_string(),
+                token_secret: String::new(),
+                device_secret: String::new(),
+            }],
+        })
+        .expect("save config");
+
+        let runner = FakeGitHubRunner::new();
+        let token = jwt_with_exp(chrono::Utc::now().timestamp() + 3600);
+        let account = make_account("acc1", &token, Some("dev-uuid"));
+        let result = sync_account_secrets_if_bound_with(&runner, &account).unwrap();
+        assert!(result.synced, "绑定 + 启用 + 已登录应同步成功");
+        assert!(!result.skipped);
+
+        let calls = runner.recorded_calls();
+        assert_eq!(calls.len(), 3, "应调用 auth status + 两个 secret set");
+        assert_eq!(calls[0].args.first().map(|s| s.as_str()), Some("auth"));
+        assert_eq!(calls[1].args.first().map(|s| s.as_str()), Some("secret"));
+        assert_eq!(calls[2].args.first().map(|s| s.as_str()), Some("secret"));
+
+        std::env::remove_var("COCKPIT_TOOLS_TEST_DATA_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn work_cn_github_sync_if_bound_not_authed_returns_err() {
+        let _lock = crate::modules::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "work-cn-gh-noauth-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::env::set_var("COCKPIT_TOOLS_TEST_DATA_DIR", &dir);
+
+        save_github_config(&WorkCnGitHubConfig {
+            enabled: true,
+            repository: "o/r".to_string(),
+            slots: vec![WorkCnGitHubSlot {
+                slot: 1,
+                account_id: "acc1".to_string(),
+                token_secret: String::new(),
+                device_secret: String::new(),
+            }],
+        })
+        .expect("save config");
+
+        let runner = FakeGitHubRunner {
+            auth_ok: false,
+            ..FakeGitHubRunner::new()
+        };
+        let token = jwt_with_exp(chrono::Utc::now().timestamp() + 3600);
+        let account = make_account("acc1", &token, Some("dev-uuid"));
+        let result = sync_account_secrets_if_bound_with(&runner, &account);
+        assert!(result.is_err(), "gh 未登录必须返回 Err");
+
+        std::env::remove_var("COCKPIT_TOOLS_TEST_DATA_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

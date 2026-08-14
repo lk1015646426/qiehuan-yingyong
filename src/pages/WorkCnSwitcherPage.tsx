@@ -7,11 +7,13 @@
 
 import { useEffect, useState } from 'react';
 import type { CSSProperties, ReactElement } from 'react';
-import { getWorkCnInstallation } from '../services/workCnService';
+import { listen } from '@tauri-apps/api/event';
+import { getWorkCnInstallation, WORK_CN_SESSION_WATCH_EVENT } from '../services/workCnService';
 import { useWorkCnStore } from '../stores/useWorkCnStore';
 import { WorkCnAddAccountDialog } from '../components/work-cn/WorkCnAddAccountDialog';
 import { WorkCnSettingsDialog } from '../components/work-cn/WorkCnSettingsDialog';
-import type { WorkCnInstallation, WorkCnAccountView, WorkCnCreditsSummary, WorkCnGitHubSyncResult } from '../types/workCn';
+import { WorkCnStatusBanner } from '../components/work-cn/WorkCnStatusBanner';
+import type { WorkCnInstallation, WorkCnAccountView, WorkCnCreditsSummary, WorkCnGitHubSyncResult, WorkCnSessionWatchStatus } from '../types/workCn';
 
 const ACCOUNT_SLOT_COUNT = 4;
 
@@ -389,6 +391,8 @@ export function WorkCnSwitcherPage() {
   const githubSyncingById = useWorkCnStore((s) => s.githubSyncingById);
   const loadGitHubConfig = useWorkCnStore((s) => s.loadGitHubConfig);
   const syncGitHub = useWorkCnStore((s) => s.syncGitHub);
+  const loadSessionWatchStatus = useWorkCnStore((s) => s.loadSessionWatchStatus);
+  const applySessionWatchStatus = useWorkCnStore((s) => s.applySessionWatchStatus);
   const [settingsOpen, setSettingsOpen] = useState(false);
 
   useEffect(() => {
@@ -417,6 +421,30 @@ export function WorkCnSwitcherPage() {
       cancelled = true;
     };
   }, [loadAccounts, loadGitHubConfig]);
+
+  useEffect(() => {
+    void loadSessionWatchStatus();
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<WorkCnSessionWatchStatus>(
+      WORK_CN_SESSION_WATCH_EVENT,
+      (event) => {
+        if (!disposed) {
+          applySessionWatchStatus(event.payload);
+        }
+      },
+    ).then((fn) => {
+      if (disposed) {
+        fn();
+      } else {
+        unlisten = fn;
+      }
+    });
+    return () => {
+      disposed = true;
+      unlisten?.();
+    };
+  }, [loadSessionWatchStatus, applySessionWatchStatus]);
 
   const status = renderInstallationStatus(installation, loading, error);
   const emptySlots = Math.max(0, ACCOUNT_SLOT_COUNT - accounts.length);
@@ -467,6 +495,8 @@ export function WorkCnSwitcherPage() {
           {lastImportWarning}
         </section>
       ) : null}
+
+      <WorkCnStatusBanner />
 
       <StoreErrorBanner />
 

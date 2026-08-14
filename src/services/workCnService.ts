@@ -9,7 +9,11 @@ import type {
   WorkCnGitHubConfig,
   WorkCnGitHubCliStatus,
   WorkCnGitHubSyncResult,
+  WorkCnSessionWatchStatus,
 } from '../types/workCn';
+
+// 后台会话监测事件名（与 Rust `SESSION_WATCH_EVENT` 保持一致，避免字符串漂移）。
+export const WORK_CN_SESSION_WATCH_EVENT = 'work-cn:session-watch';
 
 // Probe the local TRAE Work CN install. Safe to call on every page load:
 // the backend never touches login secrets here.
@@ -105,4 +109,11 @@ export async function syncWorkCnGitHubAccount(accountId: string): Promise<WorkCn
   } catch (err) {
     throw err instanceof Error ? err.message : String(err);
   }
+}
+
+// ---- Stage 7: 后台会话监测 ----
+
+// Read the current background session-watch status (desensitized, no tokens).
+export function getWorkCnSessionWatchStatus(): Promise<WorkCnSessionWatchStatus> {
+  return invoke<WorkCnSessionWatchStatus>('get_work_cn_session_watch_status');
 }
