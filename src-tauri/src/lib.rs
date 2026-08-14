@@ -1132,6 +1132,10 @@ pub fn run() {
             commands::work_cn::validate_work_cn_account,
             commands::work_cn::switch_work_cn_account,
             commands::work_cn::get_work_cn_credits,
+            commands::work_cn_github::get_work_cn_github_config,
+            commands::work_cn_github::save_work_cn_github_config,
+            commands::work_cn_github::github_cli_status,
+            commands::work_cn_github::sync_work_cn_github_account,
             // Cursor Commands
             commands::cursor::list_cursor_accounts,
             commands::cursor::delete_cursor_account,

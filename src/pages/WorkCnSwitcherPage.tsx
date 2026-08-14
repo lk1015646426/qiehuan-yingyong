@@ -10,7 +10,8 @@ import type { CSSProperties, ReactElement } from 'react';
 import { getWorkCnInstallation } from '../services/workCnService';
 import { useWorkCnStore } from '../stores/useWorkCnStore';
 import { WorkCnAddAccountDialog } from '../components/work-cn/WorkCnAddAccountDialog';
-import type { WorkCnInstallation, WorkCnAccountView, WorkCnCreditsSummary } from '../types/workCn';
+import { WorkCnSettingsDialog } from '../components/work-cn/WorkCnSettingsDialog';
+import type { WorkCnInstallation, WorkCnAccountView, WorkCnCreditsSummary, WorkCnGitHubSyncResult } from '../types/workCn';
 
 const ACCOUNT_SLOT_COUNT = 4;
 
@@ -261,21 +262,45 @@ function AccountCard({
   creditsError,
   switching,
   refreshingCredits,
+  githubEnabled,
+  githubSync,
+  githubSyncing,
   onSwitch,
   onRefreshCredits,
+  onSyncGitHub,
 }: {
   account: WorkCnAccountView;
   credits: WorkCnCreditsSummary | null;
   creditsError: string | null;
   switching: boolean;
   refreshingCredits: boolean;
+  githubEnabled: boolean;
+  githubSync: WorkCnGitHubSyncResult | null;
+  githubSyncing: boolean;
   onSwitch: () => void;
   onRefreshCredits: () => void;
+  onSyncGitHub: () => void;
 }) {
   const title = account.tags?.length
     ? account.tags[0]
     : account.nickname ?? account.email ?? account.userId ?? account.id;
   const canSwitch = account.validForSwitch && !switching;
+
+  let githubLine = 'GitHub：未同步';
+  let githubColor = '#8a909c';
+  if (!githubEnabled) {
+    githubLine = 'GitHub：未启用';
+  } else if (githubSync?.synced) {
+    githubLine = 'GitHub：已同步';
+    githubColor = '#16a34a';
+  } else if (githubSync?.error) {
+    githubLine = `GitHub 同步失败：${githubSync.error}`;
+    githubColor = '#ef4444';
+  } else if (githubSync?.skipped) {
+    githubLine = `GitHub 待同步：${githubSync.skipReason ?? '未绑定槽位'}`;
+    githubColor = '#f59e0b';
+  }
+
   return (
     <div style={slotStyle}>
       <div style={slotTitleStyle}>{title}</div>
@@ -284,11 +309,12 @@ function AccountCard({
         {account.userId ? ` · ${account.userId}` : ''}
       </div>
       {renderCredits(credits, creditsError)}
+      <div style={{ ...slotStatusStyle, color: githubColor, fontSize: 12 }}>{githubLine}</div>
       <SnapshotBadges account={account} />
       {account.warnings.length ? (
         <div style={warningStyle}>{account.warnings.join('；')}</div>
       ) : null}
-      <div style={{ marginTop: 'auto', display: 'flex', gap: 8 }}>
+      <div style={{ marginTop: 'auto', display: 'flex', gap: 8, flexWrap: 'wrap' }}>
         <button
           type="button"
           style={account.validForSwitch ? primaryButtonStyle : buttonStyle}
@@ -310,6 +336,15 @@ function AccountCard({
           title="仅查询积分，绝不签到"
         >
           {refreshingCredits ? '查询中…' : '刷新积分'}
+        </button>
+        <button
+          type="button"
+          style={buttonStyle}
+          disabled={!githubEnabled || githubSyncing || switching}
+          onClick={onSyncGitHub}
+          title="把最新凭证同步到 GitHub Secrets（绝不签到）"
+        >
+          {githubSyncing ? '同步中…' : '同步 GitHub'}
         </button>
       </div>
     </div>
@@ -349,6 +384,12 @@ export function WorkCnSwitcherPage() {
   const creditsErrorById = useWorkCnStore((s) => s.creditsErrorById);
   const refreshingCreditsId = useWorkCnStore((s) => s.refreshingCreditsId);
   const refreshCredits = useWorkCnStore((s) => s.refreshCredits);
+  const githubConfig = useWorkCnStore((s) => s.githubConfig);
+  const githubSyncResultById = useWorkCnStore((s) => s.githubSyncResultById);
+  const githubSyncingById = useWorkCnStore((s) => s.githubSyncingById);
+  const loadGitHubConfig = useWorkCnStore((s) => s.loadGitHubConfig);
+  const syncGitHub = useWorkCnStore((s) => s.syncGitHub);
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -371,10 +412,11 @@ export function WorkCnSwitcherPage() {
         }
       });
     loadAccounts();
+    void loadGitHubConfig();
     return () => {
       cancelled = true;
     };
-  }, [loadAccounts]);
+  }, [loadAccounts, loadGitHubConfig]);
 
   const status = renderInstallationStatus(installation, loading, error);
   const emptySlots = Math.max(0, ACCOUNT_SLOT_COUNT - accounts.length);
@@ -393,7 +435,11 @@ export function WorkCnSwitcherPage() {
           >
             导入当前账号
           </button>
-          <button type="button" style={buttonStyle}>
+          <button
+            type="button"
+            style={buttonStyle}
+            onClick={() => setSettingsOpen(true)}
+          >
             设置
           </button>
           <button type="button" style={buttonStyle}>
@@ -438,8 +484,12 @@ export function WorkCnSwitcherPage() {
               creditsError={creditsErrorById[account.id] ?? null}
               switching={switchingId === account.id}
               refreshingCredits={refreshingCreditsId === account.id}
+              githubEnabled={githubConfig.enabled}
+              githubSync={githubSyncResultById[account.id] ?? null}
+              githubSyncing={githubSyncingById[account.id] ?? false}
               onSwitch={() => void switchTo(account.id)}
               onRefreshCredits={() => void refreshCredits(account.id)}
+              onSyncGitHub={() => void syncGitHub(account.id)}
             />
           ))}
           {Array.from({ length: emptySlots }, (_, index) => (
@@ -452,6 +502,7 @@ export function WorkCnSwitcherPage() {
       </section>
 
       <WorkCnAddAccountDialog open={dialogOpen} onClose={() => setDialogOpen(false)} />
+      <WorkCnSettingsDialog open={settingsOpen} onClose={() => setSettingsOpen(false)} />
     </div>
   );
 }

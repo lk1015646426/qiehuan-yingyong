@@ -91,3 +91,35 @@ export interface WorkCnCreditsSummary {
   unlimited: boolean;
   updatedAt: number;
 }
+
+// One GitHub Secrets slot binding (开发指南 §8.5 / 阶段 6).
+export interface WorkCnGitHubSlot {
+  slot: number;
+  accountId: string;
+  tokenSecret: string;
+  deviceSecret: string;
+}
+
+// Persisted GitHub Secrets sync config (never holds a PAT).
+export interface WorkCnGitHubConfig {
+  enabled: boolean;
+  repository: string;
+  slots: WorkCnGitHubSlot[];
+}
+
+// Result of syncing one account's credentials to GitHub.
+export interface WorkCnGitHubSyncResult {
+  accountId: string;
+  synced: boolean;
+  skipped: boolean;
+  skipReason: string | null;
+  error: string | null;
+  syncedAt: number;
+}
+
+// GitHub CLI availability / auth status for the settings dialog.
+export interface WorkCnGitHubCliStatus {
+  available: boolean;
+  authed: boolean;
+  detail: string | null;
+}

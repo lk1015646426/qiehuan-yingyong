@@ -100,6 +100,60 @@ pub struct WorkCnCreditsSummary {
     pub updated_at: i64,
 }
 
+/// One GitHub Secrets slot binding: which account goes to which `TRAE{N}` secret pair.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkCnGitHubSlot {
+    pub slot: u8,
+    pub account_id: String,
+    /// Secret name for the access token. Empty → auto `TRAE{N}_TOKEN`.
+    pub token_secret: String,
+    /// Secret name for the device id. Empty → auto `TRAE{N}_DEVICE_ID`.
+    pub device_secret: String,
+}
+
+/// Persisted GitHub Secrets sync configuration (saved to `github.json`, never holds a PAT).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkCnGitHubConfig {
+    pub enabled: bool,
+    /// `owner/repo` for the GitHub Actions repository that performs the daily check-in.
+    pub repository: String,
+    pub slots: Vec<WorkCnGitHubSlot>,
+}
+
+impl Default for WorkCnGitHubConfig {
+    fn default() -> Self {
+        WorkCnGitHubConfig {
+            enabled: false,
+            repository: String::new(),
+            slots: Vec::new(),
+        }
+    }
+}
+
+/// Result of a single account's GitHub secret sync. `skipped=true` means the
+/// account was intentionally not synced (e.g. expired token) — not a failure.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkCnGitHubSyncResult {
+    pub account_id: String,
+    pub synced: bool,
+    pub skipped: bool,
+    pub skip_reason: Option<String>,
+    pub error: Option<String>,
+    pub synced_at: i64,
+}
+
+/// GitHub CLI availability / auth status for the settings dialog.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkCnGitHubCliStatus {
+    pub available: bool,
+    pub authed: bool,
+    pub detail: Option<String>,
+}
+
 /// Structured error codes for Work CN commands so the frontend never has to
 /// branch on Chinese error strings (开发指南 §8.4).
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]

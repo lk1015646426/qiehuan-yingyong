@@ -1,14 +1,21 @@
 import { create } from 'zustand';
 import {
   getWorkCnCredits,
+  getWorkCnGitHubCliStatus,
+  getWorkCnGitHubConfig,
   importCurrentWorkCnAccount,
   listWorkCnAccounts,
+  saveWorkCnGitHubConfig,
   switchWorkCnAccount,
+  syncWorkCnGitHubAccount,
 } from '../services/workCnService';
 import type {
   WorkCnAccountView,
   WorkCnCreditsSummary,
   WorkCnSwitchResult,
+  WorkCnGitHubConfig,
+  WorkCnGitHubCliStatus,
+  WorkCnGitHubSyncResult,
 } from '../types/workCn';
 
 interface WorkCnState {
@@ -23,6 +30,15 @@ interface WorkCnState {
   creditsById: Record<string, WorkCnCreditsSummary>;
   creditsErrorById: Record<string, string | null>;
   refreshingCreditsId: string | null;
+  // GitHub Secrets 同步（阶段 6）。
+  githubConfig: WorkCnGitHubConfig;
+  githubCliStatus: WorkCnGitHubCliStatus | null;
+  githubSyncingById: Record<string, boolean>;
+  githubSyncResultById: Record<string, WorkCnGitHubSyncResult | null>;
+  loadGitHubConfig: () => Promise<void>;
+  saveGitHubConfig: (config: WorkCnGitHubConfig) => Promise<void>;
+  refreshGitHubCliStatus: () => Promise<void>;
+  syncGitHub: (accountId: string) => Promise<void>;
   loadAccounts: () => Promise<void>;
   importCurrent: (label?: string | null) => Promise<void>;
   switchTo: (accountId: string) => Promise<void>;
@@ -41,6 +57,10 @@ export const useWorkCnStore = create<WorkCnState>((set) => ({
   creditsById: {},
   creditsErrorById: {},
   refreshingCreditsId: null,
+  githubConfig: { enabled: false, repository: '', slots: [] },
+  githubCliStatus: null,
+  githubSyncingById: {},
+  githubSyncResultById: {},
   async loadAccounts() {
     set({ loading: true, error: null });
     try {
@@ -117,6 +137,58 @@ export const useWorkCnStore = create<WorkCnState>((set) => ({
       set((state) => ({
         refreshingCreditsId: null,
         creditsErrorById: { ...state.creditsErrorById, [accountId]: message },
+      }));
+    }
+  },
+  async loadGitHubConfig() {
+    try {
+      const config = await getWorkCnGitHubConfig();
+      set({ githubConfig: config });
+    } catch {
+      // keep defaults
+    }
+  },
+  async saveGitHubConfig(config) {
+    await saveWorkCnGitHubConfig(config);
+    set({ githubConfig: config });
+    // re-read CLI status after a config change
+    void getWorkCnGitHubCliStatus()
+      .then((status) => set({ githubCliStatus: status }))
+      .catch(() => undefined);
+  },
+  async refreshGitHubCliStatus() {
+    try {
+      const status = await getWorkCnGitHubCliStatus();
+      set({ githubCliStatus: status });
+    } catch {
+      // ignore
+    }
+  },
+  async syncGitHub(accountId) {
+    set((state) => ({
+      githubSyncingById: { ...state.githubSyncingById, [accountId]: true },
+    }));
+    try {
+      const result = await syncWorkCnGitHubAccount(accountId);
+      set((state) => ({
+        githubSyncResultById: { ...state.githubSyncResultById, [accountId]: result },
+        githubSyncingById: { ...state.githubSyncingById, [accountId]: false },
+      }));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      set((state) => ({
+        githubSyncResultById: {
+          ...state.githubSyncResultById,
+          [accountId]: {
+            accountId,
+            synced: false,
+            skipped: false,
+            skipReason: null,
+            error: message,
+            syncedAt: Math.floor(Date.now() / 1000),
+          },
+        },
+        githubSyncingById: { ...state.githubSyncingById, [accountId]: false },
       }));
     }
   },

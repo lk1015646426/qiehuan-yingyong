@@ -6,6 +6,9 @@ import type {
   WorkCnSnapshotValidation,
   WorkCnSwitchResult,
   WorkCnCommandError,
+  WorkCnGitHubConfig,
+  WorkCnGitHubCliStatus,
+  WorkCnGitHubSyncResult,
 } from '../types/workCn';
 
 // Probe the local TRAE Work CN install. Safe to call on every page load:
@@ -75,4 +78,31 @@ export function parseWorkCnCommandError(err: unknown): WorkCnCommandError {
     // fall through to generic error
   }
   return { code: 'LAUNCH_FAILED', message: raw, detail: null };
+}
+
+// ---- Stage 6: GitHub Secrets 同步 ----
+
+// Read the persisted GitHub Secrets sync configuration (settings dialog prefill).
+export function getWorkCnGitHubConfig(): Promise<WorkCnGitHubConfig> {
+  return invoke<WorkCnGitHubConfig>('get_work_cn_github_config');
+}
+
+// Validate and persist the GitHub Secrets sync configuration.
+export function saveWorkCnGitHubConfig(config: WorkCnGitHubConfig): Promise<void> {
+  return invoke<void>('save_work_cn_github_config', { config });
+}
+
+// Report GitHub CLI availability / auth status (no secrets touched).
+export function getWorkCnGitHubCliStatus(): Promise<WorkCnGitHubCliStatus> {
+  return invoke<WorkCnGitHubCliStatus>('github_cli_status');
+}
+
+// Sync one account's credentials to its bound GitHub slot. Never claims a
+// check-in. On error the backend returns a plain string, which we surface as-is.
+export async function syncWorkCnGitHubAccount(accountId: string): Promise<WorkCnGitHubSyncResult> {
+  try {
+    return await invoke<WorkCnGitHubSyncResult>('sync_work_cn_github_account', { accountId });
+  } catch (err) {
+    throw err instanceof Error ? err.message : String(err);
+  }
 }

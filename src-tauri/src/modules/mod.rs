@@ -90,6 +90,7 @@ pub mod sync_settings;
 pub mod test_support;
 pub mod trae_account;
 pub mod trae_instance;
+pub mod work_cn_github;
 pub mod trae_oauth;
 pub mod trae_session_transfer;
 pub mod tray;
