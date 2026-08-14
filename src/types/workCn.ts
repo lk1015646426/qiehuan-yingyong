@@ -46,3 +46,36 @@ export interface WorkCnAccountView {
   validForSwitch: boolean;
   warnings: string[];
 }
+
+// Result of a one-click Work CN account switch.
+// Mirrors `WorkCnSwitchResult` in src-tauri/src/models/work_cn.rs.
+export interface WorkCnSwitchResult {
+  accountId: string;
+  userId: string | null;
+  launched: boolean;
+  verified: boolean;
+  githubSynced: boolean;
+  warning: string | null;
+}
+
+// Structured error code returned by Work CN commands. The backend serializes
+// `WorkCnCommandError` to a JSON string; the frontend parses it to branch on
+// `code` instead of matching Chinese text. Mirrors `WorkCnErrorCode`.
+export type WorkCnErrorCode =
+  | 'ACCOUNT_NOT_FOUND'
+  | 'SNAPSHOT_INCOMPLETE'
+  | 'CLIENT_NOT_INSTALLED'
+  | 'CLIENT_CLOSE_FAILED'
+  | 'STORAGE_BACKUP_FAILED'
+  | 'INJECT_FAILED'
+  | 'LAUNCH_FAILED'
+  | 'VERIFY_TIMEOUT'
+  | 'VERIFY_ACCOUNT_MISMATCH'
+  | 'ROLLBACK_FAILED'
+  | 'BUSY';
+
+export interface WorkCnCommandError {
+  code: WorkCnErrorCode;
+  message: string;
+  detail: string | null;
+}

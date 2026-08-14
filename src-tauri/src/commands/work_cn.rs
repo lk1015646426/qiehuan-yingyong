@@ -1,6 +1,9 @@
 use std::path::Path;
 
-use crate::models::work_cn::{WorkCnAccountView, WorkCnInstallation, WorkCnSnapshotValidation};
+use crate::models::work_cn::{
+    command_error_to_string, WorkCnAccountView, WorkCnInstallation, WorkCnSnapshotValidation,
+    WorkCnSwitchResult,
+};
 use crate::modules::{logger, process, trae_account};
 
 /// User-visible product name. The internal platform identifier stays
@@ -96,4 +99,18 @@ pub fn validate_work_cn_account(account_id: String) -> Result<WorkCnSnapshotVali
         return Err("账号不存在".to_string());
     };
     Ok(trae_account::validate_work_cn_account_snapshot(&account))
+}
+
+/// One-click switch to a saved Work CN account and open the official client.
+/// Orchestrates the full transactional state machine (close → inject → bind →
+/// launch → verify → rollback on failure). Errors are returned as a serialized
+/// `WorkCnCommandError` JSON string so the frontend can branch on `code`.
+#[tauri::command]
+pub async fn switch_work_cn_account(
+    _app: tauri::AppHandle,
+    account_id: String,
+) -> Result<WorkCnSwitchResult, String> {
+    trae_account::switch_work_cn_account(account_id)
+        .await
+        .map_err(|error| command_error_to_string(&error))
 }

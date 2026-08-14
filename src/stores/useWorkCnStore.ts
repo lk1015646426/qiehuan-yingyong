@@ -2,17 +2,21 @@ import { create } from 'zustand';
 import {
   importCurrentWorkCnAccount,
   listWorkCnAccounts,
+  switchWorkCnAccount,
 } from '../services/workCnService';
-import type { WorkCnAccountView } from '../types/workCn';
+import type { WorkCnAccountView, WorkCnSwitchResult } from '../types/workCn';
 
 interface WorkCnState {
   accounts: WorkCnAccountView[];
   loading: boolean;
   importing: boolean;
+  switchingId: string | null;
   error: string | null;
   lastImportWarning: string | null;
+  lastSwitchResult: WorkCnSwitchResult | null;
   loadAccounts: () => Promise<void>;
   importCurrent: (label?: string | null) => Promise<void>;
+  switchTo: (accountId: string) => Promise<void>;
   clearError: () => void;
 }
 
@@ -20,8 +24,10 @@ export const useWorkCnStore = create<WorkCnState>((set) => ({
   accounts: [],
   loading: false,
   importing: false,
+  switchingId: null,
   error: null,
   lastImportWarning: null,
+  lastSwitchResult: null,
   async loadAccounts() {
     set({ loading: true, error: null });
     try {
@@ -52,6 +58,22 @@ export const useWorkCnStore = create<WorkCnState>((set) => ({
       set({
         error: err instanceof Error ? err.message : String(err),
         importing: false,
+      });
+    }
+  },
+  async switchTo(accountId) {
+    set({ switchingId: accountId, error: null, lastSwitchResult: null });
+    try {
+      const result = await switchWorkCnAccount(accountId);
+      set({ switchingId: null, lastSwitchResult: result });
+      // Refresh the account list so the "current" marker (if any) updates.
+      void listWorkCnAccounts()
+        .then((accounts) => set({ accounts }))
+        .catch(() => undefined);
+    } catch (err) {
+      set({
+        error: err instanceof Error ? err.message : String(err),
+        switchingId: null,
       });
     }
   },

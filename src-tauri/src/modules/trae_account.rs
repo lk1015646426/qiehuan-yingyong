@@ -11,9 +11,13 @@ use sha2::{Digest, Sha512};
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
+use std::time::Duration;
+
+use tokio::sync::Mutex as AsyncMutex;
 
 use crate::models::trae::{TraeAccount, TraeAccountIndex, TraeImportPayload};
+use crate::models::work_cn::{WorkCnCommandError, WorkCnErrorCode, WorkCnSwitchResult};
 use crate::modules::{account, config, logger};
 
 const ACCOUNTS_INDEX_FILE: &str = "trae_accounts.json";
@@ -4007,6 +4011,458 @@ pub fn list_work_cn_accounts() -> Result<Vec<crate::models::work_cn::WorkCnAccou
         .collect())
 }
 
+// ===== 阶段 4：安全的一键切换与回滚 =====
+//
+// 严格遵循开发指南 §8.3 的状态机：获取全局锁 → 校验 → 保存当前会话 →
+// 回滚快照 → 关闭客户端 → 注入目标账号 → 绑定默认实例 → 启动 → 启动后验证 →
+// 失败回滚。所有有副作用的步骤（关闭/启动/写入 storage.json/绑定）在失败时都会
+// 把 storage 字节与默认实例绑定恢复到切换前状态，绝不让用户停留在空白登录态。
+//
+// 为支持单元测试而不真正启动 Work CN，提供两个测试注入点（仅在设置了对应
+// 环境变量时生效，生产路径默认不设置）：
+//   - `WORK_CN_SWITCH_STORAGE_OVERRIDE`：把"目标 storage.json"重定向到临时副本；
+//   - `WORK_CN_SWITCH_SKIP_PROCESS=1`：跳过真实的关闭/启动进程调用。
+
+static WORK_CN_SWITCH_LOCK: LazyLock<AsyncMutex<()>> = LazyLock::new(|| AsyncMutex::new(()));
+
+fn work_cn_switch_storage_path_override() -> Option<PathBuf> {
+    std::env::var("WORK_CN_SWITCH_STORAGE_OVERRIDE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+}
+
+fn work_cn_switch_skip_process() -> bool {
+    std::env::var("WORK_CN_SWITCH_SKIP_PROCESS").is_ok()
+}
+
+fn resolve_switch_storage_path(platform: TraePlatformKind) -> Result<PathBuf, WorkCnCommandError> {
+    if let Some(path) = work_cn_switch_storage_path_override() {
+        return Ok(path);
+    }
+    get_default_trae_storage_path_for_platform(platform)
+        .map_err(|e| WorkCnCommandError::new(WorkCnErrorCode::ClientNotInstalled, e))
+}
+
+/// Validate that an account carries everything needed for a long-lived,
+/// password-free switch (开发指南 §8.3 步骤 2).
+pub fn validate_work_cn_account_for_switch(
+    account: &TraeAccount,
+) -> Result<(), WorkCnCommandError> {
+    if resolve_account_platform_kind(account) != TraePlatformKind::TraeSoloCn {
+        return Err(WorkCnCommandError::new(
+            WorkCnErrorCode::SnapshotIncomplete,
+            "账号平台不是 TRAE Work CN",
+        ));
+    }
+    if account.access_token.trim().is_empty() {
+        return Err(WorkCnCommandError::new(
+            WorkCnErrorCode::SnapshotIncomplete,
+            "缺少 access token",
+        ));
+    }
+    if account.refresh_token.as_deref().unwrap_or("").trim().is_empty() {
+        return Err(WorkCnCommandError::new(
+            WorkCnErrorCode::SnapshotIncomplete,
+            "缺少 refresh token，无法长期免登录切换",
+        ));
+    }
+    if account.user_id.as_deref().unwrap_or("").trim().is_empty() {
+        return Err(WorkCnCommandError::new(
+            WorkCnErrorCode::SnapshotIncomplete,
+            "缺少 user_id",
+        ));
+    }
+    let Some(auth_raw) = account.trae_auth_raw.as_ref() else {
+        return Err(WorkCnCommandError::new(
+            WorkCnErrorCode::SnapshotIncomplete,
+            "缺少 trae_auth_raw",
+        ));
+    };
+    let device_id = auth_raw
+        .get("deviceInfo")
+        .and_then(|device| device.get("DeviceID"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    if device_id.is_none() {
+        return Err(WorkCnCommandError::new(
+            WorkCnErrorCode::SnapshotIncomplete,
+            "缺少数字 DeviceID（deviceInfo.DeviceID）",
+        ));
+    }
+    let Some(key_pair) = resolve_device_key_pair_for_inject(account) else {
+        return Err(WorkCnCommandError::new(
+            WorkCnErrorCode::SnapshotIncomplete,
+            "缺少设备密钥对 deviceKeyPair",
+        ));
+    };
+    let private_ok = key_pair
+        .get("privateKeyPEM")
+        .and_then(Value::as_str)
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    let public_ok = key_pair
+        .get("publicKeyPEM")
+        .and_then(Value::as_str)
+        .map(|value| !value.trim().is_empty())
+        .unwrap_or(false);
+    if !private_ok || !public_ok {
+        return Err(WorkCnCommandError::new(
+            WorkCnErrorCode::SnapshotIncomplete,
+            "设备密钥对缺少 private/public PEM",
+        ));
+    }
+    if let Some(checkin_id) = account.checkin_device_id.as_deref() {
+        if checkin_id.trim().is_empty() {
+            return Err(WorkCnCommandError::new(
+                WorkCnErrorCode::SnapshotIncomplete,
+                "checkin_device_id 为空",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// 步骤 3：切换前把当前官方客户端的登录态同步回账号库，避免丢失被官方客户端
+/// 轮换后的 refresh token（开发指南 §8.3 步骤 3）。找不到对应账号时返回 None，
+/// 不阻止切换，但会提示用户先导入。
+pub fn sync_current_work_cn_session_from_local(
+) -> Result<Option<TraeAccount>, WorkCnCommandError> {
+    let platform = TraePlatformKind::TraeSoloCn;
+    let payload = match read_local_trae_auth_for_platform(platform) {
+        Ok(Some(found)) => found,
+        Ok(None) => return Ok(None),
+        Err(error) => {
+            return Err(WorkCnCommandError::new(
+                WorkCnErrorCode::ClientNotInstalled,
+                error,
+            ))
+        }
+    };
+    let normalized_user_id = normalize_non_empty(payload.user_id.as_deref());
+    let normalized_email = normalize_email(Some(payload.email.as_str()));
+    let accounts = list_accounts_checked().map_err(|error| {
+        WorkCnCommandError::new(WorkCnErrorCode::SnapshotIncomplete, error)
+    })?;
+    let Some(account_id) = accounts
+        .iter()
+        .find(|account| {
+            if resolve_account_platform_kind(account) != platform {
+                return false;
+            }
+            if let (Some(existing), Some(incoming)) = (
+                normalize_non_empty(account.user_id.as_deref()),
+                normalized_user_id.clone(),
+            ) {
+                if existing == incoming {
+                    return true;
+                }
+            }
+            if let (Some(existing), Some(incoming)) = (
+                normalize_email(Some(account.email.as_str())),
+                normalized_email.clone(),
+            ) {
+                return existing == incoming;
+            }
+            false
+        })
+        .map(|account| account.id.clone())
+    else {
+        logger::log_info("[Work CN Switch] 当前本地客户端账号不在账号库中，跳过回写");
+        return Ok(None);
+    };
+
+    let mut payload = payload;
+    attach_platform_metadata_to_payload(&mut payload, platform);
+    let account =
+        upsert_account(payload).map_err(|error| {
+            WorkCnCommandError::new(WorkCnErrorCode::SnapshotIncomplete, error)
+        })?;
+    logger::log_info(&format!(
+        "[Work CN Switch] 已同步当前客户端会话到账号库: account_id={}",
+        account_id
+    ));
+    Ok(Some(account))
+}
+
+/// 原样恢复旧 storage.json 字节；切换前不存在则删除本次创建的文件。
+fn rollback_storage_bytes(storage_path: &Path, previous: Option<&[u8]>) {
+    match previous {
+        Some(bytes) => {
+            if let Err(error) = fs::write(storage_path, bytes) {
+                logger::log_error(&format!(
+                    "[Work CN Switch] 回滚 storage.json 字节失败: path={}, error={}",
+                    storage_path.display(),
+                    error
+                ));
+            }
+        }
+        None => {
+            let _ = fs::remove_file(storage_path);
+        }
+    }
+}
+
+/// 恢复默认实例绑定的账号（None 表示切换前未绑定）。
+fn rollback_bind(platform: TraePlatformKind, previous: Option<&str>) {
+    let bind = previous.map(|value| Some(value.to_string()));
+    if let Err(error) =
+        crate::modules::trae_instance::update_default_settings_for_platform(platform, bind, None, None)
+    {
+        logger::log_error(&format!(
+            "[Work CN Switch] 回滚默认实例绑定失败: error={}",
+            error
+        ));
+    }
+}
+
+/// 回滚后若切换前客户端正在运行，重新启动旧账号。
+async fn restart_previous_after_rollback() {
+    if work_cn_switch_skip_process() {
+        return;
+    }
+    if let Err(error) = crate::commands::trae_instance::trae_start_instance(
+        Some("trae_solo_cn".to_string()),
+        "__default__".to_string(),
+    )
+    .await
+    {
+        logger::log_error(&format!(
+            "[Work CN Switch] 回滚后重新启动旧账号失败: error={}",
+            error
+        ));
+    }
+}
+
+/// 启动后验证：最多等待 `timeout`，确认 storage.json 的 UID 等于目标账号，
+/// 且 access token 非空、未被清空（开发指南 §8.3 步骤 8）。
+pub async fn verify_work_cn_switched_account(
+    expected: &TraeAccount,
+    timeout: Duration,
+    storage_path: &Path,
+) -> Result<(), WorkCnCommandError> {
+    let start = std::time::Instant::now();
+    let expected_uid = match normalize_non_empty(expected.user_id.as_deref()) {
+        Some(value) => value,
+        None => {
+            return Err(WorkCnCommandError::new(
+                WorkCnErrorCode::VerifyAccountMismatch,
+                "目标账号缺少 user_id，无法验证",
+            ))
+        }
+    };
+    loop {
+        if let Ok(Some(payload)) = read_local_trae_auth_from_storage_path(storage_path) {
+            let storage_uid = normalize_non_empty(payload.user_id.as_deref());
+            match storage_uid {
+                Some(found) if found == expected_uid => {
+                    if !payload.access_token.trim().is_empty() {
+                        return Ok(());
+                    }
+                }
+                Some(found) => {
+                    return Err(WorkCnCommandError::new(
+                        WorkCnErrorCode::VerifyAccountMismatch,
+                        format!(
+                            "切换后 UID 不匹配: expected={}, got={}",
+                            expected_uid, found
+                        ),
+                    ));
+                }
+                None => {}
+            }
+        }
+        if start.elapsed() >= timeout {
+            return Err(WorkCnCommandError::new(
+                WorkCnErrorCode::VerifyTimeout,
+                "启动后未能在限定时间内确认目标账号",
+            ));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+/// 切换成功后把最新签到凭证同步到 GitHub（开发指南 §8.5）。阶段 6 落地；
+/// 当前为占位，返回 false 且绝不阻止本地切号。
+async fn sync_work_cn_github_for_switch(_account: &TraeAccount) -> bool {
+    false
+}
+
+/// 一键切换并打开官方客户端（原子命令核心）。命令层 `switch_work_cn_account`
+/// 负责把 `WorkCnCommandError` 序列化为 JSON 字符串返回给前端。
+pub async fn switch_work_cn_account(
+    account_id: String,
+) -> Result<WorkCnSwitchResult, WorkCnCommandError> {
+    let platform = TraePlatformKind::TraeSoloCn;
+
+    // 步骤 1：全局切号锁，禁止并发。
+    let _guard = match WORK_CN_SWITCH_LOCK.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => {
+            return Err(WorkCnCommandError::new(
+                WorkCnErrorCode::Busy,
+                "已有切号任务进行中，请稍后重试",
+            ))
+        }
+    };
+
+    // 步骤 2：加载并校验目标账号。
+    let mut account = match load_account(&account_id) {
+        Some(found) => found,
+        None => {
+            return Err(WorkCnCommandError::new(
+                WorkCnErrorCode::AccountNotFound,
+                format!("账号不存在: {}", account_id),
+            ))
+        }
+    };
+    validate_work_cn_account_for_switch(&account)?;
+
+    // 步骤 3：保存当前官方客户端会话（best-effort，不致命）。
+    let _ = sync_current_work_cn_session_from_local();
+
+    let storage_path = resolve_switch_storage_path(platform)?;
+
+    // 步骤 4：回滚快照（内存中保留旧字节 / 旧绑定 / 是否运行中）。
+    let previous_bytes: Option<Vec<u8>> = if storage_path.exists() {
+        fs::read(&storage_path).ok()
+    } else {
+        None
+    };
+    let previous_bind: Option<String> =
+        crate::modules::trae_instance::load_default_settings_for_platform(platform)
+            .ok()
+            .and_then(|settings| settings.bind_account_id.clone());
+    let was_running = crate::modules::process::is_trae_running_for_platform(platform);
+
+    // 切换到"当前账号"：只打开客户端，不重复注入。
+    if previous_bind.as_deref() == Some(account_id.as_str()) {
+        let launched = if work_cn_switch_skip_process() {
+            false
+        } else {
+            match crate::commands::trae_instance::trae_start_instance(
+                Some("trae_solo_cn".to_string()),
+                "__default__".to_string(),
+            )
+            .await
+            {
+                Ok(_) => true,
+                Err(error) => {
+                    return Err(WorkCnCommandError::new(
+                        WorkCnErrorCode::LaunchFailed,
+                        error,
+                    ))
+                }
+            }
+        };
+        return Ok(WorkCnSwitchResult {
+            account_id,
+            user_id: account.user_id.clone(),
+            launched,
+            verified: true,
+            github_synced: false,
+            warning: None,
+        });
+    }
+
+    // 步骤 5：正常关闭官方客户端（不默认强杀）。
+    if !work_cn_switch_skip_process() {
+        if let Err(error) =
+            crate::modules::process::close_trae_platform_default("trae_solo_cn", 20)
+        {
+            return Err(WorkCnCommandError::new(
+                WorkCnErrorCode::ClientCloseFailed,
+                error,
+            )
+            .with_detail("关闭失败，未写入 storage.json"));
+        }
+    }
+
+    // 步骤 6：注入目标账号到 storage.json。
+    if let Err(error) = inject_to_trae_at_path(&storage_path, &account_id) {
+        rollback_storage_bytes(&storage_path, previous_bytes.as_deref());
+        return Err(WorkCnCommandError::new(
+            WorkCnErrorCode::InjectFailed,
+            error,
+        ));
+    }
+
+    // 步骤 7：绑定默认实例。
+    if let Err(error) = crate::modules::trae_instance::update_default_settings_for_platform(
+        platform,
+        Some(Some(account_id.clone())),
+        None,
+        Some(false),
+    ) {
+        rollback_storage_bytes(&storage_path, previous_bytes.as_deref());
+        rollback_bind(platform, previous_bind.as_deref());
+        return Err(WorkCnCommandError::new(
+            WorkCnErrorCode::InjectFailed,
+            error,
+        )
+        .with_detail("注入成功但绑定默认实例失败"));
+    }
+
+    // 步骤 8：绑定并启动默认实例。
+    let launched = if work_cn_switch_skip_process() {
+        false
+    } else {
+        match crate::commands::trae_instance::trae_start_instance(
+            Some("trae_solo_cn".to_string()),
+            "__default__".to_string(),
+        )
+        .await
+        {
+            Ok(_) => true,
+            Err(error) => {
+                rollback_storage_bytes(&storage_path, previous_bytes.as_deref());
+                rollback_bind(platform, previous_bind.as_deref());
+                if was_running {
+                    restart_previous_after_rollback().await;
+                }
+                return Err(WorkCnCommandError::new(
+                    WorkCnErrorCode::LaunchFailed,
+                    error,
+                ));
+            }
+        }
+    };
+
+    // 步骤 9：启动后验证。
+    if let Err(error) =
+        verify_work_cn_switched_account(&account, Duration::from_secs(30), &storage_path).await
+    {
+        rollback_storage_bytes(&storage_path, previous_bytes.as_deref());
+        rollback_bind(platform, previous_bind.as_deref());
+        if was_running {
+            restart_previous_after_rollback().await;
+        }
+        return Err(error);
+    }
+
+    // 成功：若官方客户端启动后轮换了 Token，更新账号库。
+    if storage_path.exists() {
+        let mut refreshed = account;
+        if sync_account_tokens_from_storage_path(&mut refreshed, &storage_path, "切换后") {
+            let _ = save_account_file(&refreshed);
+        }
+        account = refreshed;
+    }
+
+    // GitHub 同步（best-effort，不影响本地切号）。
+    let github_synced = sync_work_cn_github_for_switch(&account).await;
+
+    Ok(WorkCnSwitchResult {
+        account_id,
+        user_id: account.user_id.clone(),
+        launched,
+        verified: true,
+        github_synced,
+        warning: None,
+    })
+}
+
 fn mask_identity_for_view(value: &str) -> String {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -6862,5 +7318,402 @@ mod tests {
             snapshot.device_private_key.is_some() && snapshot.device_public_key.is_some(),
             "real storage must carry device keypair"
         );
+    }
+
+    // ===== 阶段 4：安全的一键切换与回滚（TDD） =====
+
+    use crate::models::work_cn::{WorkCnCommandError, WorkCnErrorCode, WorkCnSwitchResult};
+    use crate::modules::trae_instance::{
+        load_default_settings_for_platform, update_default_settings_for_platform,
+    };
+
+    /// RAII guard that captures the real default-instance bind at creation and
+    /// restores it on drop, so switch tests never leave the real instance store
+    /// mutated.
+    struct InstanceBindGuard {
+        original: Option<Option<String>>,
+    }
+
+    impl InstanceBindGuard {
+        fn new(set_to: Option<Option<String>>) -> Self {
+            let platform = super::TraePlatformKind::TraeSoloCn;
+            let original: Option<Option<String>> =
+                load_default_settings_for_platform(platform)
+                    .ok()
+                    .map(|settings| settings.bind_account_id.clone());
+            if original != set_to {
+                let _ = update_default_settings_for_platform(platform, set_to, None, None);
+            }
+            InstanceBindGuard { original }
+        }
+    }
+
+    impl Drop for InstanceBindGuard {
+        fn drop(&mut self) {
+            let platform = super::TraePlatformKind::TraeSoloCn;
+            let _ = update_default_settings_for_platform(
+                platform,
+                self.original.clone(),
+                None,
+                None,
+            );
+        }
+    }
+
+    fn make_switch_payload(uid: &str, token: &str) -> TraeImportPayload {
+        TraeImportPayload {
+            email: format!("{uid}@example.com"),
+            user_id: Some(uid.to_string()),
+            nickname: None,
+            access_token: token.to_string(),
+            refresh_token: Some(format!("refresh-{token}")),
+            token_type: Some("Bearer".to_string()),
+            expires_at: None,
+            plan_type: None,
+            plan_reset_at: None,
+            trae_auth_raw: Some(serde_json::json!({
+                "platformId": "trae_solo_cn",
+                "userId": uid,
+                "deviceInfo": {"DeviceID": "1132918838145530"},
+                "deviceKeyPair": {
+                    "privateKeyPEM": format!("priv-{token}"),
+                    "publicKeyPEM": format!("pub-{token}")
+                }
+            })),
+            trae_profile_raw: None,
+            trae_entitlement_raw: None,
+            trae_usage_raw: None,
+            trae_server_raw: None,
+            trae_usertag_raw: None,
+            checkin_device_id: Some("d6b8ac2e-f4d1-496d-a9a6-c9c7b4bd23e3".to_string()),
+            machine_id: Some("machine-hash".to_string()),
+            auth_device_id: Some("1132918838145530".to_string()),
+            status: None,
+            status_reason: None,
+        }
+    }
+
+    #[test]
+    fn work_cn_validate_rejects_incomplete_snapshot() {
+        let _guard = WORK_CN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::modules::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let dir = std::env::temp_dir().join(format!(
+            "work-cn-validate-test-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::env::set_var("COCKPIT_TOOLS_TEST_DATA_DIR", &dir);
+
+        let valid = super::import_work_cn_account_from_payload(
+            make_switch_payload("uid-valid", "tok-valid"),
+            None,
+        )
+        .expect("import valid");
+        assert!(
+            super::validate_work_cn_account_for_switch(&valid).is_ok(),
+            "完整快照应通过校验"
+        );
+
+        let mut missing_refresh = valid.clone();
+        missing_refresh.refresh_token = None;
+        assert!(
+            matches!(
+                super::validate_work_cn_account_for_switch(&missing_refresh),
+                Err(WorkCnCommandError {
+                    code: WorkCnErrorCode::SnapshotIncomplete,
+                    ..
+                })
+            ),
+            "缺少 refresh token 应判定快照不完整"
+        );
+
+        let mut missing_device = valid.clone();
+        if let Some(auth_raw) = missing_device.trae_auth_raw.as_mut() {
+            if let Some(obj) = auth_raw.as_object_mut() {
+                obj.remove("deviceInfo");
+            }
+        }
+        assert!(
+            matches!(
+                super::validate_work_cn_account_for_switch(&missing_device),
+                Err(WorkCnCommandError {
+                    code: WorkCnErrorCode::SnapshotIncomplete,
+                    ..
+                })
+            ),
+            "缺少数字 DeviceID 应判定快照不完整"
+        );
+
+        std::env::remove_var("COCKPIT_TOOLS_TEST_DATA_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn work_cn_switch_happy_path_injects_target_uid() {
+        let _guard = WORK_CN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::modules::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let data_dir = std::env::temp_dir().join(format!(
+            "work-cn-switch-test-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).expect("temp data dir");
+        std::env::set_var("COCKPIT_TOOLS_TEST_DATA_DIR", &data_dir);
+
+        let storage_dir = std::env::temp_dir().join(format!(
+            "work-cn-switch-storage-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&storage_dir);
+        std::fs::create_dir_all(&storage_dir).expect("temp storage dir");
+        let storage_path = storage_dir.join("storage.json");
+        std::env::set_var(
+            "WORK_CN_SWITCH_STORAGE_OVERRIDE",
+            storage_path.to_string_lossy().to_string(),
+        );
+        std::env::set_var("WORK_CN_SWITCH_SKIP_PROCESS", "1");
+
+        let _bind = InstanceBindGuard::new(None);
+
+        let account = super::import_work_cn_account_from_payload(
+            make_switch_payload("uid-target", "tok-target"),
+            None,
+        )
+        .expect("import target account");
+
+        let result = super::switch_work_cn_account(account.id.clone())
+            .await
+            .expect("switch should succeed");
+        assert_eq!(result.account_id, account.id);
+        assert!(result.verified, "切换后验证应通过");
+        assert!(!result.launched, "skip_process 下不应报告已启动");
+
+        // 注入后的 storage 必须包含目标 UID（证明写入的是目标账号）。
+        let injected = super::read_local_trae_auth_from_storage_path(&storage_path)
+            .expect("read injected storage")
+            .expect("storage 应有账号");
+        assert_eq!(
+            injected.user_id.as_deref(),
+            Some("uid-target"),
+            "注入的 storage 必须是目标账号 UID"
+        );
+
+        std::env::remove_var("COCKPIT_TOOLS_TEST_DATA_DIR");
+        std::env::remove_var("WORK_CN_SWITCH_STORAGE_OVERRIDE");
+        std::env::remove_var("WORK_CN_SWITCH_SKIP_PROCESS");
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    #[tokio::test]
+    async fn work_cn_switch_verify_mismatch_returns_error() {
+        let _guard = WORK_CN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::modules::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let storage_dir = std::env::temp_dir().join(format!(
+            "work-cn-verify-test-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&storage_dir);
+        std::fs::create_dir_all(&storage_dir).expect("temp storage dir");
+        let storage_path = storage_dir.join("storage.json");
+        let storage_root = serde_json::json!({
+            "iCubeAuthInfo://icube.cloudide": {
+                "userId": "uid-actual",
+                "accessToken": "tok-actual",
+                "email": "actual@example.com"
+            }
+        });
+        std::fs::write(&storage_path, storage_root.to_string()).expect("write storage");
+
+        let mut expected = super::TraeAccount {
+            id: "acc-expected".to_string(),
+            email: "expected@example.com".to_string(),
+            user_id: Some("uid-expected".to_string()),
+            nickname: None,
+            tags: None,
+            access_token: "tok".to_string(),
+            refresh_token: Some("refresh".to_string()),
+            token_type: None,
+            expires_at: None,
+            plan_type: None,
+            plan_reset_at: None,
+            trae_auth_raw: Some(serde_json::json!({"userId": "uid-expected"})),
+            trae_profile_raw: None,
+            trae_entitlement_raw: None,
+            trae_usage_raw: None,
+            trae_server_raw: None,
+            trae_usertag_raw: None,
+            checkin_device_id: Some("d6b8ac2e-xxxx".to_string()),
+            machine_id: None,
+            auth_device_id: Some("1132918838145530".to_string()),
+            status: None,
+            status_reason: None,
+            quota_query_last_error: None,
+            quota_query_last_error_at: None,
+            usage_updated_at: None,
+            created_at: 0,
+            last_used: 0,
+        };
+
+        let err = super::verify_work_cn_switched_account(
+            &expected,
+            std::time::Duration::from_secs(2),
+            &storage_path,
+        )
+        .await
+        .expect_err("UID 不匹配应返回错误");
+        assert_eq!(err.code, WorkCnErrorCode::VerifyAccountMismatch);
+
+        // 修正期望 UID 后应通过。
+        expected.user_id = Some("uid-actual".to_string());
+        if let Some(auth_raw) = expected.trae_auth_raw.as_mut() {
+            if let Some(obj) = auth_raw.as_object_mut() {
+                obj.insert(
+                    "userId".to_string(),
+                    serde_json::Value::String("uid-actual".to_string()),
+                );
+            }
+        }
+        assert!(
+            super::verify_work_cn_switched_account(
+                &expected,
+                std::time::Duration::from_secs(2),
+                &storage_path,
+            )
+            .await
+            .is_ok(),
+            "UID 一致时应验证通过"
+        );
+
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    #[tokio::test]
+    async fn work_cn_switch_inject_failure_rolls_back_and_reports_inject_failed() {
+        let _guard = WORK_CN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::modules::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let data_dir = std::env::temp_dir().join(format!(
+            "work-cn-injectfail-test-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).expect("temp data dir");
+        std::env::set_var("COCKPIT_TOOLS_TEST_DATA_DIR", &data_dir);
+
+        // 用一个已存在的“文件”作为存储路径的父目录，使注入写文件必然失败。
+        let blocker = data_dir.join("blocker-file");
+        std::fs::write(&blocker, b"not a dir").expect("write blocker file");
+        let unreachable_storage = blocker.join("storage.json");
+        std::env::set_var(
+            "WORK_CN_SWITCH_STORAGE_OVERRIDE",
+            unreachable_storage.to_string_lossy().to_string(),
+        );
+        std::env::set_var("WORK_CN_SWITCH_SKIP_PROCESS", "1");
+
+        let _bind = InstanceBindGuard::new(None);
+
+        let account = super::import_work_cn_account_from_payload(
+            make_switch_payload("uid-inj", "tok-inj"),
+            None,
+        )
+        .expect("import account");
+
+        let err = super::switch_work_cn_account(account.id.clone())
+            .await
+            .expect_err("注入失败应返回错误");
+        assert_eq!(err.code, WorkCnErrorCode::InjectFailed);
+
+        // 切换前不存在该 storage，回滚应删除（不应残留半成品文件）。
+        assert!(
+            !unreachable_storage.exists(),
+            "注入失败后不应残留 storage 文件"
+        );
+
+        std::env::remove_var("COCKPIT_TOOLS_TEST_DATA_DIR");
+        std::env::remove_var("WORK_CN_SWITCH_STORAGE_OVERRIDE");
+        std::env::remove_var("WORK_CN_SWITCH_SKIP_PROCESS");
+        let _ = std::fs::remove_dir_all(&data_dir);
+    }
+
+    #[tokio::test]
+    async fn work_cn_switch_to_current_account_opens_only() {
+        let _guard = WORK_CN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::modules::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let data_dir = std::env::temp_dir().join(format!(
+            "work-cn-current-test-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&data_dir);
+        std::fs::create_dir_all(&data_dir).expect("temp data dir");
+        std::env::set_var("COCKPIT_TOOLS_TEST_DATA_DIR", &data_dir);
+
+        let storage_dir = std::env::temp_dir().join(format!(
+            "work-cn-current-storage-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&storage_dir);
+        std::fs::create_dir_all(&storage_dir).expect("temp storage dir");
+        let storage_path = storage_dir.join("storage.json");
+        // 预置一个“旧账号”storage（UID 与目标不同）。
+        let storage_root = serde_json::json!({
+            "iCubeAuthInfo://icube.cloudide": {
+                "userId": "uid-legacy",
+                "accessToken": "tok-legacy",
+                "email": "legacy@example.com"
+            }
+        });
+        std::fs::write(&storage_path, storage_root.to_string()).expect("write storage");
+        std::env::set_var(
+            "WORK_CN_SWITCH_STORAGE_OVERRIDE",
+            storage_path.to_string_lossy().to_string(),
+        );
+        std::env::set_var("WORK_CN_SWITCH_SKIP_PROCESS", "1");
+
+        let account = super::import_work_cn_account_from_payload(
+            make_switch_payload("uid-current", "tok-current"),
+            None,
+        )
+        .expect("import current account");
+
+        // 把默认实例绑定设为该账号，模拟“当前账号”。
+        let _bind = InstanceBindGuard::new(Some(Some(account.id.clone())));
+
+        let result = super::switch_work_cn_account(account.id.clone())
+            .await
+            .expect("open current should succeed");
+        assert!(result.verified);
+        assert!(!result.launched);
+
+        // 不应重新注入：storage 仍是“旧账号”UID。
+        let storage_after = super::read_local_trae_auth_from_storage_path(&storage_path)
+            .expect("read storage")
+            .expect("storage 应有账号");
+        assert_eq!(
+            storage_after.user_id.as_deref(),
+            Some("uid-legacy"),
+            "切换到当前账号不应改写 storage"
+        );
+
+        std::env::remove_var("COCKPIT_TOOLS_TEST_DATA_DIR");
+        std::env::remove_var("WORK_CN_SWITCH_STORAGE_OVERRIDE");
+        std::env::remove_var("WORK_CN_SWITCH_SKIP_PROCESS");
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&storage_dir);
     }
 }

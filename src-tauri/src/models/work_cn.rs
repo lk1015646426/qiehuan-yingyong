@@ -68,3 +68,74 @@ pub struct WorkCnAccountView {
     pub valid_for_switch: bool,
     pub warnings: Vec<String>,
 }
+
+/// Result of a one-click Work CN account switch (阶段 4).
+///
+/// `github_synced` is best-effort: a GitHub sync failure never blocks the local
+/// switch, it is only reported here so the UI can surface a "待同步" hint.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkCnSwitchResult {
+    pub account_id: String,
+    pub user_id: Option<String>,
+    pub launched: bool,
+    pub verified: bool,
+    pub github_synced: bool,
+    pub warning: Option<String>,
+}
+
+/// Structured error codes for Work CN commands so the frontend never has to
+/// branch on Chinese error strings (开发指南 §8.4).
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum WorkCnErrorCode {
+    AccountNotFound,
+    SnapshotIncomplete,
+    ClientNotInstalled,
+    ClientCloseFailed,
+    StorageBackupFailed,
+    InjectFailed,
+    LaunchFailed,
+    VerifyTimeout,
+    VerifyAccountMismatch,
+    RollbackFailed,
+    Busy,
+}
+
+/// Unified command error: a machine-readable `code` plus a human message and
+/// optional detail. Serialized to a JSON string for Tauri command `Err`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkCnCommandError {
+    pub code: WorkCnErrorCode,
+    pub message: String,
+    pub detail: Option<String>,
+}
+
+impl WorkCnCommandError {
+    pub fn new(code: WorkCnErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            detail: None,
+        }
+    }
+
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+}
+
+/// Serialize a `WorkCnCommandError` into the JSON-string form Tauri commands use
+/// for `Err`, so the frontend can `JSON.parse` it back into a structured error.
+pub fn command_error_to_string(err: &WorkCnCommandError) -> String {
+    serde_json::to_string(err).unwrap_or_else(|_| {
+        format!(
+            "{{\"code\":{},\"message\":{}}}",
+            serde_json::to_string(&err.code).unwrap_or_else(|_| "\"UNKNOWN\"".to_string()),
+            serde_json::to_string(&err.message).unwrap_or_else(|_| "\"error\"".to_string())
+        )
+    })
+}
+

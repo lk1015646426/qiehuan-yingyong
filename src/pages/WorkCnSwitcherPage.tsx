@@ -225,10 +225,19 @@ function SnapshotBadges({ account }: { account: WorkCnAccountView }) {
   );
 }
 
-function AccountCard({ account }: { account: WorkCnAccountView }) {
+function AccountCard({
+  account,
+  switching,
+  onSwitch,
+}: {
+  account: WorkCnAccountView;
+  switching: boolean;
+  onSwitch: () => void;
+}) {
   const title = account.tags?.length
     ? account.tags[0]
     : account.nickname ?? account.email ?? account.userId ?? account.id;
+  const canSwitch = account.validForSwitch && !switching;
   return (
     <div style={slotStyle}>
       <div style={slotTitleStyle}>{title}</div>
@@ -240,7 +249,39 @@ function AccountCard({ account }: { account: WorkCnAccountView }) {
       {account.warnings.length ? (
         <div style={warningStyle}>{account.warnings.join('；')}</div>
       ) : null}
+      <div style={{ marginTop: 'auto' }}>
+        <button
+          type="button"
+          style={account.validForSwitch ? primaryButtonStyle : buttonStyle}
+          disabled={!canSwitch}
+          onClick={onSwitch}
+          title={
+            account.validForSwitch
+              ? '关闭当前客户端并注入该账号后打开'
+              : '设备密钥不完整，请重新登录并导入'
+          }
+        >
+          {switching ? '切换中…' : account.validForSwitch ? '切换并打开' : '快照不完整'}
+        </button>
+      </div>
     </div>
+  );
+}
+
+function StoreErrorBanner() {
+  const error = useWorkCnStore((s) => s.error);
+  const clearError = useWorkCnStore((s) => s.clearError);
+  if (!error) {
+    return null;
+  }
+  return (
+    <section style={{ ...statusStyle, borderColor: '#fecaca', color: '#b91c1c' }}>
+      <span style={statusDotErrorStyle} />
+      <div style={{ flex: 1 }}>{error}</div>
+      <button type="button" style={buttonStyle} onClick={clearError}>
+        知道了
+      </button>
+    </section>
   );
 }
 
@@ -254,6 +295,8 @@ export function WorkCnSwitcherPage() {
   const storeLoading = useWorkCnStore((s) => s.loading);
   const loadAccounts = useWorkCnStore((s) => s.loadAccounts);
   const lastImportWarning = useWorkCnStore((s) => s.lastImportWarning);
+  const switchingId = useWorkCnStore((s) => s.switchingId);
+  const switchTo = useWorkCnStore((s) => s.switchTo);
 
   useEffect(() => {
     let cancelled = false;
@@ -327,6 +370,8 @@ export function WorkCnSwitcherPage() {
         </section>
       ) : null}
 
+      <StoreErrorBanner />
+
       <section>
         <h2 style={sectionTitleStyle}>
           账号槽位（{accounts.length}/{ACCOUNT_SLOT_COUNT}）
@@ -334,7 +379,12 @@ export function WorkCnSwitcherPage() {
         </h2>
         <div style={slotsStyle}>
           {accounts.map((account) => (
-            <AccountCard key={account.id} account={account} />
+            <AccountCard
+              key={account.id}
+              account={account}
+              switching={switchingId === account.id}
+              onSwitch={() => void switchTo(account.id)}
+            />
           ))}
           {Array.from({ length: emptySlots }, (_, index) => (
             <div key={`empty-${index}`} style={slotStyle}>
