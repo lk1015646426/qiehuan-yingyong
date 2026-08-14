@@ -1125,6 +1125,8 @@ pub fn run() {
             commands::trae_instance::trae_stop_instance,
             commands::trae_instance::trae_open_instance_window,
             commands::trae_instance::trae_close_all_instances,
+            // Work CN Commands
+            commands::work_cn::get_work_cn_installation,
             // Cursor Commands
             commands::cursor::list_cursor_accounts,
             commands::cursor::delete_cursor_account,

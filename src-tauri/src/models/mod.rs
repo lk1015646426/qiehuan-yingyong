@@ -15,6 +15,7 @@ pub mod token;
 pub mod trae;
 pub mod windsurf;
 pub mod workbuddy;
+pub mod work_cn;
 pub mod zcode;
 pub mod zed;
 

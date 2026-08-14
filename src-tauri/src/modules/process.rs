@@ -1070,12 +1070,12 @@ fn windows_trae_candidate_matches_platform(
     path: &std::path::Path,
     platform: crate::modules::trae_account::TraePlatformKind,
 ) -> bool {
-    let expected = platform.app_support_dir_name();
+    let expected = platform.app_support_dir_aliases();
     path.components().any(|component| {
         component
             .as_os_str()
             .to_str()
-            .map(|value| value.eq_ignore_ascii_case(expected))
+            .map(|value| expected.iter().any(|alias| value.eq_ignore_ascii_case(alias)))
             .unwrap_or(false)
     })
 }
@@ -2741,19 +2741,13 @@ fn detect_trae_exec_path_for_platform(
     #[cfg(target_os = "windows")]
     {
         let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-        let app_dir = platform.app_support_dir_name();
-        let exe_names: &[&str] = match platform {
-            crate::modules::trae_account::TraePlatformKind::Trae => &["Trae.exe"],
-            crate::modules::trae_account::TraePlatformKind::TraeSolo => {
-                &["TRAE SOLO.exe", "Trae.exe", "Electron.exe"]
-            }
-            crate::modules::trae_account::TraePlatformKind::TraeCn => {
-                &["Trae CN.exe", "Trae.exe", "Electron.exe"]
-            }
-            crate::modules::trae_account::TraePlatformKind::TraeSoloCn => {
-                &["TRAE SOLO CN.exe", "Trae.exe", "Electron.exe"]
-            }
-        };
+        // TraeSoloCn ships under renamed install/user-data directories ("TRAE
+        // Work CN", "TraeWork CN") while still using the legacy "TRAE SOLO CN"
+        // path on existing machines. Probe every alias so detection survives
+        // the rebrand.
+        let app_dirs: &[&str] = platform.app_support_dir_aliases();
+        let exe_names: &[&str] =
+            crate::modules::trae_account::trae_product_exe_names(platform);
         for base_path in crate::modules::trae_account::windows_trae_install_base_paths(platform) {
             if base_path.is_file() {
                 candidates.push(base_path);
@@ -2769,36 +2763,42 @@ fn detect_trae_exec_path_for_platform(
             for root in
                 expand_windows_scan_roots(parse_windows_scan_roots(Some(configured_scan_roots)))
             {
-                for exe_name in exe_names {
-                    if root
+                for app_dir in app_dirs {
+                    let root_matches_alias = root
                         .file_name()
                         .and_then(|value| value.to_str())
                         .map(|value| value.eq_ignore_ascii_case(app_dir))
-                        .unwrap_or(false)
-                    {
-                        candidates.push(root.join(exe_name));
+                        .unwrap_or(false);
+                    for exe_name in exe_names {
+                        if root_matches_alias {
+                            candidates.push(root.join(exe_name));
+                        }
+                        candidates.push(root.join(app_dir).join(exe_name));
                     }
-                    candidates.push(root.join(app_dir).join(exe_name));
                 }
             }
         }
         if let Ok(local_appdata) = std::env::var("LOCALAPPDATA") {
-            for exe_name in exe_names {
-                candidates.push(
-                    std::path::PathBuf::from(&local_appdata)
-                        .join("Programs")
-                        .join(app_dir)
-                        .join(exe_name),
-                );
+            for app_dir in app_dirs {
+                for exe_name in exe_names {
+                    candidates.push(
+                        std::path::PathBuf::from(&local_appdata)
+                            .join("Programs")
+                            .join(app_dir)
+                            .join(exe_name),
+                    );
+                }
             }
         }
         if let Ok(program_files) = std::env::var("PROGRAMFILES") {
-            for exe_name in exe_names {
-                candidates.push(
-                    std::path::PathBuf::from(&program_files)
-                        .join(app_dir)
-                        .join(exe_name),
-                );
+            for app_dir in app_dirs {
+                for exe_name in exe_names {
+                    candidates.push(
+                        std::path::PathBuf::from(&program_files)
+                            .join(app_dir)
+                            .join(exe_name),
+                    );
+                }
             }
         }
         for candidate in candidates {
@@ -4124,7 +4124,7 @@ fn trae_configured_app_scan_roots(
     }
 }
 
-fn resolve_trae_launch_path_for_platform(
+pub(crate) fn resolve_trae_launch_path_for_platform(
     platform: crate::modules::trae_account::TraePlatformKind,
 ) -> Result<std::path::PathBuf, String> {
     let current = config::get_user_config();

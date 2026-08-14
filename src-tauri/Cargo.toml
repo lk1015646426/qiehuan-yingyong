@@ -79,6 +79,13 @@ sha1 = "0.10"
 [target.'cfg(target_os = "windows")'.dependencies]
 windows = { version = "0.58", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Security_Cryptography", "Win32_Storage_FileSystem", "Win32_System_Com", "Win32_System_LibraryLoader", "Win32_System_ProcessStatus", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 junction.workspace = true
+# Native registry access for install detection. The upstream `cmd /u /c reg query`
+# path fails on CN-locale Windows (reg returns "key not found" when wrapped by
+# cmd) and would corrupt GBK-encoded paths; winreg reads REG_SZ as proper
+# Unicode. Pinned to 0.10 (already resolved transitively via auto_launch) so
+# its `winapi`-based HKEY matches this project's toolchain and avoids a
+# windows_sys version skew with winreg 0.55.
+winreg = "0.10"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 mac-notification-sys = "0.6"

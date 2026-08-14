@@ -1,10 +1,13 @@
 // TRAE Work CN 账号切换器 - 主页面
 //
-// 阶段 1：仅渲染静态应用壳框架。
-// 客户端检测、账号导入、一键切换、积分查询等能力将在后续阶段接入
-// 上游既有 Tauri 命令，本文件暂不调用任何后端接口。
+// 阶段 1：渲染静态应用壳框架。
+// 阶段 2：调用 get_work_cn_installation 在状态栏显示客户端检测结果。
+// 账号导入、一键切换、积分查询等能力将在后续阶段接入上游既有 Tauri 命令。
 
+import { useEffect, useState } from 'react';
 import type { CSSProperties } from 'react';
+import { getWorkCnInstallation } from '../services/workCnService';
+import type { WorkCnInstallation } from '../types/workCn';
 
 const ACCOUNT_SLOT_COUNT = 4;
 
@@ -111,7 +114,95 @@ const slotStatusStyle: CSSProperties = {
   color: '#8a909c',
 };
 
+const statusDetailStyle: CSSProperties = {
+  fontSize: 12,
+  color: '#8a909c',
+  marginTop: 4,
+  wordBreak: 'break-all',
+};
+
+const statusDotOkStyle: CSSProperties = {
+  ...statusDotStyle,
+  background: '#22c55e',
+};
+
+const statusDotErrorStyle: CSSProperties = {
+  ...statusDotStyle,
+  background: '#ef4444',
+};
+
+function renderInstallationStatus(
+  installation: WorkCnInstallation | null,
+  loading: boolean,
+  error: string | null,
+): { dot: CSSProperties; line: string; detail?: string } {
+  if (loading) {
+    return { dot: statusDotStyle, line: '客户端检测：正在检测 TRAE Work CN 安装…' };
+  }
+  if (error) {
+    return {
+      dot: statusDotErrorStyle,
+      line: '客户端检测失败，请稍后重试或在设置中手动指定路径',
+      detail: error,
+    };
+  }
+  if (!installation || !installation.installed) {
+    const legacyNote = installation?.legacyPath ? '（兼容旧数据目录）' : '';
+    const detail = installation?.userDataDir
+      ? `数据目录：${installation.userDataDir}${legacyNote}`
+      : undefined;
+    return {
+      dot: statusDotErrorStyle,
+      line: '未检测到 TRAE Work CN，请在设置中选择 EXE 路径',
+      detail,
+    };
+  }
+  const versionText = installation.version ? ` ${installation.version}` : '';
+  const dataDirText = installation.userDataDir ?? '';
+  const legacyNote = installation.legacyPath
+    ? '（兼容旧数据目录）'
+    : '';
+  return {
+    dot: statusDotOkStyle,
+    line: `已检测到 TRAE Work CN${versionText}`,
+    detail: [installation.executablePath, dataDirText ? `数据目录：${dataDirText}${legacyNote}` : '']
+      .filter(Boolean)
+      .join('\n'),
+  };
+}
+
 export function WorkCnSwitcherPage() {
+  const [installation, setInstallation] = useState<WorkCnInstallation | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    getWorkCnInstallation()
+      .then((result) => {
+        if (!cancelled) {
+          setInstallation(result);
+          setError(null);
+        }
+      })
+      .catch((err: unknown) => {
+        if (!cancelled) {
+          setError(err instanceof Error ? err.message : String(err));
+        }
+      })
+      .finally(() => {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const status = renderInstallationStatus(installation, loading, error);
+
   return (
     <div style={pageStyle}>
       <header style={headerStyle}>
@@ -127,8 +218,17 @@ export function WorkCnSwitcherPage() {
       </header>
 
       <section style={statusStyle}>
-        <span style={statusDotStyle} />
-        <span>客户端检测：等待检测 TRAE Work CN 安装…</span>
+        <span style={status.dot} />
+        <div>
+          <div>{status.line}</div>
+          {status.detail ? (
+            <div style={statusDetailStyle}>
+              {status.detail.split('\n').map((line, index) => (
+                <div key={index}>{line}</div>
+              ))}
+            </div>
+          ) : null}
+        </div>
       </section>
 
       <section style={slotsStyle}>

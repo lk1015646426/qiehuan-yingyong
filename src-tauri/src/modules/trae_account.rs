@@ -103,6 +103,19 @@ impl TraePlatformKind {
         self.display_name()
     }
 
+    /// Directory name aliases used by the official client install/user-data dirs.
+    /// TraeSoloCn ("TRAE Work CN") keeps the legacy "TRAE SOLO CN" name on disk
+    /// and may also appear under renamed variants; the first entry stays the
+    /// canonical default so existing installs keep resolving to the same path.
+    pub fn app_support_dir_aliases(self) -> &'static [&'static str] {
+        match self {
+            Self::Trae => &["Trae"],
+            Self::TraeSolo => &["TRAE SOLO"],
+            Self::TraeCn => &["Trae CN"],
+            Self::TraeSoloCn => &["TRAE SOLO CN", "TRAE Work CN", "TraeWork CN"],
+        }
+    }
+
     #[cfg(target_os = "macos")]
     pub fn macos_app_name(self) -> &'static str {
         match self {
@@ -1973,6 +1986,147 @@ pub fn get_default_trae_storage_path() -> Result<PathBuf, String> {
     get_default_trae_storage_path_for_platform(TraePlatformKind::Trae)
 }
 
+/// All on-disk data directory candidates for a platform. For TraeSoloCn this
+/// covers the legacy `TRAE SOLO CN` install as well as the renamed `TRAE Work CN`
+/// and `TraeWork CN` variants, so detection keeps working after the upstream
+/// rebrand without forcing a user directory migration.
+pub fn get_trae_data_dir_candidates_for_platform(
+    platform: TraePlatformKind,
+) -> Result<Vec<PathBuf>, String> {
+    #[cfg(target_os = "macos")]
+    {
+        let home = dirs::home_dir().ok_or("无法获取用户主目录")?;
+        let base = home.join("Library/Application Support");
+        return Ok(platform
+            .app_support_dir_aliases()
+            .iter()
+            .map(|name| base.join(name))
+            .collect());
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        let appdata =
+            std::env::var("APPDATA").map_err(|_| "无法获取 APPDATA 环境变量".to_string())?;
+        let base = PathBuf::from(appdata);
+        return Ok(platform
+            .app_support_dir_aliases()
+            .iter()
+            .map(|name| base.join(name))
+            .collect());
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let home = dirs::home_dir().ok_or("无法获取用户主目录")?;
+        let base = home.join(".config");
+        return Ok(platform
+            .app_support_dir_aliases()
+            .iter()
+            .map(|name| base.join(name))
+            .collect());
+    }
+
+    #[allow(unreachable_code)]
+    Err("Trae 仅支持 macOS、Windows 和 Linux".to_string())
+}
+
+fn storage_json_has_login_info(storage_path: &Path) -> bool {
+    let Ok(content) = fs::read_to_string(storage_path) else {
+        return false;
+    };
+    if content.trim().is_empty() {
+        return false;
+    }
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(&content) else {
+        return false;
+    };
+    map.keys().any(|key| key.starts_with("iCubeAuthInfo://"))
+}
+
+/// Pick the best data directory among candidates.
+///
+/// Selection rules (mirrors the development guide §9.3):
+/// 1. Only candidates that exist on disk are considered.
+/// 2. Prefer candidates whose `User/globalStorage/storage.json` parses and
+///    contains at least one `iCubeAuthInfo://*` key (a real login snapshot).
+/// 3. Among valid candidates, choose the one with the most recently modified
+///    `storage.json`; ties keep the candidate order.
+/// 4. If no candidate has a valid login snapshot, fall back to the first
+///    existing candidate so legacy installs keep working.
+/// 5. Returns `None` only when none of the candidates exist.
+pub fn select_trae_data_dir_candidate(candidates: &[PathBuf]) -> Option<PathBuf> {
+    let mut first_existing: Option<PathBuf> = None;
+    let mut valid: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+
+    for candidate in candidates {
+        if !candidate.is_dir() {
+            continue;
+        }
+        if first_existing.is_none() {
+            first_existing = Some(candidate.clone());
+        }
+
+        let storage_path = candidate
+            .join("User")
+            .join("globalStorage")
+            .join("storage.json");
+        if !storage_json_has_login_info(&storage_path) {
+            continue;
+        }
+
+        let modified = fs::metadata(&storage_path)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        valid.push((candidate.clone(), modified));
+    }
+
+    if !valid.is_empty() {
+        valid.sort_by(|a, b| b.1.cmp(&a.1));
+        return Some(valid[0].0.clone());
+    }
+
+    first_existing
+}
+
+/// Resolve the active data directory for a platform, falling back to the first
+/// candidate when nothing exists on disk yet (fresh install).
+pub fn resolve_trae_data_dir_for_platform(
+    platform: TraePlatformKind,
+) -> Result<PathBuf, String> {
+    let candidates = get_trae_data_dir_candidates_for_platform(platform)?;
+    if let Some(selected) = select_trae_data_dir_candidate(&candidates) {
+        return Ok(selected);
+    }
+    candidates
+        .into_iter()
+        .next()
+        .ok_or_else(|| "无可用数据目录候选".to_string())
+}
+
+/// Read the product version from `product.json` shipped next to the official
+/// executable. Returns `None` when the file is missing or has no version.
+pub fn detect_trae_product_version_for_exe(exe_path: &Path) -> Option<String> {
+    let base = if exe_path.is_dir() {
+        exe_path.to_path_buf()
+    } else {
+        exe_path.parent()?.to_path_buf()
+    };
+
+    for candidate in build_trae_product_file_candidates(&base) {
+        let Some(json) = parse_json_file(&candidate) else {
+            continue;
+        };
+        if let Some(version) = json.get("version").and_then(Value::as_str) {
+            let version = version.trim();
+            if !version.is_empty() {
+                return Some(version.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn read_storage_json(path: &Path) -> Result<Value, String> {
     if !path.exists() {
         return Err(format!("Trae storage.json 不存在: {}", path.display()));
@@ -2103,12 +2257,19 @@ fn build_trae_product_file_candidates(base_path: &Path) -> Vec<PathBuf> {
 }
 
 #[cfg(target_os = "windows")]
-fn trae_product_exe_names(platform: TraePlatformKind) -> &'static [&'static str] {
+pub(crate) fn trae_product_exe_names(platform: TraePlatformKind) -> &'static [&'static str] {
     match platform {
         TraePlatformKind::Trae => &["Trae.exe"],
         TraePlatformKind::TraeSolo => &["TRAE SOLO.exe", "Trae.exe", "Electron.exe"],
         TraePlatformKind::TraeCn => &["Trae CN.exe", "Trae.exe", "Electron.exe"],
-        TraePlatformKind::TraeSoloCn => &["TRAE SOLO CN.exe", "Trae.exe", "Electron.exe"],
+        // Renamed executables are probed before the legacy "TRAE SOLO CN.exe".
+        TraePlatformKind::TraeSoloCn => &[
+            "TRAE Work CN.exe",
+            "TraeWork CN.exe",
+            "TRAE SOLO CN.exe",
+            "Trae.exe",
+            "Electron.exe",
+        ],
     }
 }
 
@@ -2119,6 +2280,7 @@ const CREATE_NO_WINDOW: u32 = 0x08000000;
 const WINDOWS_CMD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 
 #[cfg(target_os = "windows")]
+#[allow(dead_code)]
 fn windows_cmd_output_utf16(args: &[&str]) -> Option<std::process::Output> {
     use std::os::windows::process::CommandExt;
 
@@ -2138,6 +2300,7 @@ fn windows_cmd_output_utf16(args: &[&str]) -> Option<std::process::Output> {
 }
 
 #[cfg(target_os = "windows")]
+#[allow(dead_code)]
 fn decode_utf16le(bytes: &[u8]) -> String {
     let words: Vec<u16> = bytes
         .chunks_exact(2)
@@ -2147,6 +2310,7 @@ fn decode_utf16le(bytes: &[u8]) -> String {
 }
 
 #[cfg(target_os = "windows")]
+#[allow(dead_code)]
 fn registry_line_value(line: &str) -> Option<String> {
     let pos = line.find("REG_")?;
     let after = &line[pos..];
@@ -2160,6 +2324,7 @@ fn registry_line_value(line: &str) -> Option<String> {
 }
 
 #[cfg(target_os = "windows")]
+#[allow(dead_code)]
 fn reg_query_value(key: &str, value_name: &str) -> Option<String> {
     let cmd = format!("reg query \"{}\" /v \"{}\"", key, value_name);
     let output = windows_cmd_output_utf16(&["/u", "/c", cmd.as_str()])?;
@@ -2202,7 +2367,7 @@ fn windows_uninstall_display_names(platform: TraePlatformKind) -> &'static [&'st
         TraePlatformKind::Trae => &["Trae"],
         TraePlatformKind::TraeSolo => &["TRAE SOLO"],
         TraePlatformKind::TraeCn => &["Trae CN"],
-        TraePlatformKind::TraeSoloCn => &["TRAE SOLO CN", "TRAE Work CN"],
+        TraePlatformKind::TraeSoloCn => &["TRAE SOLO CN", "TRAE Work CN", "TraeWork CN"],
     }
 }
 
@@ -2254,60 +2419,79 @@ fn push_windows_install_dir_candidates(
 
 #[cfg(target_os = "windows")]
 pub(crate) fn windows_trae_install_base_paths(platform: TraePlatformKind) -> Vec<PathBuf> {
-    let uninstall_roots = [
-        "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
-        "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
-        "HKLM\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
-    ];
-    let mut matched_keys = Vec::new();
+    // Read the Uninstall registry natively via winreg. The upstream
+    // `cmd /u /c reg query` wrapper fails on CN-locale Windows (reg returns
+    // "key not found" when spawned through cmd) and would corrupt GBK-encoded
+    // install paths; winreg reads REG_SZ/REG_EXPAND_SZ as proper Unicode.
+    use winreg::enums::*;
+    use winreg::RegKey;
 
-    for root in uninstall_roots {
-        let cmd = format!("reg query \"{}\" /s /v DisplayName", root);
-        let Some(output) = windows_cmd_output_utf16(&["/u", "/c", cmd.as_str()]) else {
+    let roots = [
+        (
+            HKEY_CURRENT_USER,
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+        ),
+        (
+            HKEY_LOCAL_MACHINE,
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+        ),
+        (
+            HKEY_LOCAL_MACHINE,
+            "Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+        ),
+    ];
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for (hive, path) in roots {
+        let Ok(uninstall) = RegKey::predef(hive).open_subkey(path) else {
             continue;
         };
-        if !output.status.success() {
-            continue;
-        }
-
-        let stdout = decode_utf16le(output.stdout.as_slice());
-        let mut current_key: Option<String> = None;
-        for line in stdout.lines() {
-            let trimmed = line.trim();
-            if trimmed.starts_with("HKEY_") {
-                current_key = Some(trimmed.to_string());
-                continue;
-            }
-            if !trimmed.to_ascii_lowercase().starts_with("displayname") {
-                continue;
-            }
-            let Some(display_name) = registry_line_value(trimmed) else {
+        for key_result in uninstall.enum_keys() {
+            let Ok(subkey_name) = key_result else {
                 continue;
             };
-            if windows_uninstall_display_name_matches(platform, display_name.as_str()) {
-                if let Some(key) = current_key.as_ref() {
-                    matched_keys.push(key.clone());
-                }
-            }
-        }
-    }
+            let Ok(subkey) = uninstall.open_subkey(&subkey_name) else {
+                continue;
+            };
 
-    let mut candidates = Vec::new();
-    for key in matched_keys {
-        if let Some(display_icon) = reg_query_value(key.as_str(), "DisplayIcon") {
-            if let Some(exe_path) = normalize_windows_registry_path(display_icon.as_str()) {
-                if let Some(parent) = exe_path.parent() {
-                    candidates.push(parent.to_path_buf());
-                }
-                candidates.push(exe_path);
+            let display_name: String = subkey.get_value("DisplayName").unwrap_or_default();
+            if !windows_uninstall_display_name_matches(platform, &display_name) {
+                continue;
             }
-        }
-        if let Some(install_location) = reg_query_value(key.as_str(), "InstallLocation") {
-            push_windows_install_dir_candidates(
-                &mut candidates,
-                install_location.as_str(),
-                platform,
-            );
+
+            let read_value = |name: &str| -> Option<String> {
+                subkey
+                    .get_value::<String, _>(name)
+                    .ok()
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+            };
+
+            if let Some(display_icon) = read_value("DisplayIcon") {
+                if let Some(exe_path) = normalize_windows_registry_path(&display_icon) {
+                    if let Some(parent) = exe_path.parent() {
+                        candidates.push(parent.to_path_buf());
+                    }
+                    candidates.push(exe_path);
+                }
+            }
+            if let Some(install_location) = read_value("InstallLocation") {
+                push_windows_install_dir_candidates(&mut candidates, &install_location, platform);
+            }
+            // UninstallString (e.g. "D:\\...\\unins000.exe") is a reliable
+            // fallback when DisplayIcon/InstallLocation are missing; its parent
+            // directory is the install root.
+            if let Some(uninstall_string) = read_value("UninstallString") {
+                if let Some(uninst_path) = normalize_windows_registry_path(&uninstall_string) {
+                    if let Some(parent) = uninst_path.parent() {
+                        push_windows_install_dir_candidates(
+                            &mut candidates,
+                            &parent.to_string_lossy(),
+                            platform,
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -5577,6 +5761,197 @@ mod tests {
             normalize_windows_registry_path("D:\\Apps\\TRAE SOLO CN\\"),
             Some(PathBuf::from("D:\\Apps\\TRAE SOLO CN\\"))
         );
+    }
+
+    fn work_cn_test_temp_dir(prefix: &str) -> PathBuf {
+        let unique = format!(
+            "{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_nanos())
+                .unwrap_or(0)
+        );
+        let dir = std::env::temp_dir().join(format!("{}_{}", prefix, unique));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn work_cn_write_storage(dir: &Path, with_login: bool) -> PathBuf {
+        let storage_path = dir
+            .join("User")
+            .join("globalStorage")
+            .join("storage.json");
+        if let Some(parent) = storage_path.parent() {
+            fs::create_dir_all(parent).expect("create storage parent");
+        }
+        let content = if with_login {
+            r#"{"iCubeAuthInfo://icube.cloudide":"cipher","telemetry.devDeviceId":"uuid"}"#
+        } else {
+            r#"{"telemetry.devDeviceId":"uuid"}"#
+        };
+        fs::write(&storage_path, content).expect("write storage");
+        storage_path
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn work_cn_uninstall_display_names_cover_traework_alias() {
+        assert!(windows_uninstall_display_name_matches(
+            TraePlatformKind::TraeSoloCn,
+            "TraeWork CN (User)"
+        ));
+        assert!(windows_uninstall_display_name_matches(
+            TraePlatformKind::TraeSoloCn,
+            "TraeWork CN"
+        ));
+        assert!(windows_uninstall_display_name_matches(
+            TraePlatformKind::TraeSoloCn,
+            "TRAE Work CN (User)"
+        ));
+        assert!(windows_uninstall_display_name_matches(
+            TraePlatformKind::TraeSoloCn,
+            "TRAE SOLO CN (User)"
+        ));
+        assert!(!windows_uninstall_display_name_matches(
+            TraePlatformKind::TraeSoloCn,
+            "Trae CN (User)"
+        ));
+        assert!(!windows_uninstall_display_name_matches(
+            TraePlatformKind::TraeSoloCn,
+            "TRAE SOLO"
+        ));
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn work_cn_exe_candidates_prefer_renamed_executables() {
+        let names = trae_product_exe_names(TraePlatformKind::TraeSoloCn);
+        let work = names
+            .iter()
+            .position(|name| *name == "TRAE Work CN.exe")
+            .expect("TRAE Work CN.exe candidate");
+        let traework = names
+            .iter()
+            .position(|name| *name == "TraeWork CN.exe")
+            .expect("TraeWork CN.exe candidate");
+        let solo = names
+            .iter()
+            .position(|name| *name == "TRAE SOLO CN.exe")
+            .expect("TRAE SOLO CN.exe candidate");
+        assert!(work < solo, "renamed exe must be probed before legacy");
+        assert!(traework < solo, "TraeWork exe must be probed before legacy");
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn work_cn_data_dir_candidates_cover_legacy_and_renamed_dirs() {
+        let candidates = get_trae_data_dir_candidates_for_platform(TraePlatformKind::TraeSoloCn)
+            .expect("data dir candidates");
+        let names: Vec<String> = candidates
+            .iter()
+            .filter_map(|path| path.file_name())
+            .filter_map(|name| name.to_str())
+            .map(|name| name.to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "TRAE SOLO CN".to_string(),
+                "TRAE Work CN".to_string(),
+                "TraeWork CN".to_string()
+            ]
+        );
+        for other in [
+            TraePlatformKind::Trae,
+            TraePlatformKind::TraeSolo,
+            TraePlatformKind::TraeCn,
+        ] {
+            let others = get_trae_data_dir_candidates_for_platform(other)
+                .expect("other platform candidates");
+            assert_eq!(others.len(), 1, "other platforms keep single data dir");
+        }
+    }
+
+    #[test]
+    fn work_cn_data_dir_selection_prefers_valid_newest_storage() {
+        let root = work_cn_test_temp_dir("work_cn_select_newest");
+        let legacy = root.join("TRAE SOLO CN");
+        let renamed = root.join("TRAE Work CN");
+        let missing = root.join("TraeWork CN");
+        work_cn_write_storage(&legacy, true);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        work_cn_write_storage(&renamed, true);
+
+        let candidates = vec![legacy.clone(), renamed.clone(), missing];
+        let selected = select_trae_data_dir_candidate(&candidates).expect("selected dir");
+        assert_eq!(selected, renamed);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn work_cn_data_dir_selection_falls_back_to_legacy_dir() {
+        let root = work_cn_test_temp_dir("work_cn_select_legacy");
+        let legacy = root.join("TRAE SOLO CN");
+        work_cn_write_storage(&legacy, true);
+
+        let candidates = vec![
+            legacy.clone(),
+            root.join("TRAE Work CN"),
+            root.join("TraeWork CN"),
+        ];
+        let selected = select_trae_data_dir_candidate(&candidates).expect("selected dir");
+        assert_eq!(selected, legacy);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn work_cn_data_dir_selection_skips_storage_without_login() {
+        let root = work_cn_test_temp_dir("work_cn_select_invalid");
+        let invalid = root.join("TRAE Work CN");
+        let valid = root.join("TRAE SOLO CN");
+        work_cn_write_storage(&invalid, false);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        work_cn_write_storage(&valid, true);
+
+        // The invalid dir has the newest storage.json but no login info;
+        // selection must still prefer the dir with a valid login snapshot.
+        let candidates = vec![valid.clone(), invalid.clone()];
+        let selected = select_trae_data_dir_candidate(&candidates).expect("selected dir");
+        assert_eq!(selected, valid);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn work_cn_data_dir_selection_returns_none_when_all_missing() {
+        let root = work_cn_test_temp_dir("work_cn_select_none");
+        let candidates = vec![root.join("a"), root.join("b")];
+        assert_eq!(select_trae_data_dir_candidate(&candidates), None);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn work_cn_product_version_read_from_product_json() {
+        let root = work_cn_test_temp_dir("work_cn_version");
+        let exe_path = root.join("TRAE SOLO CN.exe");
+        fs::write(&exe_path, "stub").expect("write stub exe");
+        let app_dir = root.join("resources").join("app");
+        fs::create_dir_all(&app_dir).expect("create app dir");
+        fs::write(
+            app_dir.join("product.json"),
+            r#"{"version":"0.1.48","nameShort":"TraeWork CN"}"#,
+        )
+        .expect("write product.json");
+
+        assert_eq!(
+            detect_trae_product_version_for_exe(&exe_path),
+            Some("0.1.48".to_string())
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

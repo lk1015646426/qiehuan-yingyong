@@ -38,6 +38,7 @@ pub mod windsurf;
 pub mod windsurf_instance;
 pub mod workbuddy;
 pub mod workbuddy_instance;
+pub mod work_cn;
 pub mod zcode;
 pub mod zcode_instance;
 pub mod zed;
