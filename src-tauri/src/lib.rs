@@ -414,6 +414,7 @@ pub fn run() {
             commands::work_cn::get_work_cn_credits,
             commands::work_cn::get_work_cn_session_watch_status,
             commands::work_cn::clear_work_cn_credentials,
+            commands::work_cn::delete_work_cn_account,
             // Work CN GitHub Commands
             commands::work_cn_github::get_work_cn_github_config,
             commands::work_cn_github::save_work_cn_github_config,
@@ -432,6 +433,7 @@ pub fn run() {
             // System Commands
             commands::system::open_data_folder,
             commands::system::open_local_path,
+            commands::system::open_log_folder,
             commands::system::save_text_file,
             commands::system::get_downloads_dir,
             commands::system::get_auto_backup_settings,

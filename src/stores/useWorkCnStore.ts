@@ -1,12 +1,14 @@
 import { create } from 'zustand';
 import {
   clearWorkCnCredentials,
+  deleteWorkCnAccount,
   getWorkCnCredits,
   getWorkCnGitHubCliStatus,
   getWorkCnGitHubConfig,
   getWorkCnSessionWatchStatus,
   importCurrentWorkCnAccount,
   listWorkCnAccounts,
+  openWorkCnLogFolder,
   saveWorkCnGitHubConfig,
   switchWorkCnAccount,
   syncWorkCnGitHubAccount,
@@ -26,6 +28,7 @@ interface WorkCnState {
   loading: boolean;
   importing: boolean;
   switchingId: string | null;
+  deletingId: string | null;
   error: string | null;
   lastImportWarning: string | null;
   lastSwitchResult: WorkCnSwitchResult | null;
@@ -50,6 +53,8 @@ interface WorkCnState {
   loadAccounts: () => Promise<void>;
   importCurrent: (label?: string | null) => Promise<void>;
   switchTo: (accountId: string) => Promise<void>;
+  deleteAccount: (accountId: string) => Promise<void>;
+  openLogs: () => Promise<void>;
   refreshCredits: (accountId: string, forceRefresh?: boolean) => Promise<void>;
   clearError: () => void;
 }
@@ -59,6 +64,7 @@ export const useWorkCnStore = create<WorkCnState>((set, get) => ({
   loading: false,
   importing: false,
   switchingId: null,
+  deletingId: null,
   error: null,
   lastImportWarning: null,
   lastSwitchResult: null,
@@ -142,6 +148,39 @@ export const useWorkCnStore = create<WorkCnState>((set, get) => ({
         error: err instanceof Error ? err.message : String(err),
         switchingId: null,
       });
+    }
+  },
+  async deleteAccount(accountId) {
+    set({ deletingId: accountId, error: null });
+    try {
+      await deleteWorkCnAccount(accountId);
+      set((state) => {
+        const creditsById = { ...state.creditsById };
+        delete creditsById[accountId];
+        const creditsErrorById = { ...state.creditsErrorById };
+        delete creditsErrorById[accountId];
+        const githubSyncResultById = { ...state.githubSyncResultById };
+        delete githubSyncResultById[accountId];
+        return {
+          accounts: state.accounts.filter((a) => a.id !== accountId),
+          creditsById,
+          creditsErrorById,
+          githubSyncResultById,
+          deletingId: null,
+        };
+      });
+    } catch (err) {
+      set({
+        error: err instanceof Error ? err.message : String(err),
+        deletingId: null,
+      });
+    }
+  },
+  async openLogs() {
+    try {
+      await openWorkCnLogFolder();
+    } catch (err) {
+      set({ error: err instanceof Error ? err.message : String(err) });
     }
   },
   async refreshCredits(accountId, forceRefresh = false) {

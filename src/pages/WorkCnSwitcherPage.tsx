@@ -68,6 +68,13 @@ const primaryButtonStyle: CSSProperties = {
   border: '1px solid #2563eb',
 };
 
+const dangerButtonStyle: CSSProperties = {
+  ...buttonStyle,
+  color: '#ffffff',
+  background: '#dc2626',
+  border: '1px solid #dc2626',
+};
+
 const statusStyle: CSSProperties = {
   display: 'flex',
   alignItems: 'center',
@@ -269,6 +276,7 @@ function AccountCard({
   credits,
   creditsError,
   switching,
+  deleting,
   refreshingCredits,
   githubEnabled,
   githubSync,
@@ -276,11 +284,13 @@ function AccountCard({
   onSwitch,
   onRefreshCredits,
   onSyncGitHub,
+  onDelete,
 }: {
   account: WorkCnAccountView;
   credits: WorkCnCreditsSummary | null;
   creditsError: string | null;
   switching: boolean;
+  deleting: boolean;
   refreshingCredits: boolean;
   githubEnabled: boolean;
   githubSync: WorkCnGitHubSyncResult | null;
@@ -288,7 +298,9 @@ function AccountCard({
   onSwitch: () => void;
   onRefreshCredits: () => void;
   onSyncGitHub: () => void;
+  onDelete: () => void;
 }) {
+  const [confirmingDelete, setConfirmingDelete] = useState(false);
   const title = account.tags?.length
     ? account.tags[0]
     : account.nickname ?? account.email ?? account.userId ?? account.id;
@@ -354,6 +366,37 @@ function AccountCard({
         >
           {githubSyncing ? '同步中…' : '同步 GitHub'}
         </button>
+        {confirmingDelete ? (
+          <>
+            <button
+              type="button"
+              style={dangerButtonStyle}
+              disabled={deleting}
+              onClick={onDelete}
+              title="删除该账号槽位（不影响官方客户端登录态）"
+            >
+              {deleting ? '删除中…' : '确认删除'}
+            </button>
+            <button
+              type="button"
+              style={buttonStyle}
+              disabled={deleting}
+              onClick={() => setConfirmingDelete(false)}
+            >
+              取消
+            </button>
+          </>
+        ) : (
+          <button
+            type="button"
+            style={buttonStyle}
+            disabled={switching || deleting}
+            onClick={() => setConfirmingDelete(true)}
+            title="从账号库删除该账号槽位"
+          >
+            删除
+          </button>
+        )}
       </div>
     </div>
   );
@@ -388,6 +431,9 @@ export function WorkCnSwitcherPage() {
   const lastImportWarning = useWorkCnStore((s) => s.lastImportWarning);
   const switchingId = useWorkCnStore((s) => s.switchingId);
   const switchTo = useWorkCnStore((s) => s.switchTo);
+  const deletingId = useWorkCnStore((s) => s.deletingId);
+  const deleteAccount = useWorkCnStore((s) => s.deleteAccount);
+  const openLogs = useWorkCnStore((s) => s.openLogs);
   const creditsById = useWorkCnStore((s) => s.creditsById);
   const creditsErrorById = useWorkCnStore((s) => s.creditsErrorById);
   const refreshingCreditsId = useWorkCnStore((s) => s.refreshingCreditsId);
@@ -476,7 +522,12 @@ export function WorkCnSwitcherPage() {
           >
             设置
           </button>
-          <button type="button" style={buttonStyle}>
+          <button
+            type="button"
+            style={buttonStyle}
+            onClick={() => void openLogs()}
+            title="在系统文件管理器中打开日志目录"
+          >
             日志
           </button>
         </div>
@@ -519,6 +570,7 @@ export function WorkCnSwitcherPage() {
               credits={creditsById[account.id] ?? null}
               creditsError={creditsErrorById[account.id] ?? null}
               switching={switchingId === account.id}
+              deleting={deletingId === account.id}
               refreshingCredits={refreshingCreditsId === account.id}
               githubEnabled={githubConfig.enabled}
               githubSync={githubSyncResultById[account.id] ?? null}
@@ -526,6 +578,7 @@ export function WorkCnSwitcherPage() {
               onSwitch={() => void switchTo(account.id)}
               onRefreshCredits={() => void refreshCredits(account.id, true)}
               onSyncGitHub={() => void syncGitHub(account.id)}
+              onDelete={() => void deleteAccount(account.id)}
             />
           ))}
           {Array.from({ length: emptySlots }, (_, index) => (

@@ -1316,7 +1316,10 @@ pub fn upsert_account(payload: TraeImportPayload) -> Result<TraeAccount, String>
         .iter()
         .filter_map(|summary| load_account(summary.id.as_str()))
         .find(|account| {
-            if resolve_account_platform_kind(account) != incoming_platform {
+            if !upsert_platform_compatible(
+                resolve_account_platform_kind(account),
+                incoming_platform,
+            ) {
                 return false;
             }
             account_matches_import_identity(
@@ -2982,6 +2985,15 @@ pub(crate) fn is_work_cn_account_kind(kind: TraePlatformKind) -> bool {
     )
 }
 
+/// upsert 匹配时的平台兼容判定：本工具为 Work CN 单平台专用，历史导入的
+/// 账号可能保留客户端原始标记 `trae_cn`，而新数据已规范化为
+/// `trae_solo_cn`。两者视为同一平台，避免切换回写/重复导入时因严格相等
+/// 匹配失败而新建出重复账号（表现为“槽位中突然多出相同账号”）。
+fn upsert_platform_compatible(existing: TraePlatformKind, incoming: TraePlatformKind) -> bool {
+    existing == incoming
+        || (is_work_cn_account_kind(existing) && is_work_cn_account_kind(incoming))
+}
+
 fn profile_payload_root(profile_raw: Option<&Value>) -> Option<&Value> {
     let root = profile_raw?;
     root.get("Result")
@@ -3972,7 +3984,11 @@ fn enforce_work_cn_account_cap(
     let mut distinct_uids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for item in &index.accounts {
         if let Some(account) = load_account(&item.id) {
-            if resolve_account_platform_kind(&account) != platform {
+            // Work CN 单平台：历史 trae_cn 与规范化 trae_solo_cn 一视同仁，
+            // 4 槽位上限按合并后的去重 UID 计数，避免混合标记时绕过上限。
+            if !is_work_cn_account_kind(resolve_account_platform_kind(&account))
+                || !is_work_cn_account_kind(platform)
+            {
                 continue;
             }
             if let Some(uid) = account.user_id.as_deref().filter(|u| !u.is_empty()) {
@@ -7538,6 +7554,123 @@ mod tests {
                 "密文中不应出现 privateKeyPEM 字面量"
             );
         }
+
+        std::env::remove_var("COCKPIT_TOOLS_TEST_DATA_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // 回归：切换中"槽位突然多出相同账号"。历史账号保留客户端原始标记
+    // `trae_cn`，规范化后的导入/回写 payload 自报 `trae_solo_cn`。upsert
+    // 必须宽松匹配到同一账号就地更新，而不是新建重复账号；4 槽上限也须
+    // 把两种标记合并计数。
+    #[test]
+    fn work_cn_upsert_matches_legacy_trae_cn_account_without_duplicate() {
+        let _guard = WORK_CN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _lock = crate::modules::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+
+        let dir = std::env::temp_dir().join(format!(
+            "work-cn-upsert-legacy-test-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::env::set_var("COCKPIT_TOOLS_TEST_DATA_DIR", &dir);
+
+        fn legacy_payload(uid: &str, token: &str) -> TraeImportPayload {
+            TraeImportPayload {
+                email: format!("legacy-{uid}@example.com"),
+                user_id: Some(uid.to_string()),
+                nickname: None,
+                access_token: token.to_string(),
+                refresh_token: Some(format!("refresh-{token}")),
+                token_type: Some("Bearer".to_string()),
+                expires_at: None,
+                plan_type: None,
+                plan_reset_at: None,
+                trae_auth_raw: Some(serde_json::json!({
+                    "platformId": "trae_cn",
+                    "deviceKeyPair": {
+                        "privateKeyPEM": format!("priv-{token}"),
+                        "publicKeyPEM": format!("pub-{token}")
+                    }
+                })),
+                trae_profile_raw: None,
+                trae_entitlement_raw: None,
+                trae_usage_raw: None,
+                trae_server_raw: None,
+                trae_usertag_raw: None,
+                checkin_device_id: Some("checkin-uuid".to_string()),
+                machine_id: Some("machine-hash".to_string()),
+                auth_device_id: Some("1132918838145530".to_string()),
+                status: None,
+                status_reason: None,
+            }
+        }
+
+        // 1) 模拟历史数据：直接 upsert 一个自报 trae_cn 的账号。
+        let legacy = upsert_account(legacy_payload("uid-legacy", "tok-old"))
+            .expect("legacy upsert");
+        assert_eq!(
+            resolve_account_platform_kind(&legacy),
+            TraePlatformKind::TraeCn,
+            "前置条件：历史账号应为 trae_cn"
+        );
+
+        // 2) 规范化导入链路（trae_solo_cn、同 UID）必须命中同一账号就地更新。
+        let normalized_payload = TraeImportPayload {
+            email: "legacy-uid-legacy@example.com".to_string(),
+            user_id: Some("uid-legacy".to_string()),
+            access_token: "tok-new".to_string(),
+            refresh_token: Some("refresh-tok-new".to_string()),
+            token_type: Some("Bearer".to_string()),
+            trae_auth_raw: Some(serde_json::json!({
+                "platformId": "trae_solo_cn",
+                "deviceKeyPair": {
+                    "privateKeyPEM": "priv-tok-new",
+                    "publicKeyPEM": "pub-tok-new"
+                }
+            })),
+            ..legacy_payload("uid-legacy", "tok-new")
+        };
+        let updated =
+            import_work_cn_account_from_payload(normalized_payload, None).expect("re-import");
+        assert_eq!(
+            updated.id, legacy.id,
+            "同 UID 不同平台标记必须更新同一账号而非新建"
+        );
+        assert_eq!(updated.access_token, "tok-new");
+
+        let accounts = list_accounts_checked().expect("list");
+        let same_uid: Vec<_> = accounts
+            .iter()
+            .filter(|a| a.user_id.as_deref() == Some("uid-legacy"))
+            .collect();
+        assert_eq!(same_uid.len(), 1, "不应出现重复账号");
+
+        // 3) 上限合并计数：再补 3 个历史 trae_cn 账号（共 4 个不同 UID），
+        //    第 5 个 UID 的规范化导入必须被 4 槽上限拦截。
+        for i in 1..=3u32 {
+            upsert_account(legacy_payload(&format!("uid-legacy-{i}"), &format!("tok-{i}")))
+                .expect("legacy upsert");
+        }
+        let fifth = import_work_cn_account_from_payload(
+            TraeImportPayload {
+                email: "fifth@example.com".to_string(),
+                user_id: Some("uid-fifth".to_string()),
+                access_token: "tok-fifth".to_string(),
+                refresh_token: Some("refresh-tok-fifth".to_string()),
+                token_type: Some("Bearer".to_string()),
+                trae_auth_raw: Some(serde_json::json!({ "platformId": "trae_solo_cn" })),
+                ..legacy_payload("uid-fifth", "tok-fifth")
+            },
+            None,
+        );
+        assert!(
+            fifth.is_err(),
+            "混合 trae_cn/trae_solo_cn 标记时 4 槽上限仍须生效"
+        );
 
         std::env::remove_var("COCKPIT_TOOLS_TEST_DATA_DIR");
         let _ = std::fs::remove_dir_all(&dir);

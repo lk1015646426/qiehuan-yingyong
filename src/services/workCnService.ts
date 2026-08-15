@@ -126,3 +126,13 @@ export function getWorkCnSessionWatchStatus(): Promise<WorkCnSessionWatchStatus>
 export function clearWorkCnCredentials(): Promise<void> {
   return invoke<void>('clear_work_cn_credentials');
 }
+
+// 删除单个已导入的 Work CN 账号槽位（解绑 GitHub 槽位；不触碰客户端与远端 Secrets）。
+export function deleteWorkCnAccount(accountId: string): Promise<void> {
+  return invoke<void>('delete_work_cn_account', { accountId });
+}
+
+// 在系统文件管理器中打开应用日志目录。
+export function openWorkCnLogFolder(): Promise<void> {
+  return invoke<void>('open_log_folder');
+}

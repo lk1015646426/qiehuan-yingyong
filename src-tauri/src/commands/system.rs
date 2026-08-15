@@ -1195,6 +1195,14 @@ pub fn open_local_path(path: String) -> Result<(), String> {
     open_path_in_system(p.as_path())
 }
 
+/// 打开应用日志目录（Windows 资源管理器 / macOS Finder / xdg-open）。
+/// 目录不存在时由 `get_log_dir` 自动创建。
+#[tauri::command]
+pub async fn open_log_folder() -> Result<(), String> {
+    let dir = modules::logger::get_log_dir()?;
+    open_path_in_system(dir.as_path())
+}
+
 /// 保存文本文件
 #[tauri::command]
 pub async fn save_text_file(path: String, content: String) -> Result<(), String> {

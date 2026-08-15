@@ -160,3 +160,33 @@ pub fn clear_work_cn_credentials() -> Result<(), String> {
     logger::log_info("[Work CN] 已清除本地凭证");
     Ok(())
 }
+
+/// 删除一个已导入的 Work CN 账号槽位：移除加密账号文件与索引项，并解绑
+/// 其占用的 GitHub Secrets 槽位。不触碰官方客户端的 storage.json；已同步
+/// 到远端 GitHub 的 Secrets 也不会被删除。
+#[tauri::command]
+pub fn delete_work_cn_account(account_id: String) -> Result<(), String> {
+    let Some(account) = trae_account::load_account(&account_id) else {
+        return Err("账号不存在".to_string());
+    };
+    if !trae_account::is_work_cn_account_kind(trae_account::resolve_account_platform_kind(
+        &account,
+    )) {
+        return Err("该账号不是 TRAE Work CN 账号".to_string());
+    }
+    trae_account::remove_account(&account_id)?;
+
+    // 解绑该账号占用的 GitHub 槽位（若有），避免设置界面残留失效绑定。
+    let mut github_config = crate::modules::work_cn_github::load_github_config();
+    let before = github_config.slots.len();
+    github_config.slots.retain(|slot| slot.account_id != account_id);
+    if github_config.slots.len() != before {
+        crate::modules::work_cn_github::save_github_config(&github_config)?;
+    }
+
+    logger::log_info(&format!(
+        "[Work CN] 账号已删除并解绑 GitHub 槽位: id={}",
+        account_id
+    ));
+    Ok(())
+}
