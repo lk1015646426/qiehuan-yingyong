@@ -93,9 +93,11 @@ pub struct WorkCnSwitchResult {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkCnCreditsSummary {
-    pub total: Option<i64>,
-    pub used: i64,
-    pub remaining: Option<i64>,
+    /// 浮点：真实接口的 `usage.credits_amount` 带小数（实测 864.63），
+    /// 整数解析会把用量读成 0，导致“剩余积分”虚高。
+    pub total: Option<f64>,
+    pub used: f64,
+    pub remaining: Option<f64>,
     pub unlimited: bool,
     pub updated_at: i64,
 }

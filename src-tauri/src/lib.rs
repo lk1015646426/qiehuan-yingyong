@@ -378,11 +378,20 @@ pub fn run() {
                         window.app_handle().exit(0);
                     }
                     CloseWindowBehavior::Ask => {
-                        // 阶段 8 删除了关闭确认弹窗（前端无监听者），
-                        // Ask 与 Quit 行为一致：直接退出，避免“点了没反应”。
-                        modules::floating_card_window::request_app_exit();
-                        info!("[Window] 用户选择退出应用（Ask 兼容为 Quit）");
-                        window.app_handle().exit(0);
+                        // 确认弹窗已在阶段 8 删除（前端无监听者）。
+                        // 用户拍板：点 × = 最小化到托盘，Ask（旧配置残留）兼容为 Minimize。
+                        api.prevent_close();
+                        if let Err(err) =
+                            modules::floating_card_window::destroy_main_window_to_tray(window)
+                        {
+                            modules::logger::log_warn(&format!(
+                                "[Window] 销毁主窗口 WebView 失败，回退为隐藏: {}",
+                                err
+                            ));
+                            let _ = window.hide();
+                            modules::process_memory::trim_idle_process_memory();
+                        }
+                        info!("[Window] 窗口已关闭到托盘（Ask 兼容为 Minimize）");
                     }
                 }
             }

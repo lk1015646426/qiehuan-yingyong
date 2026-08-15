@@ -732,6 +732,26 @@ fn pick_i64(root: Option<&Value>, paths: &[&[&str]]) -> Option<i64> {
     None
 }
 
+/// 浮点版取数：真实接口的 `credits_amount` 等字段带小数（实测 864.63），
+/// `as_i64` 会返回 None 导致用量被记 0。
+fn pick_f64(root: Option<&Value>, paths: &[&[&str]]) -> Option<f64> {
+    for path in paths {
+        if let Some(value) = extract_json_value(root, path) {
+            if let Some(num) = value.as_f64() {
+                return Some(num);
+            }
+            if let Some(text) = value.as_str() {
+                if let Ok(parsed) = text.trim().parse::<f64>() {
+                    if parsed.is_finite() {
+                        return Some(parsed);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 fn pick_bool(root: Option<&Value>, paths: &[&[&str]]) -> Option<bool> {
     for path in paths {
         if let Some(value) = extract_json_value(root, path) {
@@ -1636,7 +1656,7 @@ fn payload_from_storage_root(storage_root: &Value) -> Result<TraeImportPayload, 
         server_raw.as_ref(),
     );
 
-    Ok(TraeImportPayload {
+    let mut payload = TraeImportPayload {
         email,
         user_id,
         nickname,
@@ -1657,7 +1677,14 @@ fn payload_from_storage_root(storage_root: &Value) -> Result<TraeImportPayload, 
         auth_device_id: None,
         status,
         status_reason,
-    })
+    };
+    // 从同一份 storage.json 提取设备快照并入 payload。否则后续刷新链路
+    // （sync_account_tokens_from_storage_path → apply_payload）会用空设备字段
+    // 覆盖导入时已采集的 checkin/machine/auth 设备 ID 与设备密钥对，
+    // 表现为“导入后设备字段丢失、快照不完整、不可切换”。
+    let device_snapshot = extract_local_work_cn_device_snapshot(storage_root);
+    merge_work_cn_device_snapshot_into_payload(&mut payload, device_snapshot);
+    Ok(payload)
 }
 
 fn payload_from_import_value(raw: Value) -> Result<TraeImportPayload, String> {
@@ -2944,6 +2971,17 @@ pub(crate) fn resolve_account_platform_kind(account: &TraeAccount) -> TraePlatfo
     resolve_platform_from_roots(&roots)
 }
 
+/// Work CN 账号判定（宽松版）：本工具是 TRAE Work CN 单平台专用，历史上
+/// 导入的账号可能保留了客户端原始标记 `trae_cn`（platformId/authClientId
+/// 均为 CN 版特征，实测 2026-08 真实数据）。这类账号与 `trae_solo_cn`
+/// 一视同仁，避免重启后被列表过滤、watcher 无法匹配、切换前无法回写。
+pub(crate) fn is_work_cn_account_kind(kind: TraePlatformKind) -> bool {
+    matches!(
+        kind,
+        TraePlatformKind::TraeSoloCn | TraePlatformKind::TraeCn
+    )
+}
+
 fn profile_payload_root(profile_raw: Option<&Value>) -> Option<&Value> {
     let root = profile_raw?;
     root.get("Result")
@@ -3215,6 +3253,14 @@ fn resolve_device_id_for_inject(
             &["callbackQuery", "x_device_id"],
         ],
     )
+    .or_else(|| {
+        account
+            .auth_device_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    })
     .or_else(|| resolve_existing_device_key_storage_id(root_obj))
 }
 
@@ -3808,6 +3854,31 @@ pub(crate) fn merge_work_cn_device_snapshot_into_payload(
         }
         payload.trae_auth_raw = Some(auth_obj);
     }
+
+    // 切换校验/注入依赖 auth_raw.deviceInfo.DeviceID（官方形态），而 storage.json
+    // 里该 ID 只存在于 `iCubeAuthInfo://icube-dc:<ID>` 的键名中。导入时把它回写
+    // 到 auth_raw，保证快照自包含；已有则不覆盖。
+    if let Some(auth_device_id) = snapshot.auth_device_id.as_deref() {
+        let mut auth_obj = payload
+            .trae_auth_raw
+            .take()
+            .unwrap_or_else(|| Value::Object(Map::new()));
+        if let Some(obj) = auth_obj.as_object_mut() {
+            let has_device_id = obj
+                .get("deviceInfo")
+                .and_then(|device| device.get("DeviceID"))
+                .and_then(Value::as_str)
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false);
+            if !has_device_id {
+                obj.insert(
+                    "deviceInfo".to_string(),
+                    serde_json::json!({ "DeviceID": auth_device_id }),
+                );
+            }
+        }
+        payload.trae_auth_raw = Some(auth_obj);
+    }
 }
 
 /// Validate whether a saved Work CN account carries everything needed for a
@@ -3930,7 +4001,11 @@ pub(crate) fn import_work_cn_account_from_payload(
     mut payload: TraeImportPayload,
     label: Option<String>,
 ) -> Result<TraeAccount, String> {
-    let platform = resolve_payload_platform_kind(&payload);
+    // Work CN 专用导入链路：TRAE SOLO CN 客户端的 storage.json 自报
+    // `platformId="trae_cn"` / CN 版 authClientId（实测 ono9krqynydwx5），
+    // 按 payload 原始特征解析会得到 TraeCn，导致账号被 list_work_cn_accounts
+    // 过滤掉（表现为“重启后槽位为空”）。这里强制规范化为 TraeSoloCn。
+    let platform = TraePlatformKind::TraeSoloCn;
     attach_platform_metadata_to_payload(&mut payload, platform);
     enforce_work_cn_account_cap(platform, payload.user_id.as_deref())?;
     let mut account = upsert_account(payload)?;
@@ -4006,7 +4081,7 @@ pub fn list_work_cn_accounts() -> Result<Vec<crate::models::work_cn::WorkCnAccou
     let accounts = list_accounts_checked()?;
     Ok(accounts
         .iter()
-        .filter(|account| resolve_account_platform_kind(account) == TraePlatformKind::TraeSoloCn)
+        .filter(|account| is_work_cn_account_kind(resolve_account_platform_kind(account)))
         .map(|account| {
             build_work_cn_account_view(account, validate_work_cn_account_snapshot(account))
         })
@@ -4018,14 +4093,13 @@ pub fn list_work_cn_accounts() -> Result<Vec<crate::models::work_cn::WorkCnAccou
 pub(crate) fn find_work_cn_account_id_for_payload(
     payload: &TraeImportPayload,
 ) -> Option<String> {
-    let platform = TraePlatformKind::TraeSoloCn;
     let normalized_user_id = normalize_non_empty(payload.user_id.as_deref());
     let normalized_email = normalize_identity_email(Some(payload.email.as_str()));
     let accounts = list_accounts_checked().ok()?;
     accounts
         .iter()
         .find(|account| {
-            resolve_account_platform_kind(account) == platform
+            is_work_cn_account_kind(resolve_account_platform_kind(account))
                 && account_matches_import_identity(
                     account,
                     normalized_user_id.as_deref(),
@@ -4089,7 +4163,7 @@ fn resolve_switch_storage_path(platform: TraePlatformKind) -> Result<PathBuf, Wo
 pub fn validate_work_cn_account_for_switch(
     account: &TraeAccount,
 ) -> Result<(), WorkCnCommandError> {
-    if resolve_account_platform_kind(account) != TraePlatformKind::TraeSoloCn {
+    if !is_work_cn_account_kind(resolve_account_platform_kind(account)) {
         return Err(WorkCnCommandError::new(
             WorkCnErrorCode::SnapshotIncomplete,
             "账号平台不是 TRAE Work CN",
@@ -4124,7 +4198,18 @@ pub fn validate_work_cn_account_for_switch(
         .and_then(|device| device.get("DeviceID"))
         .and_then(Value::as_str)
         .map(str::trim)
-        .filter(|value| !value.is_empty());
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        // 旧快照可能只有顶层 auth_device_id（icube-dc 数字 ID），没有
+        // deviceInfo.DeviceID；两者同源，回退兼容，避免误判“不可切换”。
+        .or_else(|| {
+            account
+                .auth_device_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        });
     if device_id.is_none() {
         return Err(WorkCnCommandError::new(
             WorkCnErrorCode::SnapshotIncomplete,
@@ -4188,7 +4273,7 @@ pub fn sync_current_work_cn_session_from_local(
     let Some(account_id) = accounts
         .iter()
         .find(|account| {
-            if resolve_account_platform_kind(account) != platform {
+            if !is_work_cn_account_kind(resolve_account_platform_kind(account)) {
                 return false;
             }
             if let (Some(existing), Some(incoming)) = (
@@ -4552,7 +4637,7 @@ pub(crate) fn resolve_current_account_id_for_platform(
         if let Some(account_id) = accounts
             .iter()
             .find(|account| {
-                if resolve_account_platform_kind(account) != platform {
+                if !is_work_cn_account_kind(resolve_account_platform_kind(account)) {
                     return false;
                 }
 
@@ -6368,7 +6453,7 @@ pub async fn refresh_account_usage_only_async(
 pub fn parse_work_cn_credits_from_usage(usage_raw: &Option<Value>) -> WorkCnCreditsSummary {
     let no_data = WorkCnCreditsSummary {
         total: None,
-        used: 0,
+        used: 0.0,
         remaining: None,
         unlimited: false,
         updated_at: work_cn_credits_now_secs(),
@@ -6385,8 +6470,8 @@ pub fn parse_work_cn_credits_from_usage(usage_raw: &Option<Value>) -> WorkCnCred
         return no_data;
     };
 
-    let mut total: i64 = 0;
-    let mut used: i64 = 0;
+    let mut total: f64 = 0.0;
+    let mut used: f64 = 0.0;
     let mut unlimited = false;
     let mut found_any = false;
 
@@ -6395,23 +6480,22 @@ pub fn parse_work_cn_credits_from_usage(usage_raw: &Option<Value>) -> WorkCnCred
         if pack.get("is_hide").and_then(Value::as_bool) == Some(true) {
             continue;
         }
-        // 3) skip explicitly inactive packs
+        // 3) skip explicitly inactive packs.
+        // 注意：不能按 status==0 跳过——真实 CN 数据（user_current_entitlement_list）
+        // 里“老用户福利”等有效额度包 status=0 且带真实 credits_limit/usage，
+        // 跳过会把 2×2000 积分包漏算（2026-08 实测反馈“积分不准确”）。
         if pack.get("is_active").and_then(Value::as_bool) == Some(false) {
             continue;
         }
-        if let Some(status) = pack.get("status").and_then(Value::as_i64) {
-            if status <= 0 {
-                continue;
-            }
-        } else if let Some(status) = pack.get("status").and_then(Value::as_str) {
+        if let Some(status) = pack.get("status").and_then(Value::as_str) {
             let status = status.to_ascii_lowercase();
             if status == "inactive" || status == "disabled" || status == "expired" {
                 continue;
             }
         }
 
-        // 4) read quota + usage, tolerating nesting
-        let credits_limit = pick_i64(
+        // 4) read quota + usage, tolerating nesting（credits_amount 带小数）
+        let credits_limit = pick_f64(
             Some(pack),
             &[
                 &["entitlement_base_info", "quota", "credits_limit"],
@@ -6419,11 +6503,11 @@ pub fn parse_work_cn_credits_from_usage(usage_raw: &Option<Value>) -> WorkCnCred
                 &["credits_limit"],
             ],
         );
-        let credits_amount = pick_i64(
+        let credits_amount = pick_f64(
             Some(pack),
             &[&["usage", "credits_amount"], &["credits_amount"]],
         )
-        .unwrap_or(0);
+        .unwrap_or(0.0);
 
         let Some(limit) = credits_limit else {
             // rule 7: a pack without a quota limit is ignored (never counted as 0)
@@ -6431,7 +6515,7 @@ pub fn parse_work_cn_credits_from_usage(usage_raw: &Option<Value>) -> WorkCnCred
         };
         found_any = true;
 
-        if limit == -1 {
+        if limit == -1.0 {
             unlimited = true;
         } else {
             total += limit;
@@ -6446,7 +6530,7 @@ pub fn parse_work_cn_credits_from_usage(usage_raw: &Option<Value>) -> WorkCnCred
     if unlimited {
         WorkCnCreditsSummary {
             total: None,
-            used: 0,
+            used: 0.0,
             remaining: None,
             unlimited: true,
             updated_at: work_cn_credits_now_secs(),
@@ -6455,7 +6539,7 @@ pub fn parse_work_cn_credits_from_usage(usage_raw: &Option<Value>) -> WorkCnCred
         WorkCnCreditsSummary {
             total: Some(total),
             used,
-            remaining: Some((total - used).max(0)),
+            remaining: Some((total - used).max(0.0)),
             unlimited: false,
             updated_at: work_cn_credits_now_secs(),
         }
@@ -7718,6 +7802,14 @@ mod tests {
                 obj.remove("deviceInfo");
             }
         }
+        // deviceInfo 缺失时可回退到 auth_device_id（同源 icube-dc 数字 ID）：
+        // 旧快照（2026-08 实测）只有 auth_device_id，也必须可切换。
+        assert!(
+            super::validate_work_cn_account_for_switch(&missing_device).is_ok(),
+            "仅 auth_device_id 存在时应回退通过校验"
+        );
+        // 两者都缺才判定快照不完整。
+        missing_device.auth_device_id = None;
         assert!(
             matches!(
                 super::validate_work_cn_account_for_switch(&missing_device),
@@ -8049,10 +8141,39 @@ mod tests {
             }
         });
         let summary = super::parse_work_cn_credits_from_usage(&Some(usage));
-        assert_eq!(summary.total, Some(1000));
-        assert_eq!(summary.used, 250);
-        assert_eq!(summary.remaining, Some(750));
+        assert_eq!(summary.total, Some(1000.0));
+        assert_eq!(summary.used, 250.0);
+        assert_eq!(summary.remaining, Some(750.0));
         assert!(!summary.unlimited);
+    }
+
+    #[test]
+    fn work_cn_credits_decimal_amounts_parse_as_float() {
+        // 2026-08 实测：真实接口 usage.credits_amount 带小数（864.63），
+        // 整数解析会把用量读成 0，导致“剩余积分”虚高。
+        let usage = serde_json::json!({
+            "user_entitlement_pack_list": [
+                { "entitlement_base_info": { "quota": { "credits_limit": 2000.5 } }, "usage": { "credits_amount": 864.63 } }
+            ]
+        });
+        let summary = super::parse_work_cn_credits_from_usage(&Some(usage));
+        assert_eq!(summary.total, Some(2000.5));
+        assert_eq!(summary.used, 864.63);
+        assert!((summary.remaining.unwrap() - 1135.87).abs() < 1e-6);
+    }
+
+    #[test]
+    fn work_cn_credits_zero_status_pack_counted() {
+        // “老用户福利”等有效额度包 status=0 且带真实额度，必须计入。
+        let usage = serde_json::json!({
+            "user_entitlement_pack_list": [
+                { "status": 0, "entitlement_base_info": { "quota": { "credits_limit": 2000 } }, "usage": { "credits_amount": 100 } },
+                { "entitlement_base_info": { "quota": { "credits_limit": 1000 } }, "usage": { "credits_amount": 50 } }
+            ]
+        });
+        let summary = super::parse_work_cn_credits_from_usage(&Some(usage));
+        assert_eq!(summary.total, Some(3000.0));
+        assert_eq!(summary.used, 150.0);
     }
 
     #[test]
@@ -8064,9 +8185,9 @@ mod tests {
             ]
         });
         let summary = super::parse_work_cn_credits_from_usage(&Some(usage));
-        assert_eq!(summary.total, Some(1500));
-        assert_eq!(summary.used, 350);
-        assert_eq!(summary.remaining, Some(1150));
+        assert_eq!(summary.total, Some(1500.0));
+        assert_eq!(summary.used, 350.0);
+        assert_eq!(summary.remaining, Some(1150.0));
         assert!(!summary.unlimited);
     }
 
@@ -8092,8 +8213,8 @@ mod tests {
             ]
         });
         let summary = super::parse_work_cn_credits_from_usage(&Some(usage));
-        assert_eq!(summary.total, Some(1000), "隐藏包必须被忽略");
-        assert_eq!(summary.used, 250);
+        assert_eq!(summary.total, Some(1000.0), "隐藏包必须被忽略");
+        assert_eq!(summary.used, 250.0);
         assert!(!summary.unlimited);
     }
 
@@ -8101,7 +8222,7 @@ mod tests {
     fn work_cn_credits_no_data_when_missing_field_or_empty() {
         let none_summary = super::parse_work_cn_credits_from_usage(&None);
         assert_eq!(none_summary.total, None);
-        assert_eq!(none_summary.used, 0);
+        assert_eq!(none_summary.used, 0.0);
         assert_eq!(none_summary.remaining, None);
         assert!(!none_summary.unlimited);
 
@@ -8130,9 +8251,9 @@ mod tests {
             ]
         });
         let summary = super::parse_work_cn_credits_from_usage(&Some(usage));
-        assert_eq!(summary.total, Some(100));
-        assert_eq!(summary.used, 150);
-        assert_eq!(summary.remaining, Some(0), "剩余不允许为负");
+        assert_eq!(summary.total, Some(100.0));
+        assert_eq!(summary.used, 150.0);
+        assert_eq!(summary.remaining, Some(0.0), "剩余不允许为负");
     }
 
     #[test]
@@ -8145,8 +8266,8 @@ mod tests {
             }
         });
         let summary = super::parse_work_cn_credits_from_usage(&Some(usage));
-        assert_eq!(summary.total, Some(800));
-        assert_eq!(summary.used, 123);
+        assert_eq!(summary.total, Some(800.0));
+        assert_eq!(summary.used, 123.0);
     }
 
     // ---- get_work_cn_credits 命令（仅读缓存，不联网） ----
@@ -8180,9 +8301,9 @@ mod tests {
         let summary = super::get_work_cn_credits(&account.id, false)
             .await
             .expect("credits query");
-        assert_eq!(summary.total, Some(1000));
-        assert_eq!(summary.used, 250);
-        assert_eq!(summary.remaining, Some(750));
+        assert_eq!(summary.total, Some(1000.0));
+        assert_eq!(summary.used, 250.0);
+        assert_eq!(summary.remaining, Some(750.0));
 
         std::env::remove_var("COCKPIT_TOOLS_TEST_DATA_DIR");
         let _ = std::fs::remove_dir_all(&data_dir);

@@ -228,6 +228,12 @@ function SnapshotBadges({ account }: { account: WorkCnAccountView }) {
   );
 }
 
+function formatCreditsValue(value: number): string {
+  // 接口用量带小数（如 864.63）；浮点累加会产生尾差，四舍五入到 2 位并去掉多余尾零。
+  const rounded = Math.round(value * 100) / 100;
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2);
+}
+
 function renderCredits(
   credits: WorkCnCreditsSummary | null | undefined,
   error: string | null | undefined,
@@ -249,10 +255,10 @@ function renderCredits(
   return (
     <>
       <div style={{ fontSize: 20, fontWeight: 700, color: '#1f2430' }}>
-        剩余 {credits.remaining} 积分
+        剩余 {formatCreditsValue(credits.remaining ?? 0)} 积分
       </div>
       <div style={slotStatusStyle}>
-        已用 {credits.used} / 总 {credits.total}
+        已用 {formatCreditsValue(credits.used)} / 总 {formatCreditsValue(credits.total)}
       </div>
     </>
   );

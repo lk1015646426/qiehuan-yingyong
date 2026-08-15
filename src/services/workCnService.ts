@@ -66,22 +66,23 @@ export async function getWorkCnCredits(
 }
 
 // The Tauri command rejects with a JSON-string `WorkCnCommandError`. Re-parse it
-// so the UI can branch on `code` instead of scanning Chinese text.
-export function parseWorkCnCommandError(err: unknown): WorkCnCommandError {
+// and surface as a real `Error` so UI banners show the human-readable message
+// (plus detail) instead of "[object Object]". `code` is kept as a property for
+// any future branching.
+export function parseWorkCnCommandError(err: unknown): Error & { code?: string } {
   const raw = err instanceof Error ? err.message : typeof err === 'string' ? err : JSON.stringify(err);
   try {
     const parsed = JSON.parse(raw) as Partial<WorkCnCommandError>;
     if (parsed && typeof parsed.code === 'string' && typeof parsed.message === 'string') {
-      return {
-        code: parsed.code as WorkCnCommandError['code'],
-        message: parsed.message,
-        detail: parsed.detail ?? null,
-      };
+      const message = parsed.detail ? `${parsed.message}（${parsed.detail}）` : parsed.message;
+      const error = new Error(message) as Error & { code?: string };
+      error.code = parsed.code;
+      return error;
     }
   } catch {
     // fall through to generic error
   }
-  return { code: 'LAUNCH_FAILED', message: raw, detail: null };
+  return new Error(raw);
 }
 
 // ---- Stage 6: GitHub Secrets 同步 ----
