@@ -281,13 +281,11 @@ pub fn run() {
                 }
             });
 
-
             tauri::async_runtime::spawn(async {
                 modules::trae_oauth::restore_pending_oauth_listener();
             });
 
             modules::work_cn_session_watcher::ensure_started(app.handle().clone());
-
 
             #[cfg(target_os = "macos")]
             apply_macos_activation_policy(&app.handle());
@@ -303,7 +301,6 @@ pub fn run() {
                     }
                 });
             }
-
 
             // 创建骨架托盘（无账号文件 I/O，秒出）
             if let Err(e) = modules::tray::create_tray_skeleton(app.handle()) {
@@ -419,7 +416,27 @@ pub fn run() {
             commands::work_cn_github::get_work_cn_github_config,
             commands::work_cn_github::save_work_cn_github_config,
             commands::work_cn_github::github_cli_status,
+            commands::work_cn_github::gh_cli_setup_download,
+            commands::work_cn_github::gh_cli_login_with_token,
             commands::work_cn_github::sync_work_cn_github_account,
+            // Work CN Checkin Panel Commands (阶段 8)
+            commands::work_cn_checkin::trigger_checkin_workflow,
+            commands::work_cn_checkin::list_checkin_workflow_runs,
+            commands::work_cn_checkin::local_checkin_work_cn,
+            // WorkBuddy Commands
+            commands::workbuddy::get_workbuddy_installation,
+            commands::workbuddy::get_workbuddy_settings,
+            commands::workbuddy::save_workbuddy_settings,
+            commands::workbuddy::get_workbuddy_session_watch_status,
+            commands::workbuddy::start_workbuddy_session_watcher,
+            commands::workbuddy::import_current_workbuddy_account,
+            commands::workbuddy::list_workbuddy_accounts,
+            commands::workbuddy::get_workbuddy_account_status,
+            commands::workbuddy::update_workbuddy_account,
+            commands::workbuddy::delete_workbuddy_account,
+            commands::workbuddy::switch_workbuddy_account,
+            commands::workbuddy::sync_workbuddy_github,
+            commands::workbuddy::trigger_workbuddy_checkin,
             // Trae Instance Commands
             commands::trae_instance::trae_get_instance_defaults,
             commands::trae_instance::trae_list_instances,

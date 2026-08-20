@@ -50,9 +50,7 @@ pub fn install_system_shutdown_listener() -> Result<(), String> {
         .name("cockpit-system-shutdown-cleanup".to_string())
         .spawn(move || {
             if shutdown_rx.recv().is_ok() {
-                crate::modules::logger::log_info(
-                    "[Lifecycle] Windows 正在关闭，禁止创建新子进程",
-                );
+                crate::modules::logger::log_info("[Lifecycle] Windows 正在关闭，禁止创建新子进程");
             }
         })
         .map_err(|error| format!("启动 Windows 关机清理线程失败: {}", error))?;

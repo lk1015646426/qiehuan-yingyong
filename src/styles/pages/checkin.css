@@ -1,0 +1,452 @@
+/* ============================================
+   云端签到管理面板 - 页面样式
+   全部使用 base.css 设计系统 token，自动支持暗色主题
+   ============================================ */
+
+.ck-page {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 100%;
+  padding: 20px 24px;
+  box-sizing: border-box;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  gap: 16px;
+}
+
+/* ---------- 顶栏 ---------- */
+
+.ck-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.ck-title {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0;
+  font-size: 20px;
+  font-weight: 700;
+  color: var(--text-primary);
+}
+
+.ck-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.ck-gh-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+  border-radius: var(--radius-full);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-light);
+  color: var(--text-secondary);
+}
+
+.ck-gh-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-muted);
+}
+
+.ck-gh-dot--ok {
+  background: #16a34a;
+}
+
+.ck-gh-dot--warn {
+  background: var(--warning);
+}
+
+/* ---------- 状态横幅（最近一次运行） ---------- */
+
+.ck-banner {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  font-size: 13px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border-light);
+  background: var(--bg-card);
+  color: var(--text-secondary);
+  backdrop-filter: blur(8px);
+}
+
+.ck-banner--ok {
+  border-color: color-mix(in srgb, var(--success) 35%, var(--border-light));
+  color: #15803d;
+  background: color-mix(in srgb, var(--success) 7%, var(--bg-card));
+}
+
+.ck-banner--error {
+  border-color: color-mix(in srgb, var(--danger) 35%, var(--border-light));
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 7%, var(--bg-card));
+}
+
+.ck-banner--running {
+  border-color: color-mix(in srgb, var(--warning) 40%, var(--border-light));
+  color: var(--warning-strong);
+  background: color-mix(in srgb, var(--warning) 7%, var(--bg-card));
+}
+
+[data-theme="dark"] .ck-banner--ok {
+  color: #4ade80;
+}
+
+.ck-banner-main {
+  flex: 1;
+  min-width: 0;
+}
+
+.ck-banner-sub {
+  margin-top: 2px;
+  font-size: 12px;
+  opacity: 0.85;
+}
+
+.ck-banner-link {
+  font-size: 12px;
+  color: var(--primary);
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.ck-banner-link:hover {
+  text-decoration: underline;
+}
+
+/* button 化的外链（WebView 内 <a target=_blank> 不会唤起浏览器，改经 opener 插件） */
+.ck-banner-link--btn {
+  padding: 0;
+  background: none;
+  border: none;
+  cursor: pointer;
+  font: inherit;
+}
+
+/* ---------- 区块标题 ---------- */
+
+.ck-section-title {
+  margin: 4px 0 0;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ck-section-actions {
+  margin-left: auto;
+  display: flex;
+  gap: 8px;
+}
+
+/* ---------- 凭证健康卡片 ---------- */
+
+.ck-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  gap: 12px;
+}
+
+.ck-product-groups {
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+
+.ck-product-group {
+  min-width: 0;
+}
+
+.ck-product-group__title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  margin: 0 0 9px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.ck-product-group__title img {
+  border-radius: 4px;
+  object-fit: contain;
+}
+
+.ck-product-group__title span {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 400;
+}
+
+.ck-card {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 14px 16px;
+  background: var(--bg-card);
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-sm);
+  backdrop-filter: blur(8px);
+  transition: box-shadow 0.18s ease, border-color 0.18s ease, transform 0.18s ease;
+}
+
+.ck-card:hover {
+  border-color: var(--border);
+  box-shadow: var(--shadow-md);
+  transform: translateY(-1px);
+}
+
+.ck-card--active {
+  border-color: color-mix(in srgb, var(--primary) 55%, var(--border));
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--primary) 35%, transparent),
+    var(--shadow-md);
+}
+
+.ck-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.ck-product-icon { flex: 0 0 auto; border-radius: 4px; object-fit: contain; }
+.ck-product-pill {
+  flex: 0 0 auto;
+  padding: 2px 7px;
+  border: 1px solid color-mix(in srgb, var(--primary) 28%, var(--border));
+  border-radius: var(--radius-full);
+  color: var(--primary);
+  font-size: 11px;
+  font-weight: 600;
+}
+.ck-product-pill--workbuddy { color: var(--text-secondary); border-color: var(--border); }
+.ck-card-sub { font-size: 12px; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ck-product-filter { display: inline-flex; align-items: center; padding: 2px; gap: 2px; border: 1px solid var(--border-light); border-radius: var(--radius-sm); background: var(--bg-secondary); }
+.ck-product-filter__item { min-height: 28px; padding: 0 10px; border: 0; border-radius: calc(var(--radius-sm) - 1px); background: transparent; color: var(--text-secondary); font-size: 12px; cursor: pointer; }
+.ck-product-filter__item.is-active { background: var(--bg-card); color: var(--text-primary); box-shadow: var(--shadow-sm); }
+
+.ck-card-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text-primary);
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ck-slot-pill {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  font-size: 11px;
+  font-weight: 600;
+  border-radius: var(--radius-full);
+  color: var(--primary);
+  background: color-mix(in srgb, var(--primary) 9%, transparent);
+  border: 1px solid color-mix(in srgb, var(--primary) 25%, transparent);
+}
+
+.ck-slot-pill--none {
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px dashed var(--border);
+}
+
+/* token 剩余天数胶囊 */
+.ck-token-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: fit-content;
+  padding: 3px 10px;
+  font-size: 12px;
+  font-weight: 500;
+  border-radius: var(--radius-full);
+}
+
+.ck-token-pill--ok {
+  color: #15803d;
+  background: color-mix(in srgb, var(--success) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--success) 30%, transparent);
+}
+
+.ck-token-pill--warn {
+  color: var(--warning-strong);
+  background: color-mix(in srgb, var(--warning) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--warning) 35%, transparent);
+}
+
+.ck-token-pill--danger {
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--danger) 35%, transparent);
+}
+
+.ck-token-pill--unknown {
+  color: var(--text-muted);
+  background: transparent;
+  border: 1px dashed var(--border);
+}
+
+[data-theme="dark"] .ck-token-pill--ok {
+  color: #4ade80;
+}
+
+/* 刷新流阶段行 */
+.ck-flow-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+}
+
+.ck-flow-line--failed {
+  color: var(--danger);
+}
+
+.ck-flow-line--done {
+  color: #15803d;
+}
+
+[data-theme="dark"] .ck-flow-line--done {
+  color: #4ade80;
+}
+
+.ck-flow-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.ck-card-actions {
+  display: flex;
+  gap: 4px;
+  flex-wrap: nowrap;
+}
+
+/* ---------- 运行历史 ---------- */
+
+.ck-runs {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border-light);
+  border-radius: var(--radius-md);
+  background: var(--bg-card);
+  overflow: hidden;
+}
+
+.ck-run-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  font-size: 13px;
+  border-bottom: 1px solid var(--border-light);
+  color: var(--text-primary);
+  text-decoration: none;
+  transition: background 0.15s ease;
+  cursor: pointer; /* div 化外链行（原 <a> 在 WebView 内无法唤起浏览器） */
+}
+
+.ck-run-row:last-child {
+  border-bottom: none;
+}
+
+.ck-run-row:hover {
+  background: var(--bg-hover);
+}
+
+.ck-run-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.ck-run-dot--ok {
+  background: #16a34a;
+}
+
+.ck-run-dot--error {
+  background: var(--danger);
+}
+
+.ck-run-dot--running {
+  background: var(--warning);
+}
+
+.ck-run-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.ck-run-meta {
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.ck-runs-empty {
+  padding: 22px 14px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+
+.ck-runs-error {
+  padding: 12px 14px;
+  font-size: 12px;
+  color: var(--danger);
+  line-height: 1.5;
+}
+
+/* ---------- 提示消息 ---------- */
+
+.ck-note {
+  font-size: 12px;
+  color: var(--text-muted);
+  line-height: 1.6;
+}
+
+/* ---------- 响应式 ---------- */
+
+@media (max-width: 720px) {
+  .ck-page {
+    padding: 14px 16px;
+  }
+
+  .ck-cards {
+    grid-template-columns: 1fr;
+  }
+
+  .ck-section-title { align-items: flex-start; flex-wrap: wrap; }
+  .ck-section-actions { width: 100%; margin-left: 0; flex-wrap: wrap; }
+  .ck-product-filter { flex: 1 1 100%; }
+  .ck-product-filter__item { flex: 1; }
+}

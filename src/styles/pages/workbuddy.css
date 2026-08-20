@@ -1,3 +1,64 @@
+.workbuddy-page .wb-slots {
+  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+}
+
+.workbuddy-page .wb-slot--active {
+  border-color: var(--primary);
+}
+
+.workbuddy-page .wb-account-title {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.workbuddy-page .wb-account-title img {
+  flex: 0 0 auto;
+  border-radius: 4px;
+  object-fit: contain;
+}
+
+.workbuddy-page .wb-product-pill {
+  flex: 0 0 auto;
+  padding: 2px 7px;
+  border: 1px solid color-mix(in srgb, var(--primary) 28%, var(--border));
+  border-radius: var(--radius-full);
+  color: var(--primary);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.workbuddy-page .wb-account-title .wc-slot-title {
+  min-width: 0;
+}
+
+.workbuddy-page .wb-sync {
+  flex: 0 0 auto;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.workbuddy-page .wb-sync--synced { color: #16a34a; }
+.workbuddy-page .wb-sync--failed { color: #dc2626; }
+
+.workbuddy-page .wb-checkin-toggle { display: flex; align-items: center; gap: 6px; min-width: 0; margin: 0; font-size: 12px; color: var(--text-secondary); cursor: pointer; }
+.workbuddy-page .wb-checkin-toggle input { flex: 0 0 auto; width: 14px; height: 14px; margin: 0; accent-color: var(--primary); }
+.workbuddy-page .wb-checkin-toggle span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.workbuddy-page .wb-edit-name { display: flex; gap: 8px; align-items: center; margin: 0 0 12px; }
+.workbuddy-page .wb-edit-name .wc-input { min-width: 0; flex: 1; }
+.workbuddy-page .wb-status-block { min-width: 0; }
+.workbuddy-page .wb-status-line { display: flex; flex-wrap: wrap; gap: 4px 12px; color: var(--text-secondary); font-size: 12px; line-height: 18px; }
+.workbuddy-page .wb-status-line span { white-space: nowrap; }
+.workbuddy-page .wb-status-line strong { color: var(--text-primary); font-size: 13px; }
+.workbuddy-page .wb-status-error { margin-top: 4px; color: #dc2626; font-size: 11px; line-height: 1.35; word-break: break-word; }
+.workbuddy-page .wb-settings-dialog { max-width: 620px; }
+.workbuddy-page .wb-settings-dialog .wc-input { margin-bottom: 12px; }
+
+@media (max-width: 520px) {
+  .workbuddy-page .wb-edit-name { flex-wrap: wrap; }
+}
+
 .workbuddy-accounts-page .workbuddy-quota-item {
   gap: 8px;
   padding-top: 2px;

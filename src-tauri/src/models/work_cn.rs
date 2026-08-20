@@ -67,6 +67,12 @@ pub struct WorkCnAccountView {
     pub has_device_public_key: bool,
     pub valid_for_switch: bool,
     pub warnings: Vec<String>,
+    /// access token 的 `exp`（秒级时间戳，非敏感），供签到面板做倒计时预警；
+    /// 无法解析时为 None。
+    pub token_expires_at: Option<i64>,
+    /// access token 的 `iat`（秒级时间戳，非敏感），用于判断刷新时是否真实轮换；
+    /// 无法解析时为 None。
+    pub token_issued_at: Option<i64>,
 }
 
 /// Result of a one-click Work CN account switch (阶段 4).
@@ -80,6 +86,8 @@ pub struct WorkCnSwitchResult {
     pub user_id: Option<String>,
     pub launched: bool,
     pub verified: bool,
+    /// 切换期间是否观察到 access/refresh token 变化；仅为脱敏控制标记。
+    pub token_changed: bool,
     pub github_synced: bool,
     pub warning: Option<String>,
 }
@@ -102,15 +110,16 @@ pub struct WorkCnCreditsSummary {
     pub updated_at: i64,
 }
 
-/// One GitHub Secrets slot binding: which account goes to which `TRAE{N}` secret pair.
+/// One GitHub Secrets slot binding: which account goes to which secret pair.
+/// 槽位数不设上限；`slot` 只是绑定列表中的顺序号（从 1 起）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkCnGitHubSlot {
-    pub slot: u8,
+    pub slot: u32,
     pub account_id: String,
-    /// Secret name for the access token. Empty → auto `TRAE{N}_TOKEN`.
+    /// Secret name for the access token. Empty → auto `{账号槽位名}_TOKEN`.
     pub token_secret: String,
-    /// Secret name for the device id. Empty → auto `TRAE{N}_DEVICE_ID`.
+    /// Secret name for the device id. Empty → auto `{账号槽位名}_DEVICE_ID`.
     pub device_secret: String,
 }
 
@@ -122,6 +131,15 @@ pub struct WorkCnGitHubConfig {
     /// `owner/repo` for the GitHub Actions repository that performs the daily check-in.
     pub repository: String,
     pub slots: Vec<WorkCnGitHubSlot>,
+    /// 签到 workflow 文件名（相对 `.github/workflows/`），用于触发与查询运行状态。
+    /// 旧版 `github.json` 无此字段时取默认值，保持向后兼容。
+    #[serde(default = "default_workflow_file")]
+    pub workflow_file: String,
+}
+
+/// Default workflow file name for the daily check-in repository.
+pub fn default_workflow_file() -> String {
+    "daily-checkin.yml".to_string()
 }
 
 impl Default for WorkCnGitHubConfig {
@@ -130,8 +148,58 @@ impl Default for WorkCnGitHubConfig {
             enabled: false,
             repository: String::new(),
             slots: Vec::new(),
+            workflow_file: default_workflow_file(),
         }
     }
+}
+
+/// One run of the daily check-in workflow (gh run list --json)。
+/// `conclusion` 在运行未结束时为 None。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CheckinWorkflowRun {
+    pub database_id: i64,
+    /// queued / in_progress / completed
+    pub status: String,
+    /// success / failure / cancelled / None（未结束）
+    pub conclusion: Option<String>,
+    pub created_at: String,
+    pub display_title: String,
+    /// schedule / workflow_dispatch
+    pub event: String,
+    pub url: String,
+}
+
+/// 本地单账号签到（诊断/补签）结果。与云端 Python trae.py 的语义对齐：
+/// `ok=true` 表示签到成功或当日已签；`message` 直接面向用户展示。
+///
+/// 注意：项目规范 docs/DEVELOPMENT.md 写有“本地绝不签到/claim”，本结构对应的
+/// 功能是有意打破该原则的诊断/补签入口（用户 2026-08-16 决策），用于定位云端
+/// GitHub Actions 签到被 TRAE 服务端拒绝（“操作太过频繁”）的风控来源。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkCnLocalCheckinResult {
+    pub account_id: String,
+    pub ok: bool,
+    pub message: String,
+    /// 状态接口返回的当日奖励积分。
+    pub credits: Option<i64>,
+    /// true = 当天已签过（本次未发 claim）。
+    pub already_checked_in: bool,
+    /// 本次结果：already_checked_in / claimed / failed。
+    pub outcome: String,
+    /// 失败或成功发生的请求阶段：status / claim / usage。
+    pub stage: String,
+    /// 服务端业务码，不包含任何凭证。
+    pub business_code: Option<i64>,
+    /// HTTP 状态码。
+    pub http_status: Option<i64>,
+    /// 是否实际发起过 claim。
+    pub claim_attempted: bool,
+    /// access token 的离线有效性：valid / expired / unknown。
+    pub token_expiry_state: String,
+    /// 是否存在签到设备 ID。
+    pub device_present: bool,
 }
 
 /// Result of a single account's GitHub secret sync. `skipped=true` means the
@@ -271,7 +339,32 @@ pub fn command_error_to_string(err: &WorkCnCommandError) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::WorkCnSessionWatchOutcome;
+    use super::{WorkCnLocalCheckinResult, WorkCnSessionWatchOutcome};
+
+    #[test]
+    fn local_checkin_result_exposes_safe_diagnostic_fields() {
+        let result = WorkCnLocalCheckinResult {
+            account_id: "account-1".to_string(),
+            ok: false,
+            message: "签到失败".to_string(),
+            credits: Some(200),
+            already_checked_in: false,
+            outcome: "failed".to_string(),
+            stage: "claim".to_string(),
+            business_code: Some(500),
+            http_status: Some(200),
+            claim_attempted: true,
+            token_expiry_state: "valid".to_string(),
+            device_present: true,
+        };
+
+        assert_eq!(result.outcome, "failed");
+        assert_eq!(result.stage, "claim");
+        assert_eq!(result.business_code, Some(500));
+        assert_eq!(result.http_status, Some(200));
+        assert!(result.claim_attempted);
+        assert!(result.device_present);
+    }
 
     #[test]
     fn work_cn_watch_outcome_serializes_screaming_snake_case() {
@@ -293,4 +386,3 @@ mod tests {
         );
     }
 }
-

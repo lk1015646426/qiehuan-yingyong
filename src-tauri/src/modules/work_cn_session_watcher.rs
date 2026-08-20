@@ -200,11 +200,13 @@ pub(crate) fn watch_once(runner: &dyn GitHubRunner) -> WorkCnSessionWatchStatus 
     };
 
     let account_before = account.clone();
-    let token_changed =
+    let session_changed =
         trae_account::sync_account_tokens_from_storage_path(&mut account, &path, "后台监测");
+    let token_changed = account_before.access_token != account.access_token
+        || account_before.refresh_token != account.refresh_token;
     preserve_account_metadata(&account_before, &mut account);
 
-    if let Err(err) = trae_account::save_account_file(&account) {
+    if let Err(err) = trae_account::persist_session_refresh_result(&account, &account_before) {
         set_last_seen_mtime(Some(mtime));
         mark_attempt_failure_with_backoff(SESSION_BACKOFF_KEY, SESSION_FAILURE_BACKOFF_SECONDS);
         logger::log_warn(&format!(
@@ -226,7 +228,11 @@ pub(crate) fn watch_once(runner: &dyn GitHubRunner) -> WorkCnSessionWatchStatus 
     if !token_changed {
         status.outcome = WorkCnSessionWatchOutcome::NoChange;
         status.token_changed = false;
-        status.message = "账号库已是最新，暂无 token 变化".to_string();
+        status.message = if session_changed {
+            "已更新官方设备快照，暂无 token 变化".to_string()
+        } else {
+            "账号库已是最新，暂无 token 变化".to_string()
+        };
         return status;
     }
 
@@ -236,7 +242,8 @@ pub(crate) fn watch_once(runner: &dyn GitHubRunner) -> WorkCnSessionWatchStatus 
     if !allow_attempt(&gh_key) {
         status.outcome = WorkCnSessionWatchOutcome::TokenUpdated;
         status.github_skipped = true;
-        status.message = "检测到 Token 更新，账号库已更新；GitHub 同步处于退避期，稍后自动重试".to_string();
+        status.message =
+            "检测到 Token 更新，账号库已更新；GitHub 同步处于退避期，稍后自动重试".to_string();
         return status;
     }
 
@@ -248,7 +255,9 @@ pub(crate) fn watch_once(runner: &dyn GitHubRunner) -> WorkCnSessionWatchStatus 
             if result.skipped {
                 status.message = format!(
                     "检测到 Token 更新，账号库已更新；GitHub 待同步：{}",
-                    result.skip_reason.unwrap_or_else(|| "未绑定槽位".to_string())
+                    result
+                        .skip_reason
+                        .unwrap_or_else(|| "未绑定槽位".to_string())
                 );
             } else {
                 status.message = "检测到 Token 更新，账号库与 GitHub 已同步".to_string();
@@ -310,9 +319,33 @@ fn now_ts() -> i64 {
 /// 只恢复「非 token 类」元数据；`access_token`/`refresh_token`/`token_type`/
 /// `expires_at`/`status`/`status_reason`/`email`/`user_id` 保持同步后的新值。
 fn preserve_account_metadata(before: &TraeAccount, after: &mut TraeAccount) {
-    after.checkin_device_id = before.checkin_device_id.clone();
-    after.machine_id = before.machine_id.clone();
-    after.auth_device_id = before.auth_device_id.clone();
+    if after
+        .checkin_device_id
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
+        after.checkin_device_id = before.checkin_device_id.clone();
+    }
+    if after
+        .machine_id
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
+        after.machine_id = before.machine_id.clone();
+    }
+    if after
+        .auth_device_id
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("")
+        .is_empty()
+    {
+        after.auth_device_id = before.auth_device_id.clone();
+    }
 
     if let (Some(before_auth), Some(after_auth)) =
         (before.trae_auth_raw.as_ref(), after.trae_auth_raw.as_mut())
@@ -320,13 +353,7 @@ fn preserve_account_metadata(before: &TraeAccount, after: &mut TraeAccount) {
         merge_preserved_auth_keys(
             before_auth,
             after_auth,
-            &[
-                "platformId",
-                "platform",
-                "platform_id",
-                "deviceInfo",
-                "deviceKeyPair",
-            ],
+            &["platformId", "platform", "platform_id"],
         );
     }
 
@@ -385,11 +412,11 @@ fn mark_attempt_failure_with_backoff(key: &str, backoff_seconds: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::Engine as _;
     use crate::models::trae::TraeImportPayload;
     use crate::models::work_cn::{WorkCnGitHubConfig, WorkCnGitHubSlot};
     use crate::modules::trae_account::import_work_cn_account_from_payload;
     use crate::modules::work_cn_github::{save_github_config, FakeGitHubRunner};
+    use base64::Engine as _;
     use std::path::{Path, PathBuf};
 
     fn make_payload(uid: &str, token: &str) -> TraeImportPayload {
@@ -442,8 +469,41 @@ mod tests {
                 "refreshToken": format!("refresh-{token}")
             }
         });
-        std::fs::write(path, serde_json::to_string(&content).expect("serialize storage"))
-            .expect("write storage");
+        std::fs::write(
+            path,
+            serde_json::to_string(&content).expect("serialize storage"),
+        )
+        .expect("write storage");
+    }
+
+    fn write_storage_with_device(path: &Path, uid: &str, token: &str, device_id: &str) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).expect("create storage parent");
+        }
+        let mut content = serde_json::json!({
+            "iCubeAuthInfo://icube.cloudide": {
+                "userId": uid,
+                "accessToken": token,
+                "email": format!("{uid}@example.com"),
+                "refreshToken": format!("refresh-{token}")
+            },
+            "telemetry.devDeviceId": "new-checkin-device",
+            "telemetry.machineId": "new-machine-id"
+        });
+        content.as_object_mut().expect("storage object").insert(
+            format!("iCubeAuthInfo://icube-dc:{device_id}"),
+            serde_json::json!({
+                "deviceKeyPair": {
+                    "privateKeyPEM": "new-private-key",
+                    "publicKeyPEM": "new-public-key"
+                }
+            }),
+        );
+        std::fs::write(
+            path,
+            serde_json::to_string(&content).expect("serialize storage"),
+        )
+        .expect("write storage");
     }
 
     fn write_invalid_storage(path: &Path) {
@@ -480,6 +540,7 @@ mod tests {
                 token_secret: String::new(),
                 device_secret: String::new(),
             }],
+            workflow_file: crate::models::work_cn::default_workflow_file(),
         })
         .expect("save github config");
     }
@@ -603,7 +664,8 @@ mod tests {
         let storage_dir = unique_dir("work-cn-watch-updated-storage");
         let storage_path = storage_dir.join("storage.json");
         let new_token = jwt_with_exp(chrono::Utc::now().timestamp() + 3600);
-        write_storage(&storage_path, "uid-t", &new_token);
+        let new_device_id = "2232918838145530";
+        write_storage_with_device(&storage_path, "uid-t", &new_token, new_device_id);
         std::env::set_var("WORK_CN_SWITCH_STORAGE_OVERRIDE", &storage_path);
 
         let runner = FakeGitHubRunner::new();
@@ -614,11 +676,29 @@ mod tests {
         assert!(!status.github_skipped);
 
         let reloaded = trae_account::load_account(&account_id).expect("reload account");
-        assert_eq!(reloaded.access_token, new_token, "账号库 access_token 应更新");
-        // 设备快照 + 平台元数据必须保留，账号仍可再次切换。
+        assert_eq!(
+            reloaded.access_token, new_token,
+            "账号库 access_token 应更新"
+        );
+        // 官方客户端重新注册设备后，新快照必须优先，不能恢复成旧设备身份。
+        assert_eq!(reloaded.auth_device_id.as_deref(), Some(new_device_id));
         assert_eq!(
             reloaded.checkin_device_id.as_deref(),
-            Some("d6b8ac2e-f4d1-496d-a9a6-c9c7b4bd23e3")
+            Some("new-checkin-device")
+        );
+        assert_eq!(reloaded.machine_id.as_deref(), Some("new-machine-id"));
+        let device_info_id = reloaded
+            .trae_auth_raw
+            .as_ref()
+            .and_then(|raw| raw.pointer("/deviceInfo/DeviceID"))
+            .and_then(serde_json::Value::as_str);
+        assert_eq!(device_info_id, Some(new_device_id));
+        assert!(
+            runner
+                .recorded_calls()
+                .iter()
+                .any(|call| call.stdin.as_deref() == Some(new_device_id)),
+            "GitHub 应收到新数字设备 ID"
         );
         assert!(
             trae_account::validate_work_cn_account_for_switch(&reloaded).is_ok(),
@@ -656,6 +736,46 @@ mod tests {
         assert_eq!(status.outcome, WorkCnSessionWatchOutcome::NoChange);
         assert!(!status.github_synced);
         assert!(runner.recorded_calls().is_empty(), "token 未变不应调用 gh");
+
+        std::env::remove_var("WORK_CN_SWITCH_STORAGE_OVERRIDE");
+        std::env::remove_var("COCKPIT_TOOLS_TEST_DATA_DIR");
+        let _ = std::fs::remove_dir_all(&data_dir);
+        let _ = std::fs::remove_dir_all(&storage_dir);
+    }
+
+    #[test]
+    fn work_cn_watch_once_device_snapshot_change_does_not_report_token_rotation() {
+        let _lock = crate::modules::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        reset_runtime();
+
+        let data_dir = unique_dir("work-cn-watch-device-only");
+        std::env::set_var("COCKPIT_TOOLS_TEST_DATA_DIR", &data_dir);
+
+        let account = import_work_cn_account_from_payload(make_payload("uid-t", "old-token"), None)
+            .expect("import account");
+        let account_id = account.id.clone();
+        bind_github_for(&account_id);
+
+        let storage_dir = unique_dir("work-cn-watch-device-only-storage");
+        let storage_path = storage_dir.join("storage.json");
+        let new_device_id = "2232918838145530";
+        write_storage_with_device(&storage_path, "uid-t", "old-token", new_device_id);
+        std::env::set_var("WORK_CN_SWITCH_STORAGE_OVERRIDE", &storage_path);
+
+        let runner = FakeGitHubRunner::new();
+        let status = watch_once(&runner);
+        assert_eq!(status.outcome, WorkCnSessionWatchOutcome::NoChange);
+        assert!(!status.token_changed, "设备快照变化不能伪装成 Token 轮换");
+        assert!(!status.github_synced);
+        assert!(
+            runner.recorded_calls().is_empty(),
+            "Token 未轮换时不应调用 gh"
+        );
+
+        let reloaded = trae_account::load_account(&account_id).expect("reload account");
+        assert_eq!(reloaded.auth_device_id.as_deref(), Some(new_device_id));
 
         std::env::remove_var("WORK_CN_SWITCH_STORAGE_OVERRIDE");
         std::env::remove_var("COCKPIT_TOOLS_TEST_DATA_DIR");

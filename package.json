@@ -1,11 +1,12 @@
 {
   "name": "trae-work-cn-switcher",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.2",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "test:codex-api-key-scope": "node --test src/utils/codexApiKeyAccountScope.test.ts",
+    "test:token-rotation": "node --test src/utils/tokenRotation.test.ts",
     "typecheck": "tsc --noEmit",
     "prebuild": "npm run typecheck",
     "build": "npm run sync-version && tsc && vite build",

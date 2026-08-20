@@ -877,4 +877,3 @@ pub fn update_account_quota(account_id: &str, quota: QuotaData) -> Result<(), St
     }
     Ok(())
 }
-

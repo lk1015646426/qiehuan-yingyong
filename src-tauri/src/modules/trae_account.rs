@@ -18,7 +18,8 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::models::trae::{TraeAccount, TraeAccountIndex, TraeImportPayload};
 use crate::models::work_cn::{
-    WorkCnCommandError, WorkCnCreditsSummary, WorkCnErrorCode, WorkCnSwitchResult,
+    WorkCnCommandError, WorkCnCreditsSummary, WorkCnErrorCode, WorkCnLocalCheckinResult,
+    WorkCnSwitchResult,
 };
 use crate::modules::{account, config, logger};
 
@@ -213,6 +214,10 @@ const TRAE_ENT_USAGE_PATH: &str = "/trae/api/v1/pay/ide_user_ent_usage";
 /// Trae CN / TRAE SOLO CN 官方 pay 接口当前以 v2 为准（参考社区 #1281）。
 const TRAE_CN_PAY_STATUS_PATH: &str = "/trae/api/v2/pay/ide_user_pay_status";
 const TRAE_CN_ENT_USAGE_PATH: &str = "/trae/api/v2/pay/ide_user_ent_usage";
+/// 本地单账号签到（诊断/补签，用户 2026-08-16 决策）使用的两个 ug 接口，
+/// 路径与云端 Python 签到脚本（另一仓库 trae.py）保持一致。
+const TRAE_CN_CHECKIN_STATUS_PATH: &str = "/trae/api/v2/ug/checkin_credits/status";
+const TRAE_CN_CHECKIN_CLAIM_PATH: &str = "/trae/api/v2/ug/checkin_credits/claim";
 const TRAE_CN_CURRENT_ENTITLEMENT_LIST_PATH: &str =
     "/trae/api/v2/pay/user_current_entitlement_list";
 const TRAE_AUTH_DOMAIN: &str = "www.trae.ai";
@@ -669,6 +674,62 @@ fn upsert_account_record(account: TraeAccount) -> Result<TraeAccount, String> {
     refresh_summary(&mut index, &account);
     save_account_index(&index)?;
     Ok(account)
+}
+
+fn merge_usage_refresh_into_latest(
+    mut latest: TraeAccount,
+    refreshed: &TraeAccount,
+) -> TraeAccount {
+    latest.plan_type = refreshed.plan_type.clone();
+    latest.plan_reset_at = refreshed.plan_reset_at;
+    latest.trae_entitlement_raw = refreshed.trae_entitlement_raw.clone();
+    latest.trae_usage_raw = refreshed.trae_usage_raw.clone();
+    latest.quota_query_last_error = refreshed.quota_query_last_error.clone();
+    latest.quota_query_last_error_at = refreshed.quota_query_last_error_at;
+    latest.usage_updated_at = refreshed.usage_updated_at;
+    latest.last_used = latest.last_used.max(refreshed.last_used);
+    latest
+}
+
+fn persist_usage_refresh_result(refreshed: &TraeAccount) -> Result<TraeAccount, String> {
+    let _lock = TRAE_ACCOUNT_INDEX_LOCK
+        .lock()
+        .map_err(|_| "获取 Trae 账号锁失败".to_string())?;
+    let latest = load_account(&refreshed.id).ok_or_else(|| "账号不存在".to_string())?;
+    let merged = merge_usage_refresh_into_latest(latest, refreshed);
+    let mut index = load_account_index();
+    save_account_file(&merged)?;
+    refresh_summary(&mut index, &merged);
+    save_account_index(&index)?;
+    Ok(merged)
+}
+
+pub(crate) fn persist_session_refresh_result(
+    refreshed: &TraeAccount,
+    expected_before: &TraeAccount,
+) -> Result<TraeAccount, String> {
+    let _lock = TRAE_ACCOUNT_INDEX_LOCK
+        .lock()
+        .map_err(|_| "获取 Trae 账号锁失败".to_string())?;
+    let mut latest = load_account(&refreshed.id).ok_or_else(|| "账号不存在".to_string())?;
+    let latest_changed_since_read = latest.access_token != expected_before.access_token
+        || latest.refresh_token != expected_before.refresh_token;
+    if !latest_changed_since_read {
+        latest = refreshed.clone();
+    } else {
+        latest.trae_auth_raw = refreshed.trae_auth_raw.clone().or(latest.trae_auth_raw);
+        latest.checkin_device_id = refreshed
+            .checkin_device_id
+            .clone()
+            .or(latest.checkin_device_id);
+        latest.machine_id = refreshed.machine_id.clone().or(latest.machine_id);
+        latest.auth_device_id = refreshed.auth_device_id.clone().or(latest.auth_device_id);
+    }
+    let mut index = load_account_index();
+    save_account_file(&latest)?;
+    refresh_summary(&mut index, &latest);
+    save_account_index(&index)?;
+    Ok(latest)
 }
 
 fn persist_quota_query_error(account_id: &str, message: &str) {
@@ -2139,9 +2200,7 @@ pub fn select_trae_data_dir_candidate(candidates: &[PathBuf]) -> Option<PathBuf>
 
 /// Resolve the active data directory for a platform, falling back to the first
 /// candidate when nothing exists on disk yet (fresh install).
-pub fn resolve_trae_data_dir_for_platform(
-    platform: TraePlatformKind,
-) -> Result<PathBuf, String> {
+pub fn resolve_trae_data_dir_for_platform(platform: TraePlatformKind) -> Result<PathBuf, String> {
     let candidates = get_trae_data_dir_candidates_for_platform(platform)?;
     if let Some(selected) = select_trae_data_dir_candidate(&candidates) {
         return Ok(selected);
@@ -2990,8 +3049,7 @@ pub(crate) fn is_work_cn_account_kind(kind: TraePlatformKind) -> bool {
 /// `trae_solo_cn`。两者视为同一平台，避免切换回写/重复导入时因严格相等
 /// 匹配失败而新建出重复账号（表现为“槽位中突然多出相同账号”）。
 fn upsert_platform_compatible(existing: TraePlatformKind, incoming: TraePlatformKind) -> bool {
-    existing == incoming
-        || (is_work_cn_account_kind(existing) && is_work_cn_account_kind(incoming))
+    existing == incoming || (is_work_cn_account_kind(existing) && is_work_cn_account_kind(incoming))
 }
 
 fn profile_payload_root(profile_raw: Option<&Value>) -> Option<&Value> {
@@ -3726,11 +3784,7 @@ pub(crate) fn backfill_account_user_id_if_missing(
     save_account_file(&account)?;
     // Keep index summary in sync for UI/debug.
     if let Ok(mut index) = load_account_index_checked() {
-        if let Some(item) = index
-            .accounts
-            .iter_mut()
-            .find(|item| item.id == account.id)
-        {
+        if let Some(item) = index.accounts.iter_mut().find(|item| item.id == account.id) {
             item.user_id = Some(uid.clone());
             item.last_used = account.last_used;
             let _ = save_account_index(&index);
@@ -3791,14 +3845,38 @@ pub(crate) fn extract_local_work_cn_device_snapshot(
         None => return LocalWorkCnDeviceSnapshot::default(),
     };
 
-    let device_key_entry = root_obj
-        .iter()
-        .find(|(key, _)| key.starts_with(TRAE_STORAGE_DEVICE_KEY_PREFIX));
+    let provider_id = resolve_storage_provider_id(root_obj);
+    let auth_storage_key = build_auth_storage_key(provider_id.as_str());
+    let current_auth = storage_object_value_auth(storage_root, auth_storage_key.as_str())
+        .or_else(|| storage_object_value_auth(storage_root, TRAE_STORAGE_AUTH_KEY));
+    let current_auth_device_id = pick_string(
+        current_auth.as_ref(),
+        &[
+            &["deviceInfo", "DeviceID"],
+            &["deviceInfo", "deviceId"],
+            &["DeviceID"],
+            &["deviceId"],
+        ],
+    );
 
-    let auth_device_id = device_key_entry
-        .and_then(|(key, _)| key.strip_prefix(TRAE_STORAGE_DEVICE_KEY_PREFIX))
-        .and_then(|s| normalize_non_empty(Some(s)))
-        .map(String::from);
+    // storage.json can retain several historical `icube-dc:*` records after
+    // account switches. The current auth record is authoritative: only its
+    // matching key pair may be attached to the active token. Fall back to the
+    // sole/first device record only for legacy auth payloads without DeviceID.
+    let device_key_entry = if let Some(device_id) = current_auth_device_id.as_deref() {
+        root_obj.get_key_value(&build_device_key_storage_key(device_id))
+    } else {
+        root_obj
+            .iter()
+            .find(|(key, _)| key.starts_with(TRAE_STORAGE_DEVICE_KEY_PREFIX))
+    };
+
+    let auth_device_id = current_auth_device_id.or_else(|| {
+        device_key_entry
+            .and_then(|(key, _)| key.strip_prefix(TRAE_STORAGE_DEVICE_KEY_PREFIX))
+            .and_then(|s| normalize_non_empty(Some(s)))
+            .map(String::from)
+    });
 
     let parsed_device_key = device_key_entry
         .and_then(|(_, value)| parse_value_or_json_string_or_icube_cipher(Some(value)));
@@ -3813,8 +3891,12 @@ pub(crate) fn extract_local_work_cn_device_snapshot(
         .and_then(normalize_device_key_pair_value)
         .map(|kp| {
             (
-                kp.get("privateKeyPEM").and_then(Value::as_str).map(String::from),
-                kp.get("publicKeyPEM").and_then(Value::as_str).map(String::from),
+                kp.get("privateKeyPEM")
+                    .and_then(Value::as_str)
+                    .map(String::from),
+                kp.get("publicKeyPEM")
+                    .and_then(Value::as_str)
+                    .map(String::from),
             )
         })
         .unwrap_or((None, None));
@@ -3848,19 +3930,51 @@ pub(crate) fn merge_work_cn_device_snapshot_into_payload(
     payload: &mut TraeImportPayload,
     snapshot: crate::models::work_cn::LocalWorkCnDeviceSnapshot,
 ) {
-    payload.checkin_device_id = snapshot.checkin_device_id.clone();
-    payload.machine_id = snapshot.machine_id.clone();
-    payload.auth_device_id = snapshot.auth_device_id.clone();
+    let previous_auth_device_id =
+        normalize_non_empty(payload.auth_device_id.as_deref()).or_else(|| {
+            payload
+                .trae_auth_raw
+                .as_ref()
+                .and_then(|raw| raw.pointer("/deviceInfo/DeviceID"))
+                .and_then(Value::as_str)
+                .and_then(|value| normalize_non_empty(Some(value)))
+        });
+    let checkin_device_id = normalize_non_empty(snapshot.checkin_device_id.as_deref());
+    let machine_id = normalize_non_empty(snapshot.machine_id.as_deref());
+    let auth_device_id = normalize_non_empty(snapshot.auth_device_id.as_deref());
+    if checkin_device_id.is_some() {
+        payload.checkin_device_id = checkin_device_id;
+    }
+    if machine_id.is_some() {
+        payload.machine_id = machine_id;
+    }
+    if auth_device_id.is_some() {
+        payload.auth_device_id = auth_device_id.clone();
+    }
 
-    if snapshot.device_private_key.is_some() || snapshot.device_public_key.is_some() {
+    let private_key = normalize_non_empty(snapshot.device_private_key.as_deref());
+    let public_key = normalize_non_empty(snapshot.device_public_key.as_deref());
+    let device_changed = auth_device_id.is_some()
+        && previous_auth_device_id.is_some()
+        && auth_device_id.as_deref() != previous_auth_device_id.as_deref();
+    if device_changed && (private_key.is_none() || public_key.is_none()) {
+        if let Some(auth_obj) = payload
+            .trae_auth_raw
+            .as_mut()
+            .and_then(Value::as_object_mut)
+        {
+            auth_obj.remove("deviceKeyPair");
+        }
+    }
+    if let (Some(private_key), Some(public_key)) = (private_key, public_key) {
         let mut auth_obj = payload
             .trae_auth_raw
             .take()
             .unwrap_or_else(|| Value::Object(Map::new()));
         if let Some(obj) = auth_obj.as_object_mut() {
             let device_key_pair = serde_json::json!({
-                "privateKeyPEM": snapshot.device_private_key.unwrap_or_default(),
-                "publicKeyPEM": snapshot.device_public_key.unwrap_or_default(),
+                "privateKeyPEM": private_key,
+                "publicKeyPEM": public_key,
             });
             obj.insert("deviceKeyPair".to_string(), device_key_pair);
         }
@@ -3869,28 +3983,117 @@ pub(crate) fn merge_work_cn_device_snapshot_into_payload(
 
     // 切换校验/注入依赖 auth_raw.deviceInfo.DeviceID（官方形态），而 storage.json
     // 里该 ID 只存在于 `iCubeAuthInfo://icube-dc:<ID>` 的键名中。导入时把它回写
-    // 到 auth_raw，保证快照自包含；已有则不覆盖。
-    if let Some(auth_device_id) = snapshot.auth_device_id.as_deref() {
+    // 到 auth_raw，保证快照自包含；新的官方设备 ID 优先于旧快照。
+    if let Some(auth_device_id) = auth_device_id.as_deref() {
         let mut auth_obj = payload
             .trae_auth_raw
             .take()
             .unwrap_or_else(|| Value::Object(Map::new()));
         if let Some(obj) = auth_obj.as_object_mut() {
-            let has_device_id = obj
-                .get("deviceInfo")
-                .and_then(|device| device.get("DeviceID"))
-                .and_then(Value::as_str)
-                .map(|value| !value.trim().is_empty())
-                .unwrap_or(false);
-            if !has_device_id {
-                obj.insert(
-                    "deviceInfo".to_string(),
-                    serde_json::json!({ "DeviceID": auth_device_id }),
-                );
+            let device_info = obj
+                .entry("deviceInfo".to_string())
+                .or_insert_with(|| Value::Object(Map::new()));
+            if !device_info.is_object() {
+                *device_info = Value::Object(Map::new());
             }
+            device_info
+                .as_object_mut()
+                .expect("deviceInfo normalized to object")
+                .insert(
+                    "DeviceID".to_string(),
+                    Value::String(auth_device_id.to_string()),
+                );
         }
         payload.trae_auth_raw = Some(auth_obj);
     }
+}
+
+fn auth_context_value_is_valid(key: &str, value: &Value) -> bool {
+    match key {
+        "deviceInfo" => value
+            .get("DeviceID")
+            .and_then(Value::as_str)
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false),
+        "deviceKeyPair" => ["privateKeyPEM", "publicKeyPEM"].iter().all(|field| {
+            value
+                .get(*field)
+                .and_then(Value::as_str)
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false)
+        }),
+        _ => value
+            .as_str()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false),
+    }
+}
+
+fn preserve_existing_device_context_in_payload(
+    account: &TraeAccount,
+    payload: &mut TraeImportPayload,
+) {
+    let incoming_auth_device_id = normalize_non_empty(payload.auth_device_id.as_deref());
+    let existing_auth_device_id = normalize_non_empty(account.auth_device_id.as_deref());
+    let same_device = incoming_auth_device_id.is_none()
+        || incoming_auth_device_id.as_deref() == existing_auth_device_id.as_deref();
+
+    if normalize_non_empty(payload.checkin_device_id.as_deref()).is_none() {
+        payload.checkin_device_id = account.checkin_device_id.clone();
+    }
+    if normalize_non_empty(payload.machine_id.as_deref()).is_none() {
+        payload.machine_id = account.machine_id.clone();
+    }
+    if incoming_auth_device_id.is_none() {
+        payload.auth_device_id = account.auth_device_id.clone();
+    }
+
+    let mut incoming = payload
+        .trae_auth_raw
+        .take()
+        .unwrap_or_else(|| Value::Object(Map::new()));
+    if !incoming.is_object() {
+        incoming = Value::Object(Map::new());
+    }
+    let incoming_obj = incoming.as_object_mut().expect("auth normalized to object");
+    let existing_obj = account.trae_auth_raw.as_ref().and_then(Value::as_object);
+
+    for key in ["platformId", "platform", "platform_id"] {
+        let incoming_valid = incoming_obj
+            .get(key)
+            .map(|value| auth_context_value_is_valid(key, value))
+            .unwrap_or(false);
+        if !incoming_valid {
+            if let Some(value) = existing_obj.and_then(|obj| obj.get(key)) {
+                incoming_obj.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+
+    if same_device {
+        for key in ["deviceInfo", "deviceKeyPair"] {
+            let incoming_valid = incoming_obj
+                .get(key)
+                .map(|value| auth_context_value_is_valid(key, value))
+                .unwrap_or(false);
+            if !incoming_valid {
+                if let Some(value) = existing_obj
+                    .and_then(|obj| obj.get(key))
+                    .filter(|value| auth_context_value_is_valid(key, value))
+                {
+                    incoming_obj.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+    } else if incoming_obj
+        .get("deviceKeyPair")
+        .map(|value| !auth_context_value_is_valid("deviceKeyPair", value))
+        .unwrap_or(false)
+    {
+        incoming_obj.remove("deviceKeyPair");
+    }
+
+    payload.trae_auth_raw = Some(incoming);
 }
 
 /// Validate whether a saved Work CN account carries everything needed for a
@@ -3973,46 +4176,10 @@ pub fn validate_work_cn_account_snapshot(
     }
 }
 
-/// Enforce the "max 4 distinct UIDs" cap for a platform before upserting. The
-/// incoming `new_user_id` counts as an addition only when it is non-empty and
-/// not already present, so re-importing the same UID never trips the cap.
-fn enforce_work_cn_account_cap(
-    platform: TraePlatformKind,
-    new_user_id: Option<&str>,
-) -> Result<(), String> {
-    let index = load_account_index_checked()?;
-    let mut distinct_uids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    for item in &index.accounts {
-        if let Some(account) = load_account(&item.id) {
-            // Work CN 单平台：历史 trae_cn 与规范化 trae_solo_cn 一视同仁，
-            // 4 槽位上限按合并后的去重 UID 计数，避免混合标记时绕过上限。
-            if !is_work_cn_account_kind(resolve_account_platform_kind(&account))
-                || !is_work_cn_account_kind(platform)
-            {
-                continue;
-            }
-            if let Some(uid) = account.user_id.as_deref().filter(|u| !u.is_empty()) {
-                distinct_uids.insert(uid.to_string());
-            }
-        }
-    }
-    let new_uid = new_user_id.filter(|u| !u.trim().is_empty());
-    let would_add = match new_uid {
-        Some(uid) => !distinct_uids.contains(uid),
-        None => false,
-    };
-    if would_add && distinct_uids.len() >= 4 {
-        return Err(format!(
-            "TRAE Work CN 最多支持 4 个不同账号，当前已有 {} 个，无法导入第 5 个",
-            distinct_uids.len()
-        ));
-    }
-    Ok(())
-}
-
 /// Core import used by both the Tauri command and unit tests. Reads a resolved
-/// payload (already carrying the device snapshot), enforces the cap, upserts the
-/// account, and stores the optional `label` as a tag (never overwriting email).
+/// payload (already carrying the device snapshot), upserts the account, and
+/// stores the optional `label` as a tag (never overwriting email).
+/// 账号数量不设上限：新增账号按导入顺序自动排入下一个槽位。
 pub(crate) fn import_work_cn_account_from_payload(
     mut payload: TraeImportPayload,
     label: Option<String>,
@@ -4023,7 +4190,6 @@ pub(crate) fn import_work_cn_account_from_payload(
     // 过滤掉（表现为“重启后槽位为空”）。这里强制规范化为 TraeSoloCn。
     let platform = TraePlatformKind::TraeSoloCn;
     attach_platform_metadata_to_payload(&mut payload, platform);
-    enforce_work_cn_account_cap(platform, payload.user_id.as_deref())?;
     let mut account = upsert_account(payload)?;
     if let Some(label) = label.filter(|l| !l.trim().is_empty()) {
         account = update_account_tags(&account.id, vec![label.trim().to_string()])?;
@@ -4040,9 +4206,7 @@ pub fn import_current_work_cn_account(
     let platform = TraePlatformKind::TraeSoloCn;
     let storage_path = get_default_trae_storage_path_for_platform(platform)?;
     if !storage_path.exists() {
-        return Err(
-            "未检测到已登录的 TRAE Work CN 账号，请先在官方客户端登录后再导入".to_string(),
-        );
+        return Err("未检测到已登录的 TRAE Work CN 账号，请先在官方客户端登录后再导入".to_string());
     }
     let storage_root = read_storage_json(&storage_path)?;
     let mut payload = payload_from_storage_root(&storage_root)?;
@@ -4089,6 +4253,8 @@ pub(crate) fn build_work_cn_account_view(
         has_device_public_key: validation.has_device_public_key,
         valid_for_switch: validation.valid_for_switch,
         warnings: validation.warnings,
+        token_expires_at: crate::utils::jwt::parse_jwt_exp(&account.access_token),
+        token_issued_at: crate::utils::jwt::parse_jwt_iat(&account.access_token),
     }
 }
 
@@ -4106,9 +4272,7 @@ pub fn list_work_cn_accounts() -> Result<Vec<crate::models::work_cn::WorkCnAccou
 
 /// 在账号库中按 UID（优先）→ email 匹配给定 payload 对应的 Work CN 账号 id。
 /// 找不到就返回 `None`（由调用方映射为 NoMatch），**不回填** UID（主理人拍板）。
-pub(crate) fn find_work_cn_account_id_for_payload(
-    payload: &TraeImportPayload,
-) -> Option<String> {
+pub(crate) fn find_work_cn_account_id_for_payload(payload: &TraeImportPayload) -> Option<String> {
     let normalized_user_id = normalize_non_empty(payload.user_id.as_deref());
     let normalized_email = normalize_identity_email(Some(payload.email.as_str()));
     let accounts = list_accounts_checked().ok()?;
@@ -4191,7 +4355,13 @@ pub fn validate_work_cn_account_for_switch(
             "缺少 access token",
         ));
     }
-    if account.refresh_token.as_deref().unwrap_or("").trim().is_empty() {
+    if account
+        .refresh_token
+        .as_deref()
+        .unwrap_or("")
+        .trim()
+        .is_empty()
+    {
         return Err(WorkCnCommandError::new(
             WorkCnErrorCode::SnapshotIncomplete,
             "缺少 refresh token，无法长期免登录切换",
@@ -4268,8 +4438,8 @@ pub fn validate_work_cn_account_for_switch(
 /// 步骤 3：切换前把当前官方客户端的登录态同步回账号库，避免丢失被官方客户端
 /// 轮换后的 refresh token（开发指南 §8.3 步骤 3）。找不到对应账号时返回 None，
 /// 不阻止切换，但会提示用户先导入。
-pub fn sync_current_work_cn_session_from_local(
-) -> Result<Option<TraeAccount>, WorkCnCommandError> {
+pub fn sync_current_work_cn_session_from_local() -> Result<Option<TraeAccount>, WorkCnCommandError>
+{
     let platform = TraePlatformKind::TraeSoloCn;
     let payload = match read_local_trae_auth_for_platform(platform) {
         Ok(Some(found)) => found,
@@ -4283,9 +4453,8 @@ pub fn sync_current_work_cn_session_from_local(
     };
     let normalized_user_id = normalize_non_empty(payload.user_id.as_deref());
     let normalized_email = normalize_email(Some(payload.email.as_str()));
-    let accounts = list_accounts_checked().map_err(|error| {
-        WorkCnCommandError::new(WorkCnErrorCode::SnapshotIncomplete, error)
-    })?;
+    let accounts = list_accounts_checked()
+        .map_err(|error| WorkCnCommandError::new(WorkCnErrorCode::SnapshotIncomplete, error))?;
     let Some(account_id) = accounts
         .iter()
         .find(|account| {
@@ -4316,10 +4485,8 @@ pub fn sync_current_work_cn_session_from_local(
 
     let mut payload = payload;
     attach_platform_metadata_to_payload(&mut payload, platform);
-    let account =
-        upsert_account(payload).map_err(|error| {
-            WorkCnCommandError::new(WorkCnErrorCode::SnapshotIncomplete, error)
-        })?;
+    let account = upsert_account(payload)
+        .map_err(|error| WorkCnCommandError::new(WorkCnErrorCode::SnapshotIncomplete, error))?;
     logger::log_info(&format!(
         "[Work CN Switch] 已同步当前客户端会话到账号库: account_id={}",
         account_id
@@ -4348,9 +4515,9 @@ fn rollback_storage_bytes(storage_path: &Path, previous: Option<&[u8]>) {
 /// 恢复默认实例绑定的账号（None 表示切换前未绑定）。
 fn rollback_bind(platform: TraePlatformKind, previous: Option<&str>) {
     let bind = previous.map(|value| Some(value.to_string()));
-    if let Err(error) =
-        crate::modules::trae_instance::update_default_settings_for_platform(platform, bind, None, None)
-    {
+    if let Err(error) = crate::modules::trae_instance::update_default_settings_for_platform(
+        platform, bind, None, None,
+    ) {
         logger::log_error(&format!(
             "[Work CN Switch] 回滚默认实例绑定失败: error={}",
             error
@@ -4505,11 +4672,13 @@ pub async fn switch_work_cn_account(
                 }
             }
         };
+        verify_work_cn_switched_account(&account, Duration::from_secs(30), &storage_path).await?;
         return Ok(WorkCnSwitchResult {
             account_id,
             user_id: account.user_id.clone(),
             launched,
             verified: true,
+            token_changed: false,
             github_synced: false,
             warning: None,
         });
@@ -4517,14 +4686,12 @@ pub async fn switch_work_cn_account(
 
     // 步骤 5：正常关闭官方客户端（不默认强杀）。
     if !work_cn_switch_skip_process() {
-        if let Err(error) =
-            crate::modules::process::close_trae_platform_default("trae_solo_cn", 20)
+        if let Err(error) = crate::modules::process::close_trae_platform_default("trae_solo_cn", 20)
         {
-            return Err(WorkCnCommandError::new(
-                WorkCnErrorCode::ClientCloseFailed,
-                error,
-            )
-            .with_detail("关闭失败，未写入 storage.json"));
+            return Err(
+                WorkCnCommandError::new(WorkCnErrorCode::ClientCloseFailed, error)
+                    .with_detail("关闭失败，未写入 storage.json"),
+            );
         }
     }
 
@@ -4546,11 +4713,10 @@ pub async fn switch_work_cn_account(
     ) {
         rollback_storage_bytes(&storage_path, previous_bytes.as_deref());
         rollback_bind(platform, previous_bind.as_deref());
-        return Err(WorkCnCommandError::new(
-            WorkCnErrorCode::InjectFailed,
-            error,
-        )
-        .with_detail("注入成功但绑定默认实例失败"));
+        return Err(
+            WorkCnCommandError::new(WorkCnErrorCode::InjectFailed, error)
+                .with_detail("注入成功但绑定默认实例失败"),
+        );
     }
 
     // 步骤 8：绑定并启动默认实例。
@@ -4590,11 +4756,23 @@ pub async fn switch_work_cn_account(
         return Err(error);
     }
 
-    // 成功：若官方客户端启动后轮换了 Token，更新账号库。
+    // 成功：保存官方客户端在切换后写入的最新会话快照。Token 可保持有效并复用，
+    // 但数字设备 ID 或设备密钥仍可能已由官方客户端更新。
+    let mut token_changed = false;
     if storage_path.exists() {
         let mut refreshed = account;
+        let previous_access_token = refreshed.access_token.clone();
+        let previous_refresh_token = refreshed.refresh_token.clone();
         if sync_account_tokens_from_storage_path(&mut refreshed, &storage_path, "切换后") {
-            let _ = save_account_file(&refreshed);
+            token_changed = previous_access_token != refreshed.access_token
+                || previous_refresh_token != refreshed.refresh_token;
+            save_account_file(&refreshed).map_err(|error| {
+                WorkCnCommandError::new(
+                    WorkCnErrorCode::SnapshotIncomplete,
+                    "切换后无法保存官方设备快照，已停止 GitHub 同步",
+                )
+                .with_detail(error)
+            })?;
         }
         account = refreshed;
     }
@@ -4607,6 +4785,7 @@ pub async fn switch_work_cn_account(
         user_id: account.user_id.clone(),
         launched,
         verified: true,
+        token_changed,
         github_synced,
         warning: None,
     })
@@ -4773,9 +4952,7 @@ fn refuse_inject_if_storage_live(storage_path: &Path, account_id: &str) -> Resul
         }
     }
 
-    if let Ok(contexts) =
-        crate::modules::trae_instance::resolve_running_bound_account_contexts()
-    {
+    if let Ok(contexts) = crate::modules::trae_instance::resolve_running_bound_account_contexts() {
         for context in contexts {
             if storage_paths_equivalent(context.storage_path.as_path(), storage_path) {
                 return Err(format!(
@@ -4799,11 +4976,7 @@ pub fn inject_to_trae_at_path(storage_path: &Path, account_id: &str) -> Result<(
     // If the target storage already holds this account's fresher rotated tokens,
     // adopt them before rewrite so we never downgrade a live Trae session snapshot.
     if storage_path.exists()
-        && sync_account_tokens_from_storage_path(
-            &mut account,
-            storage_path,
-            "注入前本地",
-        )
+        && sync_account_tokens_from_storage_path(&mut account, storage_path, "注入前本地")
     {
         if let Err(err) = save_account_file(&account) {
             logger::log_warn(&format!(
@@ -5313,26 +5486,12 @@ fn header_value_or_dash(headers: &reqwest::header::HeaderMap, key: &str) -> Stri
         .unwrap_or_else(|| "-".to_string())
 }
 
-fn build_body_preview(body_text: &str, max_chars: usize) -> String {
-    let mut preview = String::new();
-    let mut count = 0usize;
-    for ch in body_text.chars() {
-        if count >= max_chars {
-            preview.push_str("...[truncated]");
-            break;
-        }
-        match ch {
-            '\n' => preview.push_str("\\n"),
-            '\r' => preview.push_str("\\r"),
-            '\t' => preview.push_str("\\t"),
-            _ => preview.push(ch),
-        }
-        count += 1;
-    }
-    if preview.is_empty() {
+fn build_body_diagnostic(body_text: &str) -> String {
+    let char_count = body_text.chars().count();
+    if char_count == 0 {
         "<empty>".to_string()
     } else {
-        preview
+        format!("<redacted; chars={char_count}>")
     }
 }
 
@@ -5363,9 +5522,9 @@ async fn parse_trae_response_body(response: reqwest::Response, url: &str) -> Res
     }
 
     serde_json::from_str::<Value>(&body_text).map_err(|e| {
-        let body_preview = build_body_preview(body_trimmed, 200);
+        let body_diagnostic = build_body_diagnostic(body_trimmed);
         format!(
-            "解析 Trae 响应 JSON 失败({}): {} | status={} | content-type={} | x-request-id={} | request-id={} | cf-ray={} | body_preview={}",
+            "解析 Trae 响应 JSON 失败({}): {} | status={} | content-type={} | x-request-id={} | request-id={} | cf-ray={} | body={}",
             url,
             e,
             status_code,
@@ -5373,7 +5532,7 @@ async fn parse_trae_response_body(response: reqwest::Response, url: &str) -> Res
             x_request_id,
             request_id,
             cf_ray,
-            body_preview
+            body_diagnostic
         )
     })
 }
@@ -5943,15 +6102,17 @@ fn apply_runtime_storage_payload_for_usage_refresh(
     sync_account_tokens_from_storage_path(account, storage_path, "运行中实例");
 }
 
-/// Pull fresher tokens from Trae `storage.json` when identity matches.
-/// Critical for avoiding refresh-token races: Trae may have already rotated
-/// refresh tokens on disk while Cockpit still holds a stale copy.
+/// Pull a fresher authenticated session snapshot from Trae `storage.json` when
+/// identity matches. The return value is true when any persisted credential
+/// context changed, including the official device snapshot, not only tokens.
+/// This prevents a valid but reused token from discarding a newly registered
+/// numeric device ID or device key pair after an account switch.
 pub(crate) fn sync_account_tokens_from_storage_path(
     account: &mut TraeAccount,
     storage_path: &Path,
     source_label: &str,
 ) -> bool {
-    let payload = match read_local_trae_auth_from_storage_path(storage_path) {
+    let mut payload = match read_local_trae_auth_from_storage_path(storage_path) {
         Ok(Some(payload)) => payload,
         Ok(None) => return false,
         Err(err) => {
@@ -5983,23 +6144,36 @@ pub(crate) fn sync_account_tokens_from_storage_path(
 
     let previous_access_token = account.access_token.clone();
     let previous_refresh_token = account.refresh_token.clone();
+    let previous_token_type = account.token_type.clone();
+    let previous_expires_at = account.expires_at;
+    let previous_checkin_device_id = account.checkin_device_id.clone();
+    let previous_machine_id = account.machine_id.clone();
+    let previous_auth_device_id = account.auth_device_id.clone();
+    let previous_auth_raw = account.trae_auth_raw.clone();
+    preserve_existing_device_context_in_payload(account, &mut payload);
     apply_payload(account, payload);
     let token_changed = previous_access_token != account.access_token
         || previous_refresh_token != account.refresh_token;
+    let session_changed = token_changed
+        || previous_token_type != account.token_type
+        || previous_expires_at != account.expires_at
+        || previous_checkin_device_id != account.checkin_device_id
+        || previous_machine_id != account.machine_id
+        || previous_auth_device_id != account.auth_device_id
+        || previous_auth_raw != account.trae_auth_raw;
     logger::log_info(&format!(
-        "[Trae Refresh] 已从{}同步会话快照: account_id={}, path={}, token_changed={}",
+        "[Trae Refresh] 已从{}同步会话快照: account_id={}, path={}, token_changed={}, session_changed={}",
         source_label,
         account.id,
         storage_path.display(),
-        if token_changed { "true" } else { "false" }
+        if token_changed { "true" } else { "false" },
+        if session_changed { "true" } else { "false" }
     ));
-    token_changed
+    session_changed
 }
 
 /// Collect candidate storage.json paths that may hold a fresher session for this account.
-fn collect_storage_paths_for_account_sync(
-    account: &TraeAccount,
-) -> Vec<(String, PathBuf)> {
+fn collect_storage_paths_for_account_sync(account: &TraeAccount) -> Vec<(String, PathBuf)> {
     let platform = resolve_account_platform_kind(account);
     let mut paths: Vec<(String, PathBuf)> = Vec::new();
     let mut push_unique = |label: String, path: PathBuf| {
@@ -6020,9 +6194,7 @@ fn collect_storage_paths_for_account_sync(
     }
 
     // Bound multi-open instances may hold a newer rotated refresh token.
-    if let Ok(store) =
-        crate::modules::trae_instance::load_instance_store_for_platform(platform)
-    {
+    if let Ok(store) = crate::modules::trae_instance::load_instance_store_for_platform(platform) {
         if store
             .default_settings
             .bind_account_id
@@ -6042,12 +6214,7 @@ fn collect_storage_paths_for_account_sync(
             }
         }
         for instance in store.instances {
-            if instance
-                .bind_account_id
-                .as_deref()
-                .map(str::trim)
-                != Some(account.id.as_str())
-            {
+            if instance.bind_account_id.as_deref().map(str::trim) != Some(account.id.as_str()) {
                 continue;
             }
             let label = if instance.name.trim().is_empty() {
@@ -6429,8 +6596,7 @@ async fn refresh_account_usage_only_async_once(
 
     refresh_quota_snapshot(&mut account, &client, cookie.as_deref()).await;
 
-    let updated = account.clone();
-    upsert_account_record(account)?;
+    let updated = persist_usage_refresh_result(&account)?;
     logger::log_info(&format!(
         "[Trae Refresh] 仅额度刷新完成: id={}, email={}",
         updated.id, updated.email
@@ -6578,9 +6744,8 @@ pub async fn get_work_cn_credits(
     account_id: &str,
     force_refresh: bool,
 ) -> Result<WorkCnCreditsSummary, WorkCnCommandError> {
-    let account = load_account(account_id).ok_or_else(|| {
-        WorkCnCommandError::new(WorkCnErrorCode::AccountNotFound, "账号不存在")
-    })?;
+    let account = load_account(account_id)
+        .ok_or_else(|| WorkCnCommandError::new(WorkCnErrorCode::AccountNotFound, "账号不存在"))?;
 
     let account = if force_refresh {
         match refresh_account_usage_only_async(account_id, None).await {
@@ -6598,6 +6763,414 @@ pub async fn get_work_cn_credits(
     };
 
     Ok(parse_work_cn_credits_from_usage(&account.trae_usage_raw))
+}
+
+// ===== 本地单账号签到（诊断/补签入口，用户 2026-08-16 决策） =====
+// 项目规范 docs/DEVELOPMENT.md 写有“本地绝不签到/claim”，以下代码是有意打破该
+// 原则的诊断/补签入口：云端 GitHub Actions 签到被 TRAE 服务端拒绝（“操作太过
+// 频繁”）时，从本机直接调用同一签到 API，与云端 Actions 的运行环境（IP/请求
+// 形状）形成对照，用于定位风控问题。核心认证头与云端 Python 脚本 trae.py
+// 保持一致（不带 cookie、带 x-device-id），本地仍保留独立 User-Agent 便于对照。
+
+/// 签到接口业务响应（status/claim 共用）的解析结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CheckinBusinessOutcome {
+    /// code==0，业务成功。
+    Ok,
+    /// code==1001，凭证失效。
+    TokenInvalid,
+    /// 其他非 0 code，携带 message（缺失时回退 msg）文本。
+    Error(String),
+}
+
+fn checkin_error_message(data: &Value) -> Option<String> {
+    ["message", "msg"]
+        .iter()
+        .find_map(|key| data.get(*key).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+/// 先按 HTTP 状态分类，再校验业务码。签到接口只有明确返回 code==0 才算成功。
+fn classify_checkin_response(http_status: u16, data: &Value) -> CheckinBusinessOutcome {
+    if http_status == 401 || http_status == 403 {
+        return CheckinBusinessOutcome::TokenInvalid;
+    }
+    if !(200..300).contains(&http_status) {
+        return CheckinBusinessOutcome::Error(
+            checkin_error_message(data).unwrap_or_else(|| format!("HTTP {}", http_status)),
+        );
+    }
+
+    let Some(code) = data.get("code").and_then(Value::as_i64) else {
+        return CheckinBusinessOutcome::Error("响应缺少业务码".to_string());
+    };
+    if code == 0 {
+        return CheckinBusinessOutcome::Ok;
+    }
+    if code == 1001 {
+        return CheckinBusinessOutcome::TokenInvalid;
+    }
+    CheckinBusinessOutcome::Error(
+        checkin_error_message(data).unwrap_or_else(|| format!("code={}", code)),
+    )
+}
+
+/// 保留原有纯业务码解析入口，供不涉及 HTTP 的单元测试复用。
+#[cfg(test)]
+fn parse_checkin_business_code(data: &Value) -> CheckinBusinessOutcome {
+    classify_checkin_response(200, data)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CheckinRequestError {
+    message: String,
+    http_status: Option<u16>,
+}
+
+fn parse_checkin_response_text(
+    http_status: u16,
+    body_text: &str,
+) -> Result<Value, CheckinRequestError> {
+    match serde_json::from_str::<Value>(body_text) {
+        Ok(data) => Ok(data),
+        Err(_) if !(200..300).contains(&http_status) => Ok(Value::Object(Map::new())),
+        Err(_) => Err(CheckinRequestError {
+            message: "服务端返回非 JSON".to_string(),
+            http_status: Some(http_status),
+        }),
+    }
+}
+
+/// 本地签到请求辅助：在 request_trae_pay_json 的请求头基础上补上
+/// 官方客户端使用的数字 x-device-id、设备型号和系统类型，且不带 cookie。
+async fn request_trae_checkin_json(
+    client: &reqwest::Client,
+    url: &str,
+    access_token: &str,
+    device_id: &str,
+    device_brand: &str,
+    device_type: &str,
+) -> Result<(Value, u16), CheckinRequestError> {
+    let mut request = client
+        .post(url)
+        .header("Accept", "application/json")
+        .header("Authorization", format!("Cloud-IDE-JWT {}", access_token))
+        .header("x-device-id", device_id)
+        .header("Content-Type", "application/json")
+        .json(&Value::Object(Map::new()));
+    if !device_brand.trim().is_empty() {
+        request = request.header("x-device-brand", device_brand);
+    }
+    if !device_type.trim().is_empty() {
+        request = request.header("x-device-type", device_type);
+    }
+    let response = request.send().await.map_err(|_| CheckinRequestError {
+        message: "网络请求失败".to_string(),
+        http_status: None,
+    })?;
+
+    let status_code = response.status().as_u16();
+    let body_text = response.text().await.map_err(|_| CheckinRequestError {
+        message: "读取服务端响应失败".to_string(),
+        http_status: Some(status_code),
+    })?;
+    let data = parse_checkin_response_text(status_code, &body_text)?;
+    Ok((data, status_code))
+}
+
+/// The official client sends its registered numeric Aha device id for
+/// check-in. `telemetry.devDeviceId` is a separate UUID and must not be used as
+/// a fallback because the risk service classifies that request differently.
+pub(crate) fn resolve_official_checkin_device_id(account: &TraeAccount) -> Result<&str, String> {
+    let device_id = account
+        .auth_device_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            "该账号缺少 auth_device_id，请从当前官方客户端重新导入账号快照".to_string()
+        })?;
+    if !device_id.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err("该账号的 auth_device_id 不是有效的数字设备 ID，请重新导入".to_string());
+    }
+    Ok(device_id)
+}
+
+/// 本地单账号签到（诊断/补签入口，用户 2026-08-16 决策）。
+///
+/// 项目规范 docs/DEVELOPMENT.md 写有“本地绝不签到/claim”，本函数是有意打破
+/// 该原则的诊断入口：先查 status，enable 且未签到时再发 claim。核心认证头与
+/// 云端 Python 脚本一致（不带 cookie、带 x-device-id），但保留独立 User-Agent，
+/// 用于和云端 GitHub Actions 的失败结果做对照。
+pub async fn local_checkin_work_cn_account(
+    account_id: &str,
+) -> Result<WorkCnLocalCheckinResult, String> {
+    let account = load_account(account_id).ok_or_else(|| "账号不存在".to_string())?;
+
+    let access_token = account.access_token.trim();
+    if access_token.is_empty() {
+        return Err("该账号缺少 access token，请先刷新凭证".to_string());
+    }
+
+    let device_id = resolve_official_checkin_device_id(&account)?;
+    let platform = resolve_account_platform_kind(&account);
+    let (device_brand, device_type) =
+        crate::modules::trae_oauth::official_checkin_device_headers(platform);
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|e| format!("构建 HTTP 客户端失败: {}", e))?;
+
+    let token_expiry_state = match crate::utils::jwt::parse_jwt_exp(access_token) {
+        Some(exp) if exp <= chrono::Utc::now().timestamp() => "expired",
+        Some(_) => "valid",
+        None => "unknown",
+    }
+    .to_string();
+    let device_present = !device_id.is_empty();
+
+    // 1) 查询签到状态（按账号路由遍历候选 URL，失败换下一个）。
+    let mut errors = Vec::new();
+    let mut status: Option<(Value, u16)> = None;
+    for url in build_refresh_api_urls(&account, TRAE_CN_CHECKIN_STATUS_PATH) {
+        match request_trae_checkin_json(
+            &client,
+            &url,
+            access_token,
+            device_id,
+            device_brand.as_str(),
+            device_type.as_str(),
+        )
+        .await
+        {
+            Ok(value) => {
+                status = Some(value);
+                break;
+            }
+            Err(err) => errors.push(err),
+        }
+    }
+    let Some((status, status_http_status)) = status else {
+        return Ok(WorkCnLocalCheckinResult {
+            account_id: account.id.clone(),
+            ok: false,
+            message: format!(
+                "查询签到状态失败: {}",
+                errors
+                    .last()
+                    .map(|error| error.message.as_str())
+                    .unwrap_or("请求失败")
+            ),
+            credits: None,
+            already_checked_in: false,
+            outcome: "failed".to_string(),
+            stage: "status".to_string(),
+            business_code: None,
+            http_status: errors
+                .last()
+                .and_then(|error| error.http_status)
+                .map(i64::from),
+            claim_attempted: false,
+            token_expiry_state,
+            device_present,
+        });
+    };
+
+    match classify_checkin_response(status_http_status, &status) {
+        CheckinBusinessOutcome::TokenInvalid => {
+            return Ok(WorkCnLocalCheckinResult {
+                account_id: account.id.clone(),
+                ok: false,
+                message: "access token 已失效，请先「刷新凭证」".to_string(),
+                credits: status.get("credits").and_then(Value::as_i64),
+                already_checked_in: false,
+                outcome: "failed".to_string(),
+                stage: "status".to_string(),
+                business_code: status.get("code").and_then(Value::as_i64),
+                http_status: Some(status_http_status as i64),
+                claim_attempted: false,
+                token_expiry_state,
+                device_present,
+            });
+        }
+        CheckinBusinessOutcome::Error(message) => {
+            return Ok(WorkCnLocalCheckinResult {
+                account_id: account.id.clone(),
+                ok: false,
+                message: format!("查询签到状态失败: {}", message),
+                credits: status.get("credits").and_then(Value::as_i64),
+                already_checked_in: false,
+                outcome: "failed".to_string(),
+                stage: "status".to_string(),
+                business_code: status.get("code").and_then(Value::as_i64),
+                http_status: Some(status_http_status as i64),
+                claim_attempted: false,
+                token_expiry_state,
+                device_present,
+            });
+        }
+        CheckinBusinessOutcome::Ok => {}
+    }
+
+    let credits = status.get("credits").and_then(Value::as_i64);
+    if status.get("enable").and_then(Value::as_bool) != Some(true) {
+        return Ok(WorkCnLocalCheckinResult {
+            account_id: account.id.clone(),
+            ok: false,
+            message: "签到功能未开启".to_string(),
+            credits,
+            already_checked_in: false,
+            outcome: "failed".to_string(),
+            stage: "status".to_string(),
+            business_code: status.get("code").and_then(Value::as_i64),
+            http_status: Some(status_http_status as i64),
+            claim_attempted: false,
+            token_expiry_state: token_expiry_state.clone(),
+            device_present,
+        });
+    }
+
+    if status.get("checked_in").and_then(Value::as_bool) == Some(true) {
+        return Ok(WorkCnLocalCheckinResult {
+            account_id: account.id.clone(),
+            ok: true,
+            message: match credits {
+                Some(value) => format!("今日已签到，+{}积分", value),
+                None => "今日已签到".to_string(),
+            },
+            credits,
+            already_checked_in: true,
+            outcome: "already_checked_in".to_string(),
+            stage: "status".to_string(),
+            business_code: status.get("code").and_then(Value::as_i64),
+            http_status: Some(status_http_status as i64),
+            claim_attempted: false,
+            token_expiry_state: token_expiry_state.clone(),
+            device_present,
+        });
+    }
+
+    // 2) 当日未签到 → 发起 claim。
+    errors.clear();
+    let mut claim: Option<(Value, u16)> = None;
+    for url in build_refresh_api_urls(&account, TRAE_CN_CHECKIN_CLAIM_PATH) {
+        match request_trae_checkin_json(
+            &client,
+            &url,
+            access_token,
+            device_id,
+            device_brand.as_str(),
+            device_type.as_str(),
+        )
+        .await
+        {
+            Ok(value) => {
+                claim = Some(value);
+                break;
+            }
+            Err(err) => errors.push(err),
+        }
+    }
+    let Some((claim, claim_http_status)) = claim else {
+        return Ok(WorkCnLocalCheckinResult {
+            account_id: account.id.clone(),
+            ok: false,
+            message: format!(
+                "发起签到失败: {}",
+                errors
+                    .last()
+                    .map(|error| error.message.as_str())
+                    .unwrap_or("请求失败")
+            ),
+            credits,
+            already_checked_in: false,
+            outcome: "failed".to_string(),
+            stage: "claim".to_string(),
+            business_code: None,
+            http_status: errors
+                .last()
+                .and_then(|error| error.http_status)
+                .map(i64::from),
+            claim_attempted: true,
+            token_expiry_state,
+            device_present,
+        });
+    };
+    let claim_credits = claim.get("credits").and_then(Value::as_i64).or(credits);
+
+    match classify_checkin_response(claim_http_status, &claim) {
+        CheckinBusinessOutcome::Ok => Ok(WorkCnLocalCheckinResult {
+            account_id: account.id.clone(),
+            ok: true,
+            message: match claim_credits {
+                Some(value) => format!("签到成功，+{}积分", value),
+                None => "签到成功".to_string(),
+            },
+            credits: claim_credits,
+            already_checked_in: false,
+            outcome: "claimed".to_string(),
+            stage: "claim".to_string(),
+            business_code: claim.get("code").and_then(Value::as_i64),
+            http_status: Some(claim_http_status as i64),
+            claim_attempted: true,
+            token_expiry_state: token_expiry_state.clone(),
+            device_present,
+        }),
+        CheckinBusinessOutcome::TokenInvalid => Ok(WorkCnLocalCheckinResult {
+            account_id: account.id.clone(),
+            ok: false,
+            message: "access token 已失效，请先「刷新凭证」".to_string(),
+            credits: claim_credits,
+            already_checked_in: false,
+            outcome: "failed".to_string(),
+            stage: "claim".to_string(),
+            business_code: claim.get("code").and_then(Value::as_i64),
+            http_status: Some(claim_http_status as i64),
+            claim_attempted: true,
+            token_expiry_state,
+            device_present,
+        }),
+        CheckinBusinessOutcome::Error(message) => {
+            // 服务端文案含“已签到”/“already”时视为当日已签（与云端脚本一致）。
+            if message.contains("已签到") || message.to_lowercase().contains("already") {
+                Ok(WorkCnLocalCheckinResult {
+                    account_id: account.id.clone(),
+                    ok: true,
+                    message: match claim_credits {
+                        Some(value) => format!("今日已签到，+{}积分", value),
+                        None => "今日已签到".to_string(),
+                    },
+                    credits: claim_credits,
+                    already_checked_in: true,
+                    outcome: "already_checked_in".to_string(),
+                    stage: "claim".to_string(),
+                    business_code: claim.get("code").and_then(Value::as_i64),
+                    http_status: Some(claim_http_status as i64),
+                    claim_attempted: true,
+                    token_expiry_state: token_expiry_state.clone(),
+                    device_present,
+                })
+            } else {
+                Ok(WorkCnLocalCheckinResult {
+                    account_id: account.id.clone(),
+                    ok: false,
+                    message: format!("签到失败: {}", message),
+                    credits: claim_credits,
+                    already_checked_in: false,
+                    outcome: "failed".to_string(),
+                    stage: "claim".to_string(),
+                    business_code: claim.get("code").and_then(Value::as_i64),
+                    http_status: Some(claim_http_status as i64),
+                    claim_attempted: true,
+                    token_expiry_state,
+                    device_present,
+                })
+            }
+        }
+    }
 }
 
 async fn refresh_accounts(
@@ -6689,6 +7262,139 @@ mod tests {
             created_at: 0,
             last_used: 0,
         }
+    }
+
+    #[test]
+    fn usage_refresh_merge_preserves_newer_credentials_and_metadata() {
+        let mut latest = sample_account();
+        latest.access_token = "rotated-access".to_string();
+        latest.refresh_token = Some("rotated-refresh".to_string());
+        latest.auth_device_id = Some("new-device".to_string());
+        latest.nickname = Some("new-note".to_string());
+        latest.last_used = 200;
+
+        let mut stale_response = sample_account();
+        stale_response.access_token = "stale-access".to_string();
+        stale_response.refresh_token = Some("stale-refresh".to_string());
+        stale_response.auth_device_id = Some("stale-device".to_string());
+        stale_response.nickname = Some("stale-note".to_string());
+        stale_response.plan_type = Some("pro".to_string());
+        stale_response.plan_reset_at = Some(12345);
+        stale_response.trae_entitlement_raw = Some(serde_json::json!({ "plan": "pro" }));
+        stale_response.trae_usage_raw = Some(serde_json::json!({ "credits": 88 }));
+        stale_response.quota_query_last_error = None;
+        stale_response.quota_query_last_error_at = None;
+        stale_response.usage_updated_at = Some(300);
+        stale_response.last_used = 300;
+
+        let merged = merge_usage_refresh_into_latest(latest, &stale_response);
+
+        assert_eq!(merged.access_token, "rotated-access");
+        assert_eq!(merged.refresh_token.as_deref(), Some("rotated-refresh"));
+        assert_eq!(merged.auth_device_id.as_deref(), Some("new-device"));
+        assert_eq!(merged.nickname.as_deref(), Some("new-note"));
+        assert_eq!(merged.plan_type.as_deref(), Some("pro"));
+        assert_eq!(merged.plan_reset_at, Some(12345));
+        assert_eq!(merged.trae_usage_raw, stale_response.trae_usage_raw);
+        assert_eq!(merged.usage_updated_at, Some(300));
+        assert_eq!(merged.last_used, 300);
+    }
+
+    // ===== 本地单账号签到（诊断/补签）：业务响应码解析 =====
+
+    #[test]
+    fn resolve_official_checkin_device_id_prefers_numeric_auth_device_id() {
+        let mut account = sample_account();
+        account.checkin_device_id = Some("d6b8ac2e-f4d1-496d-a9a6-c9c7b4bd23e3".to_string());
+        account.auth_device_id = Some("1132918838145530".to_string());
+
+        assert_eq!(
+            resolve_official_checkin_device_id(&account).unwrap(),
+            "1132918838145530"
+        );
+    }
+
+    #[test]
+    fn resolve_official_checkin_device_id_rejects_uuid_and_missing_auth_id() {
+        let mut account = sample_account();
+        account.checkin_device_id = Some("d6b8ac2e-f4d1-496d-a9a6-c9c7b4bd23e3".to_string());
+
+        let missing = resolve_official_checkin_device_id(&account).unwrap_err();
+        assert!(missing.contains("auth_device_id"));
+
+        account.auth_device_id = Some("not-a-numeric-device".to_string());
+        let invalid = resolve_official_checkin_device_id(&account).unwrap_err();
+        assert!(invalid.contains("数字"));
+    }
+
+    #[test]
+    fn parse_checkin_business_code_success_on_zero() {
+        let data = serde_json::json!({ "code": 0, "checked_in": true, "credits": 50 });
+        assert_eq!(
+            parse_checkin_business_code(&data),
+            CheckinBusinessOutcome::Ok
+        );
+    }
+
+    #[test]
+    fn parse_checkin_business_code_token_invalid_on_1001() {
+        let data = serde_json::json!({ "code": 1001, "message": "凭证失效" });
+        assert_eq!(
+            parse_checkin_business_code(&data),
+            CheckinBusinessOutcome::TokenInvalid
+        );
+    }
+
+    #[test]
+    fn parse_checkin_business_code_error_takes_message() {
+        let data = serde_json::json!({ "code": 500, "message": "操作太过频繁啦，请稍后尝试" });
+        assert_eq!(
+            parse_checkin_business_code(&data),
+            CheckinBusinessOutcome::Error("操作太过频繁啦，请稍后尝试".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_checkin_business_code_error_falls_back_to_msg_field() {
+        let data = serde_json::json!({ "code": 400, "msg": "参数错误" });
+        assert_eq!(
+            parse_checkin_business_code(&data),
+            CheckinBusinessOutcome::Error("参数错误".to_string())
+        );
+    }
+
+    #[test]
+    fn classify_checkin_response_rejects_http_500_without_business_code() {
+        let data = serde_json::json!({});
+        assert_eq!(
+            classify_checkin_response(500, &data),
+            CheckinBusinessOutcome::Error("HTTP 500".to_string())
+        );
+    }
+
+    #[test]
+    fn classify_checkin_response_treats_http_401_as_token_invalid() {
+        let data = serde_json::json!({"message": "unauthorized"});
+        assert_eq!(
+            classify_checkin_response(401, &data),
+            CheckinBusinessOutcome::TokenInvalid
+        );
+    }
+
+    #[test]
+    fn classify_checkin_response_rejects_success_http_without_business_code() {
+        let data = serde_json::json!({});
+        assert_eq!(
+            classify_checkin_response(200, &data),
+            CheckinBusinessOutcome::Error("响应缺少业务码".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_checkin_response_text_preserves_http_status_on_invalid_json() {
+        let error = parse_checkin_response_text(200, "not-json").unwrap_err();
+        assert_eq!(error.message, "服务端返回非 JSON");
+        assert_eq!(error.http_status, Some(200));
     }
 
     #[test]
@@ -6871,10 +7577,7 @@ mod tests {
     }
 
     fn work_cn_write_storage(dir: &Path, with_login: bool) -> PathBuf {
-        let storage_path = dir
-            .join("User")
-            .join("globalStorage")
-            .join("storage.json");
+        let storage_path = dir.join("User").join("globalStorage").join("storage.json");
         if let Some(parent) = storage_path.parent() {
             fs::create_dir_all(parent).expect("create storage parent");
         }
@@ -7415,6 +8118,73 @@ mod tests {
     }
 
     #[test]
+    fn work_cn_device_snapshot_prefers_device_id_from_current_auth_record() {
+        let storage_root = serde_json::json!({
+            "iCubeAuthInfo://icube.cloudide": {
+                "accessToken": "access-current",
+                "deviceInfo": {"DeviceID": "2232918838145530"}
+            },
+            "iCubeAuthInfo://icube-dc:1132918838145530": {
+                "deviceKeyPair": {
+                    "privateKeyPEM": "old-private",
+                    "publicKeyPEM": "old-public"
+                }
+            },
+            "iCubeAuthInfo://icube-dc:2232918838145530": {
+                "deviceKeyPair": {
+                    "privateKeyPEM": "current-private",
+                    "publicKeyPEM": "current-public"
+                }
+            }
+        });
+
+        let snapshot = extract_local_work_cn_device_snapshot(&storage_root);
+
+        assert_eq!(snapshot.auth_device_id.as_deref(), Some("2232918838145530"));
+        assert_eq!(
+            snapshot.device_private_key.as_deref(),
+            Some("current-private")
+        );
+        assert_eq!(
+            snapshot.device_public_key.as_deref(),
+            Some("current-public")
+        );
+    }
+
+    #[test]
+    fn work_cn_device_snapshot_does_not_borrow_keys_from_a_different_device() {
+        let storage_root = serde_json::json!({
+            "iCubeAuthInfo://icube.cloudide": {
+                "accessToken": "access-current",
+                "deviceInfo": {"DeviceID": "2232918838145530"}
+            },
+            "iCubeAuthInfo://icube-dc:1132918838145530": {
+                "deviceKeyPair": {
+                    "privateKeyPEM": "old-private",
+                    "publicKeyPEM": "old-public"
+                }
+            }
+        });
+
+        let snapshot = extract_local_work_cn_device_snapshot(&storage_root);
+
+        assert_eq!(snapshot.auth_device_id.as_deref(), Some("2232918838145530"));
+        assert!(snapshot.device_private_key.is_none());
+        assert!(snapshot.device_public_key.is_none());
+    }
+
+    #[test]
+    fn trae_response_body_diagnostic_never_contains_sensitive_content() {
+        let sensitive = r#"{"access_token":"secret-token-value","device_id":"2232918838145530"}"#;
+
+        let diagnostic = build_body_diagnostic(sensitive);
+
+        assert!(!diagnostic.contains("secret-token-value"));
+        assert!(!diagnostic.contains("2232918838145530"));
+        assert!(diagnostic.contains("redacted"));
+    }
+
+    #[test]
     fn work_cn_snapshot_merge_into_payload_sets_fields_and_device_keypair() {
         let mut payload = TraeImportPayload {
             email: "user@example.com".to_string(),
@@ -7450,13 +8220,253 @@ mod tests {
         assert_eq!(payload.checkin_device_id.as_deref(), Some("d6b8ac2e-xxxx"));
         assert_eq!(payload.machine_id.as_deref(), Some("machine-hash"));
         let auth_raw = payload.trae_auth_raw.as_ref().unwrap();
-        let kp = auth_raw.get("deviceKeyPair").expect("deviceKeyPair present");
-        assert_eq!(kp.get("privateKeyPEM").and_then(Value::as_str), Some("priv-xyz"));
-        assert_eq!(kp.get("publicKeyPEM").and_then(Value::as_str), Some("pub-xyz"));
+        let kp = auth_raw
+            .get("deviceKeyPair")
+            .expect("deviceKeyPair present");
+        assert_eq!(
+            kp.get("privateKeyPEM").and_then(Value::as_str),
+            Some("priv-xyz")
+        );
+        assert_eq!(
+            kp.get("publicKeyPEM").and_then(Value::as_str),
+            Some("pub-xyz")
+        );
     }
 
     #[test]
-    fn work_cn_import_caps_at_four_and_dedupes_same_uid_and_encrypts() {
+    fn work_cn_snapshot_merge_ignores_incomplete_device_keypair() {
+        let mut payload = TraeImportPayload {
+            email: "user@example.com".to_string(),
+            user_id: Some("7463021402682639361".to_string()),
+            nickname: None,
+            access_token: "access-new".to_string(),
+            refresh_token: Some("refresh-new".to_string()),
+            token_type: None,
+            expires_at: None,
+            plan_type: None,
+            plan_reset_at: None,
+            trae_auth_raw: Some(serde_json::json!({
+                "deviceKeyPair": {
+                    "privateKeyPEM": "old-private-key",
+                    "publicKeyPEM": "old-public-key"
+                }
+            })),
+            trae_profile_raw: None,
+            trae_entitlement_raw: None,
+            trae_usage_raw: None,
+            trae_server_raw: None,
+            trae_usertag_raw: None,
+            checkin_device_id: Some("old-checkin-device".to_string()),
+            machine_id: Some("old-machine-id".to_string()),
+            auth_device_id: Some("1132918838145530".to_string()),
+            status: None,
+            status_reason: None,
+        };
+        let snapshot = LocalWorkCnDeviceSnapshot {
+            checkin_device_id: None,
+            machine_id: None,
+            auth_device_id: None,
+            device_private_key: Some("partial-private-key".to_string()),
+            device_public_key: None,
+        };
+
+        merge_work_cn_device_snapshot_into_payload(&mut payload, snapshot);
+
+        assert_eq!(
+            payload.checkin_device_id.as_deref(),
+            Some("old-checkin-device")
+        );
+        assert_eq!(payload.machine_id.as_deref(), Some("old-machine-id"));
+        assert_eq!(payload.auth_device_id.as_deref(), Some("1132918838145530"));
+        let pair = payload
+            .trae_auth_raw
+            .as_ref()
+            .and_then(|raw| raw.get("deviceKeyPair"))
+            .expect("existing device key pair");
+        assert_eq!(
+            pair.get("privateKeyPEM").and_then(Value::as_str),
+            Some("old-private-key")
+        );
+        assert_eq!(
+            pair.get("publicKeyPEM").and_then(Value::as_str),
+            Some("old-public-key")
+        );
+    }
+
+    #[test]
+    fn work_cn_snapshot_merge_drops_old_keypair_when_device_changes_incompletely() {
+        let mut payload = TraeImportPayload {
+            email: "user@example.com".to_string(),
+            user_id: Some("7463021402682639361".to_string()),
+            nickname: None,
+            access_token: "access-new".to_string(),
+            refresh_token: Some("refresh-new".to_string()),
+            token_type: None,
+            expires_at: None,
+            plan_type: None,
+            plan_reset_at: None,
+            trae_auth_raw: Some(serde_json::json!({
+                "deviceInfo": {"DeviceID": "1132918838145530"},
+                "deviceKeyPair": {
+                    "privateKeyPEM": "old-private-key",
+                    "publicKeyPEM": "old-public-key"
+                }
+            })),
+            trae_profile_raw: None,
+            trae_entitlement_raw: None,
+            trae_usage_raw: None,
+            trae_server_raw: None,
+            trae_usertag_raw: None,
+            checkin_device_id: None,
+            machine_id: None,
+            auth_device_id: Some("1132918838145530".to_string()),
+            status: None,
+            status_reason: None,
+        };
+        let snapshot = LocalWorkCnDeviceSnapshot {
+            checkin_device_id: None,
+            machine_id: None,
+            auth_device_id: Some("2232918838145530".to_string()),
+            device_private_key: Some("partial-new-private-key".to_string()),
+            device_public_key: None,
+        };
+
+        merge_work_cn_device_snapshot_into_payload(&mut payload, snapshot);
+
+        assert_eq!(payload.auth_device_id.as_deref(), Some("2232918838145530"));
+        let auth = payload.trae_auth_raw.as_ref().expect("auth payload");
+        assert_eq!(
+            auth.pointer("/deviceInfo/DeviceID").and_then(Value::as_str),
+            Some("2232918838145530")
+        );
+        assert!(
+            auth.get("deviceKeyPair").is_none(),
+            "设备已变化且新密钥不完整时不能沿用旧设备密钥"
+        );
+    }
+
+    #[test]
+    fn storage_token_sync_preserves_existing_device_context_when_snapshot_is_partial() {
+        let mut account = sample_account();
+        account.checkin_device_id = Some("old-checkin-device".to_string());
+        account.machine_id = Some("old-machine-id".to_string());
+        account.auth_device_id = Some("1132918838145530".to_string());
+        account.trae_auth_raw = Some(serde_json::json!({
+            "platformId": "trae_solo_cn",
+            "deviceInfo": {"DeviceID": "1132918838145530"},
+            "deviceKeyPair": {
+                "privateKeyPEM": "old-private-key",
+                "publicKeyPEM": "old-public-key"
+            }
+        }));
+
+        let dir = std::env::temp_dir().join(format!(
+            "work-cn-partial-storage-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let storage_path = dir.join("storage.json");
+        let storage = serde_json::json!({
+            "iCubeAuthInfo://icube.cloudide": {
+                "userId": "7463021402682639361",
+                "email": "lijie769328281@gmail.com",
+                "accessToken": "new-access",
+                "refreshToken": "new-refresh"
+            }
+        });
+        std::fs::write(
+            &storage_path,
+            serde_json::to_string(&storage).expect("serialize storage"),
+        )
+        .expect("write storage");
+
+        assert!(sync_account_tokens_from_storage_path(
+            &mut account,
+            &storage_path,
+            "测试暂态存储"
+        ));
+        assert_eq!(account.auth_device_id.as_deref(), Some("1132918838145530"));
+        assert_eq!(
+            account.checkin_device_id.as_deref(),
+            Some("old-checkin-device")
+        );
+        assert_eq!(account.machine_id.as_deref(), Some("old-machine-id"));
+        assert_eq!(
+            account
+                .trae_auth_raw
+                .as_ref()
+                .and_then(|raw| raw.pointer("/deviceKeyPair/publicKeyPEM"))
+                .and_then(Value::as_str),
+            Some("old-public-key")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn storage_session_sync_reports_change_when_token_is_unchanged_but_device_snapshot_rotates() {
+        let mut account = sample_account();
+        account.checkin_device_id = Some("old-checkin-device".to_string());
+        account.machine_id = Some("old-machine-id".to_string());
+        account.auth_device_id = Some("1132918838145530".to_string());
+        account.trae_auth_raw = Some(serde_json::json!({
+            "platformId": "trae_solo_cn",
+            "deviceInfo": {"DeviceID": "1132918838145530"},
+            "deviceKeyPair": {
+                "privateKeyPEM": "old-private-key",
+                "publicKeyPEM": "old-public-key"
+            }
+        }));
+
+        let dir = std::env::temp_dir().join(format!(
+            "work-cn-device-only-sync-{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let storage_path = dir.join("storage.json");
+        let storage = serde_json::json!({
+            "iCubeAuthInfo://icube.cloudide": {
+                "userId": "7463021402682639361",
+                "email": "lijie769328281@gmail.com",
+                "accessToken": "old-access",
+                "refreshToken": "old-refresh",
+                "deviceInfo": {"DeviceID": "2232918838145530"}
+            },
+            "iCubeAuthInfo://icube-dc:2232918838145530": {
+                "deviceKeyPair": {
+                    "privateKeyPEM": "new-private-key",
+                    "publicKeyPEM": "new-public-key"
+                }
+            },
+            "telemetry.devDeviceId": "new-checkin-device",
+            "telemetry.machineId": "new-machine-id"
+        });
+        std::fs::write(
+            &storage_path,
+            serde_json::to_string(&storage).expect("serialize storage"),
+        )
+        .expect("write storage");
+
+        assert!(
+            sync_account_tokens_from_storage_path(&mut account, &storage_path, "测试设备轮换"),
+            "Token 未变化时，新的官方设备快照仍必须被视为需要落盘的会话变化"
+        );
+        assert_eq!(account.access_token, "old-access");
+        assert_eq!(account.auth_device_id.as_deref(), Some("2232918838145530"));
+        assert_eq!(
+            account
+                .trae_auth_raw
+                .as_ref()
+                .and_then(|raw| raw.pointer("/deviceKeyPair/privateKeyPEM"))
+                .and_then(Value::as_str),
+            Some("new-private-key")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn work_cn_import_has_no_cap_and_dedupes_same_uid_and_encrypts() {
         let _guard = WORK_CN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _lock = crate::modules::test_support::env_lock()
             .lock()
@@ -7501,13 +8511,11 @@ mod tests {
             }
         }
 
-        for i in 0..4u32 {
+        for i in 0..5u32 {
             let uid = format!("uid-{i}");
-            let account = import_work_cn_account_from_payload(
-                make_payload(&uid, &format!("tok-{i}")),
-                None,
-            )
-            .expect("import");
+            let account =
+                import_work_cn_account_from_payload(make_payload(&uid, &format!("tok-{i}")), None)
+                    .expect("import");
             assert_eq!(account.auth_device_id.as_deref(), Some("1132918838145530"));
             let validation = validate_work_cn_account_snapshot(&account);
             assert!(validation.has_device_private_key);
@@ -7516,19 +8524,23 @@ mod tests {
         }
 
         let count = list_accounts_checked().expect("list").len();
-        assert_eq!(count, 4, "应有 4 个账号");
+        assert_eq!(count, 5, "账号数量不设上限，应有 5 个账号");
 
-        // 第 5 个不同 UID 必须返回明确错误
-        let err = import_work_cn_account_from_payload(make_payload("uid-4", "tok-4"), None)
-            .unwrap_err();
-        assert!(err.contains("4"), "应提示最多 4 个: {err}");
+        // 第 6 个不同 UID 依然可以导入
+        import_work_cn_account_from_payload(make_payload("uid-5", "tok-5"), None)
+            .expect("import 6th account");
+        assert_eq!(
+            list_accounts_checked().expect("list").len(),
+            6,
+            "第 6 个账号应导入成功"
+        );
 
         // 同 UID 重复导入不应增加账号数量
         import_work_cn_account_from_payload(make_payload("uid-0", "tok-0-new"), None)
             .expect("re-import same uid");
         assert_eq!(
             list_accounts_checked().expect("list").len(),
-            4,
+            6,
             "同 UID 不应增加数量"
         );
 
@@ -7561,8 +8573,8 @@ mod tests {
 
     // 回归：切换中"槽位突然多出相同账号"。历史账号保留客户端原始标记
     // `trae_cn`，规范化后的导入/回写 payload 自报 `trae_solo_cn`。upsert
-    // 必须宽松匹配到同一账号就地更新，而不是新建重复账号；4 槽上限也须
-    // 把两种标记合并计数。
+    // 必须宽松匹配到同一账号就地更新，而不是新建重复账号；槽位不设上限，
+    // 两种标记的账号都按导入顺序追加。
     #[test]
     fn work_cn_upsert_matches_legacy_trae_cn_account_without_duplicate() {
         let _guard = WORK_CN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -7610,8 +8622,8 @@ mod tests {
         }
 
         // 1) 模拟历史数据：直接 upsert 一个自报 trae_cn 的账号。
-        let legacy = upsert_account(legacy_payload("uid-legacy", "tok-old"))
-            .expect("legacy upsert");
+        let legacy =
+            upsert_account(legacy_payload("uid-legacy", "tok-old")).expect("legacy upsert");
         assert_eq!(
             resolve_account_platform_kind(&legacy),
             TraePlatformKind::TraeCn,
@@ -7649,11 +8661,14 @@ mod tests {
             .collect();
         assert_eq!(same_uid.len(), 1, "不应出现重复账号");
 
-        // 3) 上限合并计数：再补 3 个历史 trae_cn 账号（共 4 个不同 UID），
-        //    第 5 个 UID 的规范化导入必须被 4 槽上限拦截。
+        // 3) 槽位不设上限：再补 3 个历史 trae_cn 账号（共 4 个不同 UID），
+        //    第 5 个 UID 的规范化导入照样成功并按顺序追加。
         for i in 1..=3u32 {
-            upsert_account(legacy_payload(&format!("uid-legacy-{i}"), &format!("tok-{i}")))
-                .expect("legacy upsert");
+            upsert_account(legacy_payload(
+                &format!("uid-legacy-{i}"),
+                &format!("tok-{i}"),
+            ))
+            .expect("legacy upsert");
         }
         let fifth = import_work_cn_account_from_payload(
             TraeImportPayload {
@@ -7666,10 +8681,14 @@ mod tests {
                 ..legacy_payload("uid-fifth", "tok-fifth")
             },
             None,
-        );
-        assert!(
-            fifth.is_err(),
-            "混合 trae_cn/trae_solo_cn 标记时 4 槽上限仍须生效"
+        )
+        .expect("槽位无上限：第 5 个账号应导入成功");
+        assert_eq!(fifth.access_token, "tok-fifth", "第 5 个账号应按新凭证入库");
+        let accounts = list_accounts_checked().expect("list");
+        assert_eq!(
+            accounts.len(),
+            5,
+            "混合 trae_cn/trae_solo_cn 标记时应有 5 个账号，无上限"
         );
 
         std::env::remove_var("COCKPIT_TOOLS_TEST_DATA_DIR");
@@ -7692,19 +8711,13 @@ mod tests {
         let payload = payload_from_storage_root(&storage_root).expect("build payload");
         let snapshot = extract_local_work_cn_device_snapshot(&storage_root);
         eprintln!(
-            "REAL payload: has_access={} user_id_prefix={:?} email_prefix={:?}",
+            "REAL snapshot probe: has_access={} has_user_id={} has_email={} has_auth_device={} has_checkin_device={} has_machine={} has_priv={} has_pub={}",
             !payload.access_token.is_empty(),
-            payload
-                .user_id
-                .as_deref()
-                .map(|s| format!("{}…", &s[..s.len().min(3)])),
-            format!("{}…", payload.email.chars().next().unwrap_or('?'))
-        );
-        eprintln!(
-            "REAL snapshot: auth_device_id={:?} checkin={:?} machine={:?} has_priv={} has_pub={}",
-            snapshot.auth_device_id,
-            snapshot.checkin_device_id,
-            snapshot.machine_id,
+            payload.user_id.as_deref().is_some_and(|value| !value.is_empty()),
+            !payload.email.is_empty(),
+            snapshot.auth_device_id.is_some(),
+            snapshot.checkin_device_id.is_some(),
+            snapshot.machine_id.is_some(),
             snapshot.device_private_key.is_some(),
             snapshot.device_public_key.is_some()
         );
@@ -7754,10 +8767,9 @@ mod tests {
     impl InstanceBindGuard {
         fn new(set_to: Option<Option<String>>) -> Self {
             let platform = super::TraePlatformKind::TraeSoloCn;
-            let original: Option<Option<String>> =
-                load_default_settings_for_platform(platform)
-                    .ok()
-                    .map(|settings| settings.bind_account_id.clone());
+            let original: Option<Option<String>> = load_default_settings_for_platform(platform)
+                .ok()
+                .map(|settings| settings.bind_account_id.clone());
             if original != set_to {
                 let _ = update_default_settings_for_platform(platform, set_to, None, None);
             }
@@ -7768,12 +8780,8 @@ mod tests {
     impl Drop for InstanceBindGuard {
         fn drop(&mut self) {
             let platform = super::TraePlatformKind::TraeSoloCn;
-            let _ = update_default_settings_for_platform(
-                platform,
-                self.original.clone(),
-                None,
-                None,
-            );
+            let _ =
+                update_default_settings_for_platform(platform, self.original.clone(), None, None);
         }
     }
 
@@ -7837,8 +8845,8 @@ mod tests {
         let override_path = std::env::temp_dir().join("work-cn-override-storage.json");
         std::env::set_var("WORK_CN_SWITCH_STORAGE_OVERRIDE", &override_path);
 
-        let resolved = super::resolve_current_work_cn_storage_path()
-            .expect("override 路径应可解析");
+        let resolved =
+            super::resolve_current_work_cn_storage_path().expect("override 路径应可解析");
         assert_eq!(resolved, override_path);
 
         std::env::remove_var("WORK_CN_SWITCH_STORAGE_OVERRIDE");
@@ -8155,7 +9163,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn work_cn_switch_to_current_account_opens_only() {
+    async fn work_cn_switch_to_current_account_rejects_storage_uid_mismatch() {
         let _guard = WORK_CN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let _lock = crate::modules::test_support::env_lock()
             .lock()
@@ -8200,11 +9208,10 @@ mod tests {
         // 把默认实例绑定设为该账号，模拟“当前账号”。
         let _bind = InstanceBindGuard::new(Some(Some(account.id.clone())));
 
-        let result = super::switch_work_cn_account(account.id.clone())
+        let error = super::switch_work_cn_account(account.id.clone())
             .await
-            .expect("open current should succeed");
-        assert!(result.verified);
-        assert!(!result.launched);
+            .expect_err("当前绑定与 storage UID 不一致时必须拒绝同步");
+        assert_eq!(error.code, WorkCnErrorCode::VerifyAccountMismatch);
 
         // 不应重新注入：storage 仍是“旧账号”UID。
         let storage_after = super::read_local_trae_auth_from_storage_path(&storage_path)
@@ -8373,7 +9380,10 @@ mod tests {
             ]
         });
         let summary = super::parse_work_cn_credits_from_usage(&Some(usage));
-        assert_eq!(summary.total, None, "找不到 credits_limit 应判暂无积分数据，不能误显示 0");
+        assert_eq!(
+            summary.total, None,
+            "找不到 credits_limit 应判暂无积分数据，不能误显示 0"
+        );
     }
 
     #[test]
@@ -8460,7 +9470,10 @@ mod tests {
         let err = super::get_work_cn_credits("does-not-exist", false)
             .await
             .expect_err("未知账号应返回错误");
-        assert_eq!(err.code, crate::models::work_cn::WorkCnErrorCode::AccountNotFound);
+        assert_eq!(
+            err.code,
+            crate::models::work_cn::WorkCnErrorCode::AccountNotFound
+        );
 
         std::env::remove_var("COCKPIT_TOOLS_TEST_DATA_DIR");
         let _ = std::fs::remove_dir_all(&data_dir);

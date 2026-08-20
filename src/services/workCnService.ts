@@ -1,4 +1,5 @@
 import { invoke } from '@tauri-apps/api/core';
+import { openUrl } from '@tauri-apps/plugin-opener';
 import type {
   WorkCnInstallation,
   WorkCnAccountView,
@@ -102,6 +103,26 @@ export function getWorkCnGitHubCliStatus(): Promise<WorkCnGitHubCliStatus> {
   return invoke<WorkCnGitHubCliStatus>('github_cli_status');
 }
 
+// gh 自动安装进度事件名（与 Rust `GH_SETUP_EVENT` 保持一致）。
+export const GH_SETUP_EVENT = 'gh-setup:progress';
+
+// gh 安装进度事件载荷。
+export interface GhSetupProgress {
+  phase: 'downloading' | 'installing' | 'done' | 'failed';
+  received: number;
+  total: number;
+}
+
+// 自动下载官方 gh MSI 并静默安装（进度经 GH_SETUP_EVENT 推送）。
+export function setupGhCli(): Promise<void> {
+  return invoke<void>('gh_cli_setup_download');
+}
+
+// 用 PAT 完成 gh 登录（Token 只走 stdin，绝不落盘）。
+export function ghLoginWithToken(token: string): Promise<void> {
+  return invoke<void>('gh_cli_login_with_token', { token });
+}
+
 // Sync one account's credentials to its bound GitHub slot. Never claims a
 // check-in. On error the backend returns a plain string, which we surface as-is.
 export async function syncWorkCnGitHubAccount(accountId: string): Promise<WorkCnGitHubSyncResult> {
@@ -135,4 +156,10 @@ export function deleteWorkCnAccount(accountId: string): Promise<void> {
 // 在系统文件管理器中打开应用日志目录。
 export function openWorkCnLogFolder(): Promise<void> {
   return invoke<void>('open_log_folder');
+}
+
+// 用系统默认浏览器打开外部链接。WebView 内 `<a target="_blank">` 不会唤起
+// 浏览器，必须经 opener 插件（权限已含于 opener:default）。
+export function openExternalUrl(url: string): Promise<void> {
+  return openUrl(url);
 }

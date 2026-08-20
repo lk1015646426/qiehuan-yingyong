@@ -1,190 +1,44 @@
 // TRAE Work CN 账号切换器 - 主页面
 //
-// 阶段 1：渲染静态应用壳框架。
-// 阶段 2：调用 get_work_cn_installation 在状态栏显示客户端检测结果。
-// 阶段 3：接入"导入当前账号"（完整快照），并展示已导入账号及其快照完整度。
-//         一键切换、积分查询等能力将在后续阶段接入。
+// 样式全部走 work-cn.css（基于 base.css 设计系统 token，自动适配暗色主题）：
+// - 快照完整度折叠为一行摘要（悬浮 title 展示缺失项明细）
+// - 积分区带 已用/总量 进度条
+// - 当前活跃账号（后台会话监测 accountId）高亮描边 + 角标
 
 import { useEffect, useState } from 'react';
-import type { CSSProperties, ReactElement } from 'react';
 import { listen } from '@tauri-apps/api/event';
+import traeCnIcon from '../assets/icons/trae-cn.png';
 import { getWorkCnInstallation, WORK_CN_SESSION_WATCH_EVENT } from '../services/workCnService';
 import { useWorkCnStore } from '../stores/useWorkCnStore';
 import { WorkCnAddAccountDialog } from '../components/work-cn/WorkCnAddAccountDialog';
 import { WorkCnSettingsDialog } from '../components/work-cn/WorkCnSettingsDialog';
 import { WorkCnStatusBanner } from '../components/work-cn/WorkCnStatusBanner';
 import type { WorkCnInstallation, WorkCnAccountView, WorkCnCreditsSummary, WorkCnGitHubSyncResult, WorkCnSessionWatchStatus } from '../types/workCn';
+import { compactUid } from '../utils/accountCardPresentation';
 
-const ACCOUNT_SLOT_COUNT = 4;
-
-const pageStyle: CSSProperties = {
-  display: 'flex',
-  flexDirection: 'column',
-  minWidth: 0,
-  minHeight: '100vh',
-  padding: '20px 24px',
-  boxSizing: 'border-box',
-  background: '#f5f6f8',
-  color: '#1f2430',
-  fontFamily: "'Segoe UI', 'Microsoft YaHei', 'PingFang SC', system-ui, sans-serif",
-  gap: 16,
-};
-
-const headerStyle: CSSProperties = {
-  display: 'flex',
-  alignItems: 'center',
-  justifyContent: 'space-between',
-  gap: 12,
-};
-
-const titleStyle: CSSProperties = {
-  margin: 0,
-  fontSize: 20,
-  fontWeight: 600,
-  letterSpacing: 0.2,
-};
-
-const headerActionsStyle: CSSProperties = {
-  display: 'flex',
-  alignItems: 'center',
-  gap: 8,
-};
-
-const buttonStyle: CSSProperties = {
-  height: 32,
-  padding: '0 14px',
-  fontSize: 13,
-  color: '#1f2430',
-  background: '#ffffff',
-  border: '1px solid #d7dae0',
-  borderRadius: 6,
-  cursor: 'pointer',
-};
-
-const primaryButtonStyle: CSSProperties = {
-  ...buttonStyle,
-  color: '#ffffff',
-  background: '#2563eb',
-  border: '1px solid #2563eb',
-};
-
-const dangerButtonStyle: CSSProperties = {
-  ...buttonStyle,
-  color: '#ffffff',
-  background: '#dc2626',
-  border: '1px solid #dc2626',
-};
-
-const statusStyle: CSSProperties = {
-  display: 'flex',
-  alignItems: 'center',
-  gap: 8,
-  padding: '10px 14px',
-  background: '#ffffff',
-  border: '1px solid #e4e7ec',
-  borderRadius: 8,
-  fontSize: 13,
-  color: '#525866',
-};
-
-const statusDotStyle: CSSProperties = {
-  width: 8,
-  height: 8,
-  borderRadius: '50%',
-  background: '#c4c8d0',
-  flexShrink: 0,
-};
-
-const sectionTitleStyle: CSSProperties = {
-  margin: '4px 0 0',
-  fontSize: 14,
-  fontWeight: 600,
-  color: '#1f2430',
-};
-
-const slotsStyle: CSSProperties = {
-  display: 'grid',
-  gridTemplateColumns: 'repeat(2, minmax(0, 1fr))',
-  gap: 12,
-};
-
-const slotStyle: CSSProperties = {
-  display: 'flex',
-  flexDirection: 'column',
-  gap: 8,
-  padding: '16px 18px',
-  background: '#ffffff',
-  border: '1px solid #e4e7ec',
-  borderRadius: 10,
-  minHeight: 132,
-};
-
-const slotTitleStyle: CSSProperties = {
-  fontSize: 14,
-  fontWeight: 600,
-  color: '#1f2430',
-};
-
-const slotStatusStyle: CSSProperties = {
-  fontSize: 12,
-  color: '#8a909c',
-};
-
-const badgeRowStyle: CSSProperties = {
-  display: 'flex',
-  flexWrap: 'wrap',
-  gap: 6,
-};
-
-const badgeStyle: CSSProperties = {
-  fontSize: 11,
-  padding: '2px 7px',
-  borderRadius: 999,
-  border: '1px solid #e4e7ec',
-  color: '#525866',
-};
-
-const badgeOkStyle: CSSProperties = {
-  ...badgeStyle,
-  color: '#15803d',
-  borderColor: '#bbf7d0',
-  background: '#f0fdf4',
-};
-
-const badgeWarnStyle: CSSProperties = {
-  ...badgeStyle,
-  color: '#b45309',
-  borderColor: '#fde68a',
-  background: '#fffbeb',
-};
-
-const warningStyle: CSSProperties = {
-  fontSize: 11,
-  color: '#b45309',
-  lineHeight: 1.5,
-};
-
-const statusDotOkStyle: CSSProperties = {
-  ...statusDotStyle,
-  background: '#22c55e',
-};
-
-const statusDotErrorStyle: CSSProperties = {
-  ...statusDotStyle,
-  background: '#ef4444',
-};
+// 快照字段中文名（与后端 WorkCnSnapshotValidation 对应），用于摘要明细。
+const SNAPSHOT_FIELDS: Array<[keyof WorkCnAccountView, string]> = [
+  ['hasAccessToken', '访问令牌'],
+  ['hasRefreshToken', '刷新令牌'],
+  ['hasUserId', '用户ID'],
+  ['hasAuthDeviceId', 'Auth设备ID'],
+  ['hasCheckinDeviceId', 'Checkin设备ID'],
+  ['hasMachineId', '机器ID'],
+  ['hasDevicePrivateKey', '设备私钥'],
+  ['hasDevicePublicKey', '设备公钥'],
+];
 
 function renderInstallationStatus(
   installation: WorkCnInstallation | null,
   loading: boolean,
   error: string | null,
-): { dot: CSSProperties; line: string; detail?: string } {
+): { tone: string; line: string; detail?: string } {
   if (loading) {
-    return { dot: statusDotStyle, line: '客户端检测：正在检测 TRAE Work CN 安装…' };
+    return { tone: '', line: '客户端检测：正在检测 TRAE Work CN 安装…' };
   }
   if (error) {
     return {
-      dot: statusDotErrorStyle,
+      tone: 'wc-status--error',
       line: '客户端检测失败，请稍后重试或在设置中手动指定路径',
       detail: error,
     };
@@ -195,7 +49,7 @@ function renderInstallationStatus(
       ? `数据目录：${installation.userDataDir}${legacyNote}`
       : undefined;
     return {
-      dot: statusDotErrorStyle,
+      tone: 'wc-status--error',
       line: '未检测到 TRAE Work CN，请在设置中选择 EXE 路径',
       detail,
     };
@@ -204,7 +58,7 @@ function renderInstallationStatus(
   const dataDirText = installation.userDataDir ?? '';
   const legacyNote = installation.legacyPath ? '（兼容旧数据目录）' : '';
   return {
-    dot: statusDotOkStyle,
+    tone: 'wc-status--ok',
     line: `已检测到 TRAE Work CN${versionText}`,
     detail: [installation.executablePath, dataDirText ? `数据目录：${dataDirText}${legacyNote}` : '']
       .filter(Boolean)
@@ -212,25 +66,17 @@ function renderInstallationStatus(
   };
 }
 
-function SnapshotBadges({ account }: { account: WorkCnAccountView }) {
-  const items: Array<[boolean, string]> = [
-    [account.hasAccessToken, '令牌'],
-    [account.hasRefreshToken, '刷新令牌'],
-    [account.hasUserId, '用户ID'],
-    [account.hasAuthDeviceId, 'Auth设备ID'],
-    [account.hasCheckinDeviceId, 'Checkin设备ID'],
-    [account.hasMachineId, '机器ID'],
-    [account.hasDevicePrivateKey, '私钥'],
-    [account.hasDevicePublicKey, '公钥'],
-  ];
+// 8 个技术徽章折叠为一行「快照 N/8」摘要；缺失时悬浮 title 列出缺失项。
+function SnapshotSummary({ account }: { account: WorkCnAccountView }) {
+  const missing = SNAPSHOT_FIELDS.filter(([key]) => !account[key]).map(([, label]) => label);
+  const total = SNAPSHOT_FIELDS.length;
+  const ok = missing.length === 0;
   return (
-    <div style={badgeRowStyle}>
-      {items.map(([ok, label]) => (
-        <span key={label} style={ok ? badgeOkStyle : badgeWarnStyle}>
-          {ok ? '✓ ' : '✗ '}
-          {label}
-        </span>
-      ))}
+    <div
+      className={ok ? 'wc-snapshot-summary wc-snapshot-summary--ok' : 'wc-snapshot-summary wc-snapshot-summary--missing'}
+      title={ok ? '登录快照字段完整，可安全切换' : `快照缺失 ${missing.length} 项：${missing.join('、')}\n请重新登录该账号并导入`}
+    >
+      {ok ? `✓ 快照完整 ${total}/${total}` : `快照 ${total - missing.length}/${total} · 缺 ${missing.length} 项`}
     </div>
   );
 }
@@ -241,33 +87,27 @@ function formatCreditsValue(value: number): string {
   return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2);
 }
 
-function renderCredits(
-  credits: WorkCnCreditsSummary | null | undefined,
-  error: string | null | undefined,
-): ReactElement | null {
+function CreditsBlock({
+  credits,
+  error,
+}: {
+  credits: WorkCnCreditsSummary | null;
+  error: string | null;
+}) {
   if (error) {
-    return <div style={warningStyle}>积分查询失败：{error}</div>;
+    return <div className="wc-credits-error">积分查询失败：{error}</div>;
   }
   if (!credits) {
     return null;
   }
   if (credits.unlimited) {
-    return (
-      <div style={{ fontSize: 20, fontWeight: 700, color: '#1f2430' }}>剩余积分：无限</div>
-    );
+    return <div className="wc-credits-value">剩余积分：无限</div>;
   }
   if (credits.total == null) {
-    return <div style={slotStatusStyle}>剩余积分：暂无积分数据</div>;
+    return <div className="wc-credits-sub">剩余积分：暂无积分数据</div>;
   }
   return (
-    <>
-      <div style={{ fontSize: 20, fontWeight: 700, color: '#1f2430' }}>
-        剩余 {formatCreditsValue(credits.remaining ?? 0)} 积分
-      </div>
-      <div style={slotStatusStyle}>
-        已用 {formatCreditsValue(credits.used)} / 总 {formatCreditsValue(credits.total)}
-      </div>
-    </>
+    <div className="wc-credits-value">剩余 {formatCreditsValue(credits.remaining ?? 0)} 积分</div>
   );
 }
 
@@ -280,10 +120,9 @@ function AccountCard({
   refreshingCredits,
   githubEnabled,
   githubSync,
-  githubSyncing,
+  active,
   onSwitch,
   onRefreshCredits,
-  onSyncGitHub,
   onDelete,
 }: {
   account: WorkCnAccountView;
@@ -294,10 +133,9 @@ function AccountCard({
   refreshingCredits: boolean;
   githubEnabled: boolean;
   githubSync: WorkCnGitHubSyncResult | null;
-  githubSyncing: boolean;
+  active: boolean;
   onSwitch: () => void;
   onRefreshCredits: () => void;
-  onSyncGitHub: () => void;
   onDelete: () => void;
 }) {
   const [confirmingDelete, setConfirmingDelete] = useState(false);
@@ -307,37 +145,46 @@ function AccountCard({
   const canSwitch = account.validForSwitch && !switching;
 
   let githubLine = 'GitHub：未同步';
-  let githubColor = '#8a909c';
+  let githubTone = '';
   if (!githubEnabled) {
     githubLine = 'GitHub：未启用';
   } else if (githubSync?.synced) {
     githubLine = 'GitHub：已同步';
-    githubColor = '#16a34a';
+    githubTone = ' wc-github-line--ok';
   } else if (githubSync?.error) {
     githubLine = `GitHub 同步失败：${githubSync.error}`;
-    githubColor = '#ef4444';
+    githubTone = ' wc-github-line--error';
   } else if (githubSync?.skipped) {
     githubLine = `GitHub 待同步：${githubSync.skipReason ?? '未绑定槽位'}`;
-    githubColor = '#f59e0b';
+    githubTone = ' wc-github-line--warn';
   }
 
   return (
-    <div style={slotStyle}>
-      <div style={slotTitleStyle}>{title}</div>
-      <div style={slotStatusStyle}>
-        {account.validForSwitch ? '快照完整 · 可切换' : '快照不完整 · 不可切换'}
-        {account.userId ? ` · ${account.userId}` : ''}
+    <div className={active ? 'wc-slot account-card account-card--compact wc-slot--active' : 'wc-slot account-card account-card--compact'}>
+      {active ? <span className="wc-slot-active-badge">使用中</span> : null}
+      <div className="wc-slot-head account-card__head">
+        <div className="wc-slot-title" title={title}>{title}</div>
+        <SnapshotSummary account={account} />
       </div>
-      {renderCredits(credits, creditsError)}
-      <div style={{ ...slotStatusStyle, color: githubColor, fontSize: 12 }}>{githubLine}</div>
-      <SnapshotBadges account={account} />
-      {account.warnings.length ? (
-        <div style={warningStyle}>{account.warnings.join('；')}</div>
-      ) : null}
-      <div style={{ marginTop: 'auto', display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+      <div className="wc-slot-sub account-card__identity" title={account.userId ?? undefined}>
+        {account.email ?? '未提供邮箱'} · UID {compactUid(account.userId)}
+      </div>
+      <div className="account-card__metrics">
+        <CreditsBlock credits={credits} error={creditsError} />
+        <div className="wc-credits-sub">{account.validForSwitch ? '快照可切换' : '快照需重新导入'}</div>
+      </div>
+      <div className="account-card__status">
+        <div
+          className={`wc-github-line${githubTone}`}
+          title={[githubLine, ...account.warnings].join('；')}
+        >
+          {githubLine}{account.warnings.length ? ` · ${account.warnings.join('；')}` : ''}
+        </div>
+      </div>
+      <div className="wc-slot-actions account-card__actions">
         <button
           type="button"
-          style={account.validForSwitch ? primaryButtonStyle : buttonStyle}
+          className={account.validForSwitch ? 'wc-btn wc-btn-primary' : 'wc-btn'}
           disabled={!canSwitch}
           onClick={onSwitch}
           title={
@@ -350,27 +197,18 @@ function AccountCard({
         </button>
         <button
           type="button"
-          style={buttonStyle}
+          className="wc-btn"
           disabled={refreshingCredits || switching}
           onClick={onRefreshCredits}
           title="仅查询积分，绝不签到"
         >
           {refreshingCredits ? '查询中…' : '刷新积分'}
         </button>
-        <button
-          type="button"
-          style={buttonStyle}
-          disabled={!githubEnabled || githubSyncing || switching}
-          onClick={onSyncGitHub}
-          title="把最新凭证同步到 GitHub Secrets（绝不签到）"
-        >
-          {githubSyncing ? '同步中…' : '同步 GitHub'}
-        </button>
         {confirmingDelete ? (
           <>
             <button
               type="button"
-              style={dangerButtonStyle}
+              className="wc-btn wc-btn-danger"
               disabled={deleting}
               onClick={onDelete}
               title="删除该账号槽位（不影响官方客户端登录态）"
@@ -379,7 +217,7 @@ function AccountCard({
             </button>
             <button
               type="button"
-              style={buttonStyle}
+              className="wc-btn"
               disabled={deleting}
               onClick={() => setConfirmingDelete(false)}
             >
@@ -389,7 +227,7 @@ function AccountCard({
         ) : (
           <button
             type="button"
-            style={buttonStyle}
+            className="wc-btn"
             disabled={switching || deleting}
             onClick={() => setConfirmingDelete(true)}
             title="从账号库删除该账号槽位"
@@ -409,10 +247,10 @@ function StoreErrorBanner() {
     return null;
   }
   return (
-    <section style={{ ...statusStyle, borderColor: '#fecaca', color: '#b91c1c' }}>
-      <span style={statusDotErrorStyle} />
+    <section className="wc-status wc-status--error">
+      <span className="wc-status-dot wc-status-dot--error" />
       <div style={{ flex: 1 }}>{error}</div>
-      <button type="button" style={buttonStyle} onClick={clearError}>
+      <button type="button" className="wc-btn" onClick={clearError}>
         知道了
       </button>
     </section>
@@ -427,7 +265,7 @@ export function WorkCnSwitcherPage() {
 
   const accounts = useWorkCnStore((s) => s.accounts);
   const storeLoading = useWorkCnStore((s) => s.loading);
-  const loadAccounts = useWorkCnStore((s) => s.loadAccounts);
+  const ensureAccountsLoaded = useWorkCnStore((s) => s.ensureAccountsLoaded);
   const lastImportWarning = useWorkCnStore((s) => s.lastImportWarning);
   const switchingId = useWorkCnStore((s) => s.switchingId);
   const switchTo = useWorkCnStore((s) => s.switchTo);
@@ -436,13 +274,15 @@ export function WorkCnSwitcherPage() {
   const openLogs = useWorkCnStore((s) => s.openLogs);
   const creditsById = useWorkCnStore((s) => s.creditsById);
   const creditsErrorById = useWorkCnStore((s) => s.creditsErrorById);
-  const refreshingCreditsId = useWorkCnStore((s) => s.refreshingCreditsId);
+  const refreshingCreditsIds = useWorkCnStore((s) => s.refreshingCreditsIds);
   const refreshCredits = useWorkCnStore((s) => s.refreshCredits);
   const githubConfig = useWorkCnStore((s) => s.githubConfig);
   const githubSyncResultById = useWorkCnStore((s) => s.githubSyncResultById);
-  const githubSyncingById = useWorkCnStore((s) => s.githubSyncingById);
   const loadGitHubConfig = useWorkCnStore((s) => s.loadGitHubConfig);
-  const syncGitHub = useWorkCnStore((s) => s.syncGitHub);
+  const syncGitHubAll = useWorkCnStore((s) => s.syncGitHubAll);
+  const syncingAllGithub = useWorkCnStore((s) => s.syncingAllGithub);
+  const syncAllProgress = useWorkCnStore((s) => s.syncAllProgress);
+  const sessionWatchStatus = useWorkCnStore((s) => s.sessionWatchStatus);
   const loadSessionWatchStatus = useWorkCnStore((s) => s.loadSessionWatchStatus);
   const applySessionWatchStatus = useWorkCnStore((s) => s.applySessionWatchStatus);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -467,12 +307,12 @@ export function WorkCnSwitcherPage() {
           setLoading(false);
         }
       });
-    loadAccounts();
+    void ensureAccountsLoaded();
     void loadGitHubConfig();
     return () => {
       cancelled = true;
     };
-  }, [loadAccounts, loadGitHubConfig]);
+  }, [ensureAccountsLoaded, loadGitHubConfig]);
 
   useEffect(() => {
     void loadSessionWatchStatus();
@@ -499,16 +339,25 @@ export function WorkCnSwitcherPage() {
   }, [loadSessionWatchStatus, applySessionWatchStatus]);
 
   const status = renderInstallationStatus(installation, loading, error);
-  const emptySlots = Math.max(0, ACCOUNT_SLOT_COUNT - accounts.length);
+
+  // 当前活跃账号：优先取后台会话监测到的 accountId；未监测时回退到最近使用。
+  const activeAccountId =
+    sessionWatchStatus?.accountId ??
+    (accounts.some((a) => a.lastUsed > 0)
+      ? accounts.reduce((latest, a) => (a.lastUsed > latest.lastUsed ? a : latest)).id
+      : null);
 
   return (
-    <div style={pageStyle}>
-      <header style={headerStyle}>
-        <h1 style={titleStyle}>TRAE Work CN 账号切换器</h1>
-        <div style={headerActionsStyle}>
+    <div className="wc-page">
+      <header className="wc-header">
+        <h1 className="wc-title">
+          <img className="wc-title-icon" src={traeCnIcon} alt="TRAE" />
+          TRAE Work CN 账号切换器
+        </h1>
+        <div className="wc-header-actions">
           <button
             type="button"
-            style={primaryButtonStyle}
+            className="wc-btn wc-btn-primary"
             onClick={() => setDialogOpen(true)}
             disabled={!installation?.installed}
             title={installation?.installed ? '' : '请先安装并登录 TRAE Work CN'}
@@ -517,14 +366,25 @@ export function WorkCnSwitcherPage() {
           </button>
           <button
             type="button"
-            style={buttonStyle}
+            className="wc-btn"
+            onClick={() => void syncGitHubAll()}
+            disabled={syncingAllGithub || !githubConfig.enabled || accounts.length === 0}
+            title="把所有已绑定槽位账号的最新凭证（按账号槽位名命名的 *_TOKEN / *_DEVICE_ID）一键同步到 GitHub Secrets，供 daily-checkin 工作流签到使用"
+          >
+            {syncingAllGithub && syncAllProgress
+              ? `同步中 ${syncAllProgress.done}/${syncAllProgress.total}…`
+              : '同步全部 GitHub'}
+          </button>
+          <button
+            type="button"
+            className="wc-btn"
             onClick={() => setSettingsOpen(true)}
           >
             设置
           </button>
           <button
             type="button"
-            style={buttonStyle}
+            className="wc-btn"
             onClick={() => void openLogs()}
             title="在系统文件管理器中打开日志目录"
           >
@@ -533,12 +393,12 @@ export function WorkCnSwitcherPage() {
         </div>
       </header>
 
-      <section style={statusStyle}>
-        <span style={status.dot} />
+      <section className={`wc-status${status.tone ? ` ${status.tone}` : ''}`}>
+        <span className={`wc-status-dot${status.tone === 'wc-status--ok' ? ' wc-status-dot--ok' : status.tone === 'wc-status--error' ? ' wc-status-dot--error' : ''}`} />
         <div>
           <div>{status.line}</div>
           {status.detail ? (
-            <div style={{ fontSize: 12, color: '#8a909c', marginTop: 4, wordBreak: 'break-all' }}>
+            <div className="wc-status-detail">
               {status.detail.split('\n').map((line, index) => (
                 <div key={index}>{line}</div>
               ))}
@@ -548,9 +408,7 @@ export function WorkCnSwitcherPage() {
       </section>
 
       {lastImportWarning ? (
-        <section style={{ ...statusStyle, borderColor: '#fde68a', color: '#b45309' }}>
-          {lastImportWarning}
-        </section>
+        <section className="wc-status wc-status--warn">{lastImportWarning}</section>
       ) : null}
 
       <WorkCnStatusBanner />
@@ -558,11 +416,11 @@ export function WorkCnSwitcherPage() {
       <StoreErrorBanner />
 
       <section>
-        <h2 style={sectionTitleStyle}>
-          账号槽位（{accounts.length}/{ACCOUNT_SLOT_COUNT}）
+        <h2 className="wc-section-title">
+          账号槽位（{accounts.length}，数量不限）
           {storeLoading ? ' · 加载中…' : ''}
         </h2>
-        <div style={slotsStyle}>
+        <div className="wc-slots">
           {accounts.map((account) => (
             <AccountCard
               key={account.id}
@@ -571,22 +429,19 @@ export function WorkCnSwitcherPage() {
               creditsError={creditsErrorById[account.id] ?? null}
               switching={switchingId === account.id}
               deleting={deletingId === account.id}
-              refreshingCredits={refreshingCreditsId === account.id}
+              refreshingCredits={!!refreshingCreditsIds[account.id]}
               githubEnabled={githubConfig.enabled}
               githubSync={githubSyncResultById[account.id] ?? null}
-              githubSyncing={githubSyncingById[account.id] ?? false}
+              active={account.id === activeAccountId}
               onSwitch={() => void switchTo(account.id)}
               onRefreshCredits={() => void refreshCredits(account.id, true)}
-              onSyncGitHub={() => void syncGitHub(account.id)}
               onDelete={() => void deleteAccount(account.id)}
             />
           ))}
-          {Array.from({ length: emptySlots }, (_, index) => (
-            <div key={`empty-${index}`} style={slotStyle}>
-              <div style={slotTitleStyle}>空槽位</div>
-              <div style={slotStatusStyle}>可导入</div>
-            </div>
-          ))}
+          <div className="wc-slot wc-slot--empty">
+            <span className="wc-slot-empty-icon">＋</span>
+            <span className="wc-slot-empty-hint">新增槽位 · 点击右上「导入当前账号」按顺序追加</span>
+          </div>
         </div>
       </section>
 

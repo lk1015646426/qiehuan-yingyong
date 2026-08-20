@@ -1,4 +1,5 @@
 import { create } from 'zustand';
+import { listen } from '@tauri-apps/api/event';
 import {
   clearWorkCnCredentials,
   deleteWorkCnAccount,
@@ -6,13 +7,17 @@ import {
   getWorkCnGitHubCliStatus,
   getWorkCnGitHubConfig,
   getWorkCnSessionWatchStatus,
+  GH_SETUP_EVENT,
+  ghLoginWithToken,
   importCurrentWorkCnAccount,
   listWorkCnAccounts,
   openWorkCnLogFolder,
   saveWorkCnGitHubConfig,
+  setupGhCli,
   switchWorkCnAccount,
   syncWorkCnGitHubAccount,
 } from '../services/workCnService';
+import type { GhSetupProgress } from '../services/workCnService';
 import type {
   WorkCnAccountView,
   WorkCnCreditsSummary,
@@ -22,9 +27,11 @@ import type {
   WorkCnGitHubSyncResult,
   WorkCnSessionWatchStatus,
 } from '../types/workCn';
+import { shouldLoadWorkCnAccounts } from '../utils/workCnLifecycle';
 
 interface WorkCnState {
   accounts: WorkCnAccountView[];
+  accountsLoaded: boolean;
   loading: boolean;
   importing: boolean;
   switchingId: string | null;
@@ -35,22 +42,33 @@ interface WorkCnState {
   // 积分余额（仅查询，绝不签到）。key 为账号 id。
   creditsById: Record<string, WorkCnCreditsSummary>;
   creditsErrorById: Record<string, string | null>;
-  refreshingCreditsId: string | null;
+  refreshingCreditsIds: Record<string, boolean>;
   // GitHub Secrets 同步（阶段 6）。
   githubConfig: WorkCnGitHubConfig;
   githubCliStatus: WorkCnGitHubCliStatus | null;
   githubSyncingById: Record<string, boolean>;
   githubSyncResultById: Record<string, WorkCnGitHubSyncResult | null>;
+  // 一键同步全部（顶栏按钮）：进行中标志 + 进度。
+  syncingAllGithub: boolean;
+  syncAllProgress: { done: number; total: number } | null;
+  // gh 自动安装（引导弹窗「自动下载并安装」按钮）。
+  ghSetup: GhSetupProgress | null;
+  ghSetupError: string | null;
+  setupGh: () => Promise<void>;
+  ghLogin: (token: string) => Promise<void>;
   // 后台会话监测（阶段 7）。
   sessionWatchStatus: WorkCnSessionWatchStatus | null;
   loadGitHubConfig: () => Promise<void>;
   saveGitHubConfig: (config: WorkCnGitHubConfig) => Promise<void>;
   refreshGitHubCliStatus: () => Promise<void>;
   syncGitHub: (accountId: string) => Promise<void>;
+  syncGitHubAll: () => Promise<void>;
   loadSessionWatchStatus: () => Promise<void>;
   applySessionWatchStatus: (status: WorkCnSessionWatchStatus) => void;
   clearCredentials: () => Promise<void>;
   loadAccounts: () => Promise<void>;
+  refreshAccountMetadata: () => Promise<void>;
+  ensureAccountsLoaded: () => Promise<void>;
   importCurrent: (label?: string | null) => Promise<void>;
   switchTo: (accountId: string) => Promise<void>;
   deleteAccount: (accountId: string) => Promise<void>;
@@ -61,6 +79,7 @@ interface WorkCnState {
 
 export const useWorkCnStore = create<WorkCnState>((set, get) => ({
   accounts: [],
+  accountsLoaded: false,
   loading: false,
   importing: false,
   switchingId: null,
@@ -70,17 +89,22 @@ export const useWorkCnStore = create<WorkCnState>((set, get) => ({
   lastSwitchResult: null,
   creditsById: {},
   creditsErrorById: {},
-  refreshingCreditsId: null,
+  refreshingCreditsIds: {},
   githubConfig: { enabled: false, repository: '', slots: [] },
   githubCliStatus: null,
   githubSyncingById: {},
   githubSyncResultById: {},
+  syncingAllGithub: false,
+  syncAllProgress: null,
+  ghSetup: null,
+  ghSetupError: null,
   sessionWatchStatus: null,
   async loadAccounts() {
+    if (get().loading) return;
     set({ loading: true, error: null });
     try {
       const accounts = await listWorkCnAccounts();
-      set({ accounts, loading: false });
+      set({ accounts, accountsLoaded: true, loading: false });
       // 载入时先本地解析缓存积分快速展示，再静默联网刷新一次真实余额
       // （仅查询用量接口，绝不签到/领取）。
       void Promise.all(
@@ -108,6 +132,21 @@ export const useWorkCnStore = create<WorkCnState>((set, get) => ({
         error: err instanceof Error ? err.message : String(err),
         loading: false,
       });
+    }
+  },
+  async refreshAccountMetadata() {
+    if (get().loading) return;
+    set({ loading: true });
+    try {
+      set({ accounts: await listWorkCnAccounts(), accountsLoaded: true, loading: false });
+    } catch (err) {
+      set({ error: err instanceof Error ? err.message : String(err), loading: false });
+    }
+  },
+  async ensureAccountsLoaded() {
+    const state = get();
+    if (shouldLoadWorkCnAccounts(state.accountsLoaded, state.loading)) {
+      await state.loadAccounts();
     }
   },
   async importCurrent(label) {
@@ -184,18 +223,19 @@ export const useWorkCnStore = create<WorkCnState>((set, get) => ({
     }
   },
   async refreshCredits(accountId, forceRefresh = false) {
-    set({ refreshingCreditsId: accountId });
+    if (get().refreshingCreditsIds[accountId]) return;
+    set((state) => ({ refreshingCreditsIds: { ...state.refreshingCreditsIds, [accountId]: true } }));
     try {
       const summary = await getWorkCnCredits(accountId, forceRefresh);
       set((state) => ({
         creditsById: { ...state.creditsById, [accountId]: summary },
         creditsErrorById: { ...state.creditsErrorById, [accountId]: null },
-        refreshingCreditsId: null,
+        refreshingCreditsIds: Object.fromEntries(Object.entries(state.refreshingCreditsIds).filter(([id]) => id !== accountId)),
       }));
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       set((state) => ({
-        refreshingCreditsId: null,
+        refreshingCreditsIds: Object.fromEntries(Object.entries(state.refreshingCreditsIds).filter(([id]) => id !== accountId)),
         creditsErrorById: { ...state.creditsErrorById, [accountId]: message },
       }));
     }
@@ -222,6 +262,44 @@ export const useWorkCnStore = create<WorkCnState>((set, get) => ({
       set({ githubCliStatus: status });
     } catch {
       // ignore
+    }
+  },
+  // 自动下载并安装 gh：订阅进度事件更新 ghSetup，结束后自动刷新 CLI 状态。
+  async setupGh() {
+    set({ ghSetupError: null, ghSetup: { phase: 'downloading', received: 0, total: 0 } });
+    let disposed = false;
+    let unlisten: (() => void) | undefined;
+    void listen<GhSetupProgress>(GH_SETUP_EVENT, (event) => {
+      if (!disposed) {
+        set({ ghSetup: event.payload });
+      }
+    }).then((fn) => {
+      if (disposed) {
+        fn();
+      } else {
+        unlisten = fn;
+      }
+    });
+    try {
+      await setupGhCli();
+      await get().refreshGitHubCliStatus();
+    } catch (err) {
+      set({
+        ghSetupError: err instanceof Error ? err.message : String(err),
+        ghSetup: { phase: 'failed', received: 0, total: 0 },
+      });
+    } finally {
+      disposed = true;
+      unlisten?.();
+    }
+  },
+  // PAT 登录 gh：成功后刷新 CLI 状态。
+  async ghLogin(token) {
+    try {
+      await ghLoginWithToken(token);
+      await get().refreshGitHubCliStatus();
+    } catch (err) {
+      throw err instanceof Error ? err : new Error(String(err));
     }
   },
   async syncGitHub(accountId) {
@@ -252,6 +330,28 @@ export const useWorkCnStore = create<WorkCnState>((set, get) => ({
       }));
     }
   },
+  // 一键同步全部：顺序同步所有已绑定槽位的账号（避免 gh CLI 并发竞争），
+  // 单个失败不中断，最终逐卡展示结果。
+  async syncGitHubAll() {
+    const { accounts, githubConfig, syncingAllGithub } = get();
+    if (syncingAllGithub) return;
+    if (!githubConfig.enabled) {
+      set({ error: 'GitHub 同步未启用，请先在设置中启用并绑定槽位' });
+      return;
+    }
+    const boundIds = new Set(githubConfig.slots.map((slot) => slot.accountId));
+    const targets = accounts.filter((account) => boundIds.has(account.id));
+    if (targets.length === 0) {
+      set({ error: '没有账号绑定 GitHub 槽位，请先在设置中完成「账号 → 槽位」绑定' });
+      return;
+    }
+    set({ syncingAllGithub: true, syncAllProgress: { done: 0, total: targets.length } });
+    for (let i = 0; i < targets.length; i += 1) {
+      await get().syncGitHub(targets[i].id);
+      set({ syncAllProgress: { done: i + 1, total: targets.length } });
+    }
+    set({ syncingAllGithub: false, syncAllProgress: null });
+  },
   async loadSessionWatchStatus() {
     try {
       const status = await getWorkCnSessionWatchStatus();
@@ -272,6 +372,7 @@ export const useWorkCnStore = create<WorkCnState>((set, get) => ({
     await clearWorkCnCredentials();
     set({
       accounts: [],
+      accountsLoaded: true,
       creditsById: {},
       creditsErrorById: {},
       githubConfig: { enabled: false, repository: '', slots: [] },

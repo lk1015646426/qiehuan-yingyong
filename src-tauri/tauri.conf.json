@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "切换工具",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "identifier": "com.lk.trae-work-cn-switcher",
   "build": {
     "beforeDevCommand": "node scripts/prepare-tauri.cjs && npm run dev",
@@ -48,7 +48,9 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis"],
+    "targets": [
+      "nsis"
+    ],
     "createUpdaterArtifacts": false,
     "windows": {
       "nsis": {

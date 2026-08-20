@@ -1075,7 +1075,11 @@ fn windows_trae_candidate_matches_platform(
         component
             .as_os_str()
             .to_str()
-            .map(|value| expected.iter().any(|alias| value.eq_ignore_ascii_case(alias)))
+            .map(|value| {
+                expected
+                    .iter()
+                    .any(|alias| value.eq_ignore_ascii_case(alias))
+            })
             .unwrap_or(false)
     })
 }
@@ -2746,8 +2750,7 @@ fn detect_trae_exec_path_for_platform(
         // path on existing machines. Probe every alias so detection survives
         // the rebrand.
         let app_dirs: &[&str] = platform.app_support_dir_aliases();
-        let exe_names: &[&str] =
-            crate::modules::trae_account::trae_product_exe_names(platform);
+        let exe_names: &[&str] = crate::modules::trae_account::trae_product_exe_names(platform);
         for base_path in crate::modules::trae_account::windows_trae_install_base_paths(platform) {
             if base_path.is_file() {
                 candidates.push(base_path);
@@ -2841,6 +2844,124 @@ fn detect_trae_exec_path_for_platform(
     None
 }
 
+#[cfg(target_os = "windows")]
+fn select_workbuddy_windows_exec_path<F>(
+    candidates: Vec<std::path::PathBuf>,
+    detect_by_signatures: F,
+) -> Option<std::path::PathBuf>
+where
+    F: FnOnce() -> Option<std::path::PathBuf>,
+{
+    candidates
+        .into_iter()
+        .rev()
+        .find(|candidate| candidate.is_file() && is_workbuddy_launch_executable(candidate))
+        .or_else(detect_by_signatures)
+        .filter(|candidate| candidate.is_file() && is_workbuddy_launch_executable(candidate))
+}
+
+fn is_workbuddy_launch_executable(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    !matches!(
+        name.as_str(),
+        "node.exe" | "electron.exe" | "crashpad_handler.exe"
+    ) && (name == "workbuddy.exe" || name == "workbuddy" || name.ends_with("workbuddy.exe"))
+}
+
+#[cfg(target_os = "windows")]
+fn detect_running_workbuddy_exec_path() -> Option<std::path::PathBuf> {
+    scan_windows_app_launch_targets("workbuddy", None)
+        .ok()?
+        .into_iter()
+        .find(|candidate| candidate.source == "running_process")
+        .map(|candidate| std::path::PathBuf::from(candidate.target))
+        .filter(|candidate| candidate.is_file())
+}
+
+#[cfg(target_os = "windows")]
+fn detect_registered_workbuddy_exec_path() -> Option<std::path::PathBuf> {
+    use winreg::enums::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
+    use winreg::RegKey;
+
+    let mut raw_candidates = Vec::new();
+    for (hive, path) in [
+        (
+            HKEY_CURRENT_USER,
+            "Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\WorkBuddy.exe",
+        ),
+        (
+            HKEY_LOCAL_MACHINE,
+            "Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\WorkBuddy.exe",
+        ),
+        (
+            HKEY_LOCAL_MACHINE,
+            "Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\App Paths\\WorkBuddy.exe",
+        ),
+    ] {
+        let Ok(key) = RegKey::predef(hive).open_subkey(path) else {
+            continue;
+        };
+        if let Ok(value) = key.get_value::<String, _>("") {
+            raw_candidates.push(value);
+        }
+        if let Ok(directory) = key.get_value::<String, _>("Path") {
+            raw_candidates.push(
+                std::path::PathBuf::from(directory)
+                    .join("WorkBuddy.exe")
+                    .to_string_lossy()
+                    .to_string(),
+            );
+        }
+    }
+
+    for (hive, path) in [
+        (
+            HKEY_CURRENT_USER,
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+        ),
+        (
+            HKEY_LOCAL_MACHINE,
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+        ),
+        (
+            HKEY_LOCAL_MACHINE,
+            "Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+        ),
+    ] {
+        let Ok(uninstall) = RegKey::predef(hive).open_subkey(path) else {
+            continue;
+        };
+        for subkey_name in uninstall.enum_keys().flatten() {
+            let Ok(subkey) = uninstall.open_subkey(&subkey_name) else {
+                continue;
+            };
+            let display_name: String = subkey.get_value("DisplayName").unwrap_or_default();
+            if !display_name.to_ascii_lowercase().contains("workbuddy") {
+                continue;
+            }
+            if let Ok(value) = subkey.get_value::<String, _>("DisplayIcon") {
+                raw_candidates.push(value);
+            }
+            if let Ok(directory) = subkey.get_value::<String, _>("InstallLocation") {
+                raw_candidates.push(
+                    std::path::PathBuf::from(directory)
+                        .join("WorkBuddy.exe")
+                        .to_string_lossy()
+                        .to_string(),
+                );
+            }
+        }
+    }
+
+    raw_candidates
+        .iter()
+        .find_map(|candidate| normalize_windows_candidate_path(candidate))
+}
+
 fn detect_workbuddy_exec_path() -> Option<std::path::PathBuf> {
     #[cfg(target_os = "macos")]
     {
@@ -2875,10 +2996,13 @@ fn detect_workbuddy_exec_path() -> Option<std::path::PathBuf> {
                     .join("WorkBuddy.exe"),
             );
         }
-        for candidate in candidates {
-            if candidate.exists() {
-                return Some(candidate);
-            }
+        if let Some(running) = detect_running_workbuddy_exec_path() {
+            candidates.push(running);
+        }
+        if let Some(candidate) = select_workbuddy_windows_exec_path(candidates, || {
+            detect_registered_workbuddy_exec_path()
+        }) {
+            return Some(candidate);
         }
     }
 
@@ -2898,6 +3022,104 @@ fn detect_workbuddy_exec_path() -> Option<std::path::PathBuf> {
     }
 
     None
+}
+
+#[cfg(all(test, target_os = "windows"))]
+mod workbuddy_windows_detection_tests {
+    use super::{
+        is_workbuddy_launch_executable, parse_windows_exec_candidates,
+        select_workbuddy_windows_exec_path,
+    };
+    use std::os::windows::process::ExitStatusExt;
+    use std::path::PathBuf;
+
+    #[test]
+    fn falls_back_to_multi_source_detection_for_nonstandard_install_path() {
+        let root = std::env::temp_dir().join(format!(
+            "workbuddy-detection-test-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let detected = root.join("自定义目录").join("WorkBuddy.exe");
+        std::fs::create_dir_all(detected.parent().unwrap()).unwrap();
+        std::fs::write(&detected, b"test executable").unwrap();
+
+        let result = select_workbuddy_windows_exec_path(
+            vec![PathBuf::from(r"C:\missing\WorkBuddy\WorkBuddy.exe")],
+            || Some(detected.clone()),
+        );
+
+        assert_eq!(result, Some(detected));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn prefers_running_workbuddy_over_default_install_candidate() {
+        let root = std::env::temp_dir().join(format!(
+            "workbuddy-running-priority-test-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let default_install = root.join("Program Files").join("WorkBuddy.exe");
+        let running_install = root.join("自定义目录").join("WorkBuddy.exe");
+        std::fs::create_dir_all(default_install.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(running_install.parent().unwrap()).unwrap();
+        std::fs::write(&default_install, b"default executable").unwrap();
+        std::fs::write(&running_install, b"running executable").unwrap();
+
+        let result = select_workbuddy_windows_exec_path(
+            vec![default_install, running_install.clone()],
+            || panic!("running WorkBuddy must avoid the slow signature fallback"),
+        );
+
+        assert_eq!(result, Some(running_install));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn parses_running_process_candidate_with_unicode_install_path() {
+        let root = std::env::temp_dir().join(format!(
+            "workbuddy-running-process-test-{}-{}",
+            std::process::id(),
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        let detected = root.join("联想软件下载内容").join("WorkBuddy.exe");
+        std::fs::create_dir_all(detected.parent().unwrap()).unwrap();
+        std::fs::write(&detected, b"test executable").unwrap();
+        let stdout = format!("STAGE:RUNNING\r\n{}\r\nSTAGE:END\r\n", detected.display());
+        let output = std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: stdout.into_bytes(),
+            stderr: Vec::new(),
+        };
+
+        let result =
+            parse_windows_exec_candidates("WorkBuddy", &["WorkBuddy.exe"], &["workbuddy"], output);
+
+        assert_eq!(result, Some(detected));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn embedded_node_runtime_is_not_used_as_workbuddy_launch_executable() {
+        assert!(!is_workbuddy_launch_executable(std::path::Path::new(
+            r"C:\Users\tester\.workbuddy\binaries\node\versions\22.2.2\node.exe",
+        )));
+    }
+
+    #[test]
+    fn workbuddy_probe_failure_is_not_treated_as_not_running() {
+        let fallback = Vec::<(u32, Option<String>)>::new();
+        assert!(
+            super::resolve_workbuddy_probe_result(Err("powershell failed".into()), fallback)
+                .is_err()
+        );
+
+        assert_eq!(
+            super::resolve_workbuddy_probe_result(Ok(Vec::new()), Vec::new()).unwrap(),
+            Vec::new()
+        );
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -3203,7 +3425,13 @@ fn resolve_trae_macos_exec_path(path_str: &str) -> Option<std::path::PathBuf> {
     resolve_macos_exec_path(path_str, "Trae")
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "windows")]
+fn resolve_workbuddy_macos_exec_path(path_str: &str) -> Option<std::path::PathBuf> {
+    resolve_macos_exec_path(path_str, "WorkBuddy")
+        .filter(|path| is_workbuddy_launch_executable(path))
+}
+
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 fn resolve_workbuddy_macos_exec_path(path_str: &str) -> Option<std::path::PathBuf> {
     resolve_macos_exec_path(path_str, "WorkBuddy")
 }
@@ -4154,13 +4382,31 @@ pub(crate) fn resolve_trae_launch_path_for_platform(
     Err(app_path_missing_error(platform.provider_key()))
 }
 
-fn resolve_workbuddy_launch_path() -> Result<std::path::PathBuf, String> {
+pub fn resolve_workbuddy_launch_path() -> Result<std::path::PathBuf, String> {
+    if let Some(custom) =
+        crate::modules::workbuddy_settings::load_workbuddy_settings().executable_path
+    {
+        let expanded = crate::modules::workbuddy_settings::expand_environment_path(&custom);
+        let custom = normalize_custom_path(Some(&expanded));
+        if let Some(custom) = custom {
+            if let Some(exec) = resolve_workbuddy_macos_exec_path(&custom) {
+                return Ok(exec);
+            }
+        }
+        crate::modules::logger::log_warn(&format!(
+            "[WorkBuddy Resolve] 手动启动路径无效，继续自动探测: {}",
+            expanded
+        ));
+    }
     if let Some(custom) = normalize_custom_path(Some(&config::get_user_config().workbuddy_app_path))
     {
         if let Some(exec) = resolve_workbuddy_macos_exec_path(&custom) {
             return Ok(exec);
         }
-        return Err(app_path_missing_error("workbuddy"));
+        crate::modules::logger::log_warn(&format!(
+            "[WorkBuddy Resolve] 通用配置启动路径无效，继续自动探测: {}",
+            custom
+        ));
     }
 
     if let Some(detected) = detect_workbuddy_exec_path() {
@@ -4475,6 +4721,18 @@ fn extract_user_data_dir_from_command_line(command_line: &str) -> Option<String>
         index += 1;
     }
     None
+}
+
+fn command_line_starts_with_node_executable(command_line: &str) -> bool {
+    let Some(first) = split_command_tokens(command_line).into_iter().next() else {
+        return false;
+    };
+    let name = Path::new(&first)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    name == "node.exe" || name == "node"
 }
 
 #[cfg(target_os = "macos")]
@@ -6103,6 +6361,222 @@ public class Win32 {{
 }
 
 #[cfg(target_os = "windows")]
+struct WorkBuddyWindowEnumContext {
+    pids: HashSet<u32>,
+    handles: Vec<windows::Win32::Foundation::HWND>,
+}
+
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn collect_workbuddy_window(
+    hwnd: windows::Win32::Foundation::HWND,
+    lparam: windows::Win32::Foundation::LPARAM,
+) -> windows::Win32::Foundation::BOOL {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowThreadProcessId, IsWindow, IsWindowVisible,
+    };
+
+    let context = lparam.0 as *mut WorkBuddyWindowEnumContext;
+    if context.is_null() || !IsWindow(hwnd).as_bool() || !IsWindowVisible(hwnd).as_bool() {
+        return windows::Win32::Foundation::BOOL(1);
+    }
+
+    let mut pid = 0_u32;
+    if GetWindowThreadProcessId(hwnd, Some(&mut pid)) != 0 && (*context).pids.contains(&pid) {
+        (*context).handles.push(hwnd);
+    }
+    windows::Win32::Foundation::BOOL(1)
+}
+
+#[cfg(target_os = "windows")]
+fn enumerate_workbuddy_windows(
+    pids: &HashSet<u32>,
+) -> Result<Vec<windows::Win32::Foundation::HWND>, String> {
+    use windows::Win32::Foundation::LPARAM;
+    use windows::Win32::UI::WindowsAndMessaging::EnumWindows;
+
+    let mut context = WorkBuddyWindowEnumContext {
+        pids: pids.clone(),
+        handles: Vec::new(),
+    };
+    unsafe {
+        EnumWindows(
+            Some(collect_workbuddy_window),
+            LPARAM(&mut context as *mut WorkBuddyWindowEnumContext as isize),
+        )
+        .map_err(|error| format!("枚举 WorkBuddy 窗口失败: {error}"))?;
+    }
+    Ok(context.handles)
+}
+
+/// Activate the current WorkBuddy window without trusting a cached MainWindowHandle.
+/// Electron may expose several same-named processes and may replace its HWND while starting.
+#[cfg(target_os = "windows")]
+pub fn activate_workbuddy_window() -> Result<(), String> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, IsIconic, IsWindow,
+        IsWindowVisible, SetForegroundWindow, ShowWindowAsync, SW_RESTORE,
+    };
+
+    let started = Instant::now();
+    let timeout = Duration::from_secs(15);
+    let mut last_detail = "未找到可见的 WorkBuddy 顶层窗口".to_string();
+
+    while started.elapsed() < timeout {
+        let entries = collect_workbuddy_process_entries();
+        let pids = entries
+            .into_iter()
+            .map(|(pid, _)| pid)
+            .collect::<HashSet<_>>();
+        if pids.is_empty() {
+            last_detail = "WorkBuddy 进程尚未出现".to_string();
+            thread::sleep(Duration::from_millis(180));
+            continue;
+        }
+
+        let handles = enumerate_workbuddy_windows(&pids)?;
+        if handles.is_empty() {
+            last_detail = format!(
+                "已找到 {} 个 WorkBuddy 进程，但没有可见顶层窗口",
+                pids.len()
+            );
+            thread::sleep(Duration::from_millis(180));
+            continue;
+        }
+
+        for hwnd in handles {
+            unsafe {
+                if !IsWindow(hwnd).as_bool() || !IsWindowVisible(hwnd).as_bool() {
+                    continue;
+                }
+                if IsIconic(hwnd).as_bool() {
+                    let _ = ShowWindowAsync(hwnd, SW_RESTORE);
+                }
+                let _ = BringWindowToTop(hwnd);
+                let requested = SetForegroundWindow(hwnd).as_bool();
+                thread::sleep(Duration::from_millis(90));
+
+                let foreground = GetForegroundWindow();
+                let mut foreground_pid = 0_u32;
+                GetWindowThreadProcessId(foreground, Some(&mut foreground_pid));
+                if foreground_pid != 0 && pids.contains(&foreground_pid) {
+                    crate::modules::logger::log_info(&format!(
+                        "[WorkBuddy Focus] 激活窗口成功 hwnd={} pid={} requested={}",
+                        hwnd.0 as usize, foreground_pid, requested
+                    ));
+                    return Ok(());
+                }
+                last_detail = if requested {
+                    "SetForegroundWindow 已调用，但前台窗口仍属于其它进程".to_string()
+                } else {
+                    "Windows 拒绝前台窗口切换，可能是权限级别或前台锁定限制".to_string()
+                };
+            }
+        }
+        thread::sleep(Duration::from_millis(180));
+    }
+
+    Err(format!(
+        "WorkBuddy 窗口激活超时（{}ms）：{}",
+        started.elapsed().as_millis(),
+        last_detail
+    ))
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn activate_workbuddy_window_for_pid(pid: u32) -> Result<(), String> {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, IsIconic, IsWindow,
+        IsWindowVisible, SetForegroundWindow, ShowWindowAsync, SW_RESTORE,
+    };
+
+    if pid == 0 {
+        return Err("WorkBuddy 启动 PID 无效".to_string());
+    }
+
+    let started = Instant::now();
+    let timeout = Duration::from_secs(15);
+    let target_pids = HashSet::from([pid]);
+    let mut last_detail = "未找到本次启动实例的可见顶层窗口".to_string();
+
+    while started.elapsed() < timeout {
+        if !is_pid_running(pid) {
+            last_detail = "本次启动的 WorkBuddy 进程已退出".to_string();
+            thread::sleep(Duration::from_millis(180));
+            continue;
+        }
+
+        let handles = enumerate_workbuddy_windows(&target_pids)?;
+        if handles.is_empty() {
+            last_detail = "本次启动实例尚未出现可见顶层窗口".to_string();
+            thread::sleep(Duration::from_millis(180));
+            continue;
+        }
+
+        for hwnd in handles {
+            unsafe {
+                if !IsWindow(hwnd).as_bool() || !IsWindowVisible(hwnd).as_bool() {
+                    continue;
+                }
+                if IsIconic(hwnd).as_bool() {
+                    let _ = ShowWindowAsync(hwnd, SW_RESTORE);
+                }
+                let _ = BringWindowToTop(hwnd);
+                let requested = SetForegroundWindow(hwnd).as_bool();
+                thread::sleep(Duration::from_millis(90));
+
+                let foreground = GetForegroundWindow();
+                let mut foreground_pid = 0_u32;
+                GetWindowThreadProcessId(foreground, Some(&mut foreground_pid));
+                if foreground_pid == pid {
+                    crate::modules::logger::log_info(&format!(
+                        "[WorkBuddy Focus] 激活本次启动窗口成功 hwnd={} pid={} requested={}",
+                        hwnd.0 as usize, foreground_pid, requested
+                    ));
+                    return Ok(());
+                }
+                last_detail = if requested {
+                    "SetForegroundWindow 已调用，但前台窗口仍未属于本次启动进程".to_string()
+                } else {
+                    "Windows 拒绝前台窗口切换，可能是权限级别或前台锁定限制".to_string()
+                };
+            }
+        }
+        thread::sleep(Duration::from_millis(180));
+    }
+
+    Err(format!(
+        "WorkBuddy 本次启动窗口激活超时（{}ms）：{}",
+        started.elapsed().as_millis(),
+        last_detail
+    ))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub fn activate_workbuddy_window() -> Result<(), String> {
+    let pid = resolve_workbuddy_pid(None, None)
+        .ok_or_else(|| "WorkBuddy 进程未运行，无法定位窗口".to_string())?;
+    focus_window_by_pid(pid).map_err(|error| format!("WorkBuddy 窗口激活失败: {error}"))
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+pub(crate) fn activate_workbuddy_window_for_pid(pid: u32) -> Result<(), String> {
+    if pid == 0 {
+        return Err("WorkBuddy 启动 PID 无效".to_string());
+    }
+    focus_window_by_pid(pid).map_err(|error| format!("WorkBuddy 窗口激活失败: {error}"))
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+pub fn activate_workbuddy_window() -> Result<(), String> {
+    Err("当前平台不支持 WorkBuddy 窗口激活".to_string())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+pub(crate) fn activate_workbuddy_window_for_pid(_pid: u32) -> Result<(), String> {
+    Err("当前平台不支持 WorkBuddy 窗口激活".to_string())
+}
+
+#[cfg(target_os = "windows")]
 pub fn focus_current_process_main_window() -> Result<(), String> {
     focus_window_by_pid(std::process::id())
 }
@@ -6810,15 +7284,21 @@ fn collect_codebuddy_process_entries_from_sysinfo_fallback(
 }
 
 #[cfg(target_os = "windows")]
-fn collect_workbuddy_process_entries_from_powershell(
-    expected_exe_path: &str,
-) -> Vec<(u32, Option<String>)> {
+fn collect_workbuddy_process_entries_from_powershell() -> Result<Vec<(u32, Option<String>)>, String>
+{
     let mut entries = Vec::new();
-    let process_name = Path::new(expected_exe_path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("WorkBuddy.exe");
-    let script = build_windows_path_filtered_process_probe_script(process_name, expected_exe_path);
+    let script = r#"
+$processes = Get-CimInstance Win32_Process -Filter "Name='WorkBuddy.exe' OR Name='node.exe'"
+foreach ($process in $processes) {
+  $name = [string]$process.Name
+  $cmd = [string]$process.CommandLine
+  $lower = $cmd.ToLowerInvariant()
+  $isWorkBuddy = $name.Equals('WorkBuddy.exe', [System.StringComparison]::OrdinalIgnoreCase) -or
+    $lower.Contains('workbuddy') -or $lower.Contains('.workbuddy')
+  if (-not $isWorkBuddy) { continue }
+  "$($process.ProcessId)|$cmd"
+}
+"#;
     let output = powershell_output_with_timeout(
         &["-NoProfile", "-Command", &script],
         WINDOWS_PROCESS_PROBE_TIMEOUT,
@@ -6834,7 +7314,7 @@ fn collect_workbuddy_process_entries_from_powershell(
                     err
                 ));
             }
-            return entries;
+            return Err(format!("PowerShell 进程探测失败: {err}"));
         }
     };
     if !output.status.success() {
@@ -6844,7 +7324,10 @@ fn collect_workbuddy_process_entries_from_powershell(
             output.status,
             stderr.trim()
         ));
-        return entries;
+        return Err(format!(
+            "PowerShell 进程探测返回非 0 状态: {}",
+            output.status
+        ));
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
     for line in stdout.lines() {
@@ -6871,33 +7354,19 @@ fn collect_workbuddy_process_entries_from_powershell(
                 Some(normalized)
             }
         });
+        if command_line_starts_with_node_executable(cmdline) && dir.is_none() {
+            continue;
+        }
         entries.push((pid, dir));
     }
     entries.sort_by_key(|(pid, _)| *pid);
     entries.dedup_by(|a, b| a.0 == b.0);
-    entries
+    Ok(entries)
 }
 
 #[cfg(target_os = "windows")]
-fn collect_workbuddy_process_entries_from_sysinfo_fallback(
-    expected_exe_path: &str,
-) -> Vec<(u32, Option<String>)> {
-    let expected = normalize_path_for_compare(expected_exe_path);
-    if expected.is_empty() {
-        return Vec::new();
-    }
-
-    let expected_file_name = Path::new(expected_exe_path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("workbuddy.exe")
-        .to_ascii_lowercase();
-
+fn collect_workbuddy_process_entries_from_sysinfo_fallback() -> Vec<(u32, Option<String>)> {
     let mut entries: Vec<(u32, Option<String>)> = Vec::new();
-    let mut candidates = 0usize;
-    let mut path_mismatch = 0usize;
-    let mut missing_exe = 0usize;
-    let mut cmdline_fallback_hit = 0usize;
 
     let mut system = System::new();
     system.refresh_processes_specifics(
@@ -6928,54 +7397,32 @@ fn collect_workbuddy_process_entries_from_sysinfo_fallback(
             .collect::<Vec<String>>()
             .join(" ");
 
-        let is_workbuddy = name == expected_file_name
-            || exe_path.ends_with(&format!("\\{}", expected_file_name))
-            || name == "workbuddy.exe"
+        let is_workbuddy = name == "workbuddy.exe"
             || exe_path.ends_with("\\workbuddy.exe")
-            || exe_path.contains("\\workbuddy\\");
+            || ((name == "node.exe" || exe_path.ends_with("\\node.exe"))
+                && (args_line.contains("workbuddy") || args_line.contains(".workbuddy")));
         if !is_workbuddy
             || is_helper_command_line(&args_line)
             || args_line.contains("crashpad_handler")
         {
             continue;
         }
-        candidates += 1;
-
-        let (actual, used_cmdline_fallback) = resolve_windows_process_exe_for_match(process);
-        match actual {
-            Some(actual_path) if actual_path == expected => {
-                if used_cmdline_fallback {
-                    cmdline_fallback_hit += 1;
-                }
-                let dir = extract_user_data_dir(process.cmd()).and_then(|value| {
-                    let normalized = normalize_path_for_compare(&value);
-                    if normalized.is_empty() {
-                        None
-                    } else {
-                        Some(normalized)
-                    }
-                });
-                entries.push((pid_u32, dir));
+        let dir = extract_user_data_dir(process.cmd()).and_then(|value| {
+            let normalized = normalize_path_for_compare(&value);
+            if normalized.is_empty() {
+                None
+            } else {
+                Some(normalized)
             }
-            Some(_) => path_mismatch += 1,
-            None => missing_exe += 1,
+        });
+        if (name == "node.exe" || exe_path.ends_with("\\node.exe")) && dir.is_none() {
+            continue;
         }
+        entries.push((pid_u32, dir));
     }
 
     entries.sort_by_key(|(pid, _)| *pid);
     entries.dedup_by(|a, b| a.0 == b.0);
-
-    if entries.is_empty() {
-        crate::modules::logger::log_warn(&format!(
-            "[WorkBuddy Probe] sysinfo fallback no match: expected={}, candidates={}, path_mismatch={}, missing_exe={}, cmdline_fallback_hit={}",
-            expected, candidates, path_mismatch, missing_exe, cmdline_fallback_hit
-        ));
-    } else {
-        crate::modules::logger::log_info(&format!(
-            "[WorkBuddy Probe] sysinfo fallback matched: expected={}, matched={}, candidates={}, path_mismatch={}, missing_exe={}, cmdline_fallback_hit={}",
-            expected, entries.len(), candidates, path_mismatch, missing_exe, cmdline_fallback_hit
-        ));
-    }
 
     entries
 }
@@ -7527,25 +7974,43 @@ pub fn collect_trae_process_entries_for_platform(
     }
 }
 
-pub fn collect_workbuddy_process_entries() -> Vec<(u32, Option<String>)> {
-    let expected_launch = resolve_expected_workbuddy_launch_path_for_match();
-    if expected_launch.is_none() {
-        return Vec::new();
+#[cfg(target_os = "windows")]
+fn resolve_workbuddy_probe_result(
+    powershell: Result<Vec<(u32, Option<String>)>, String>,
+    fallback: Vec<(u32, Option<String>)>,
+) -> Result<Vec<(u32, Option<String>)>, String> {
+    match powershell {
+        Ok(entries) if !entries.is_empty() => Ok(entries),
+        Ok(_) => Ok(fallback),
+        Err(_) if !fallback.is_empty() => Ok(fallback),
+        Err(error) => Err(error),
     }
+}
 
+#[cfg(target_os = "windows")]
+fn collect_workbuddy_process_entries_checked() -> Result<Vec<(u32, Option<String>)>, String> {
+    let powershell = collect_workbuddy_process_entries_from_powershell();
+    let fallback = if powershell
+        .as_ref()
+        .map(|entries| entries.is_empty())
+        .unwrap_or(true)
+    {
+        collect_workbuddy_process_entries_from_sysinfo_fallback()
+    } else {
+        Vec::new()
+    };
+    resolve_workbuddy_probe_result(powershell, fallback)
+}
+
+pub fn collect_workbuddy_process_entries() -> Vec<(u32, Option<String>)> {
     #[cfg(target_os = "windows")]
     {
-        let expected = expected_launch
-            .as_deref()
-            .expect("expected launch path must exist");
-        let entries = collect_workbuddy_process_entries_from_powershell(expected);
-        if !entries.is_empty() {
-            return entries;
-        }
-        crate::modules::logger::log_warn(
-            "[WorkBuddy Probe] PowerShell returned empty; fallback to sysinfo probe",
-        );
-        return collect_workbuddy_process_entries_from_sysinfo_fallback(expected);
+        return collect_workbuddy_process_entries_checked().unwrap_or_else(|error| {
+            crate::modules::logger::log_warn(&format!(
+                "[WorkBuddy Probe] 进程探测失败，返回空结果: {error}"
+            ));
+            Vec::new()
+        });
     }
 
     #[cfg(target_os = "macos")]
@@ -7733,8 +8198,16 @@ fn get_default_trae_user_data_dir_for_platform_for_os(
         .map(|value| value.to_string_lossy().to_string())
 }
 
+pub fn get_default_workbuddy_user_data_dir() -> Result<std::path::PathBuf, String> {
+    dirs::home_dir()
+        .map(|home| home.join(".workbuddy").join("app"))
+        .ok_or_else(|| "无法获取用户主目录".to_string())
+}
+
 fn get_default_workbuddy_user_data_dir_for_os() -> Option<String> {
-    None
+    get_default_workbuddy_user_data_dir()
+        .ok()
+        .map(|path| path.to_string_lossy().to_string())
 }
 
 pub fn focus_vscode_instance(
@@ -7907,6 +8380,7 @@ fn close_managed_instances_common<CollectEntries, SelectMainPids, CollectRemaini
     failure_message: &str,
     user_data_dirs: &[String],
     timeout_secs: u64,
+    allow_elevation: bool,
     collect_entries: CollectEntries,
     select_main_pids: SelectMainPids,
     collect_remaining_entries: CollectRemainingEntries,
@@ -7979,11 +8453,13 @@ where
         }
     }
 
-    if let Err(err) = close_pids(&pids, timeout_secs) {
+    let mut close_error = None;
+    if let Err(err) = close_pids_with_options(&pids, timeout_secs, allow_elevation) {
         crate::modules::logger::log_warn(&format!(
             "[{}] close_pids returned error: {}",
             log_prefix, err
         ));
+        close_error = Some(err);
     }
 
     let mut remaining_entries = collect_remaining_entries(&target_dirs);
@@ -8003,11 +8479,12 @@ where
                 log_prefix,
                 summarize_pid_list_for_log(&remaining_pids)
             ));
-            if let Err(err) = close_pids(&remaining_pids, 6) {
+            if let Err(err) = close_pids_with_options(&remaining_pids, 6, allow_elevation) {
                 crate::modules::logger::log_warn(&format!(
                     "[{}] retry close_pids returned error: {}",
                     log_prefix, err
                 ));
+                close_error = Some(err);
             }
             remaining_entries = collect_remaining_entries(&target_dirs);
         }
@@ -8023,10 +8500,19 @@ where
             log_prefix,
             summarize_process_entries_for_log(&remaining_entries)
         ));
+        let close_error_detail = close_error
+            .map(|error| {
+                format!(
+                    "; close_error={}",
+                    summarize_text_for_process_log(&error, 240)
+                )
+            })
+            .unwrap_or_default();
         return Err(format!(
-            "{} ({})",
+            "{} ({}){}",
             failure_message,
-            summarize_pid_list_for_log(&remaining_pids)
+            summarize_pid_list_for_log(&remaining_pids),
+            close_error_detail
         ));
     }
 
@@ -8060,6 +8546,7 @@ pub fn close_antigravity_instances(
         "无法关闭受管 Antigravity IDE 实例进程，请手动关闭后重试",
         user_data_dirs,
         timeout_secs,
+        false,
         collect_antigravity_process_entries,
         |entries, target_dirs| {
             select_main_pids_by_target_dirs(entries, target_dirs, default_dir.as_deref())
@@ -8105,6 +8592,7 @@ pub fn close_antigravity_legacy_instances(
         "无法关闭受管 Antigravity 实例进程，请手动关闭后重试",
         user_data_dirs,
         timeout_secs,
+        false,
         collect_antigravity_legacy_process_entries,
         |entries, target_dirs| {
             select_main_pids_by_target_dirs(entries, target_dirs, default_dir.as_deref())
@@ -8131,6 +8619,7 @@ fn close_user_data_dir_scoped_instances(
     failure_message: &str,
     user_data_dirs: &[String],
     timeout_secs: u64,
+    allow_elevation: bool,
     default_dir: Option<String>,
     collect_entries: fn() -> Vec<(u32, Option<String>)>,
 ) -> Result<(), String> {
@@ -8151,6 +8640,7 @@ fn close_user_data_dir_scoped_instances(
         failure_message,
         user_data_dirs,
         timeout_secs,
+        allow_elevation,
         collect_entries,
         |entries, target_dirs| {
             select_main_pids_by_target_dirs(entries, target_dirs, default_dir.as_deref())
@@ -8177,7 +8667,8 @@ pub fn close_codebuddy_instances(
         "Unable to close managed CodeBuddy instances; please close them manually and retry",
         user_data_dirs,
         timeout_secs,
-        default_dir,
+        false,
+        default_dir.clone(),
         collect_codebuddy_process_entries,
     )
 }
@@ -8195,6 +8686,7 @@ pub fn close_codebuddy_cn_instances(
         "Unable to close managed CodeBuddy CN instances; please close them manually and retry",
         user_data_dirs,
         timeout_secs,
+        false,
         default_dir,
         collect_codebuddy_cn_process_entries,
     )
@@ -8210,6 +8702,7 @@ pub fn close_qoder_instances(user_data_dirs: &[String], timeout_secs: u64) -> Re
         "Unable to close managed Qoder instances; please close them manually and retry",
         user_data_dirs,
         timeout_secs,
+        false,
         default_dir,
         collect_qoder_process_entries,
     )
@@ -8225,6 +8718,7 @@ pub fn close_trae_instances(user_data_dirs: &[String], timeout_secs: u64) -> Res
         "Unable to close managed Trae instances; please close them manually and retry",
         user_data_dirs,
         timeout_secs,
+        false,
         default_dir,
         collect_trae_process_entries,
     )
@@ -8298,8 +8792,7 @@ fn launch_trae_macos_with_verification(
 
         let probe_started = Instant::now();
         while probe_started.elapsed() < probe_timeout {
-            if let Some(resolved_pid) =
-                resolve_trae_pid_for_platform(None, user_data_dir, platform)
+            if let Some(resolved_pid) = resolve_trae_pid_for_platform(None, user_data_dir, platform)
             {
                 crate::modules::logger::log_info(&format!(
                     "[Trae Start] platform={} 已匹配主进程 pid={}（{} 后）",
@@ -8354,10 +8847,9 @@ fn launch_trae_macos_with_verification(
                 let probe_started = Instant::now();
                 while probe_started.elapsed() < probe_timeout {
                     if let Some(resolved_pid) =
-                        resolve_trae_pid_for_platform(None, user_data_dir, platform)
-                            .or_else(|| {
-                                resolve_trae_pid_loose_for_platform(None, user_data_dir, platform)
-                            })
+                        resolve_trae_pid_for_platform(None, user_data_dir, platform).or_else(|| {
+                            resolve_trae_pid_loose_for_platform(None, user_data_dir, platform)
+                        })
                     {
                         return Ok(resolved_pid);
                     }
@@ -8475,6 +8967,7 @@ pub fn close_trae_platform_instances(
         ),
         user_data_dirs,
         timeout_secs,
+        false,
         || collect_trae_process_entries_for_platform(platform),
         |entries, target_dirs| {
             select_main_pids_by_target_dirs(entries, target_dirs, default_dir.as_deref())
@@ -8520,15 +9013,44 @@ pub fn close_workbuddy_instances(
             Some(trimmed.to_string())
         })
         .collect();
-    close_user_data_dir_scoped_instances(
+    #[cfg(target_os = "windows")]
+    collect_workbuddy_process_entries_checked()
+        .map_err(|error| format!("WorkBuddy 进程探测失败，已取消切换: {error}"))?;
+
+    let close_result = close_user_data_dir_scoped_instances(
         "WorkBuddy Close",
         "WorkBuddy",
         "Unable to close managed WorkBuddy instances; please close them manually and retry",
         &normalized,
         timeout_secs,
-        default_dir,
+        true,
+        default_dir.clone(),
         collect_workbuddy_process_entries,
-    )
+    );
+
+    #[cfg(target_os = "windows")]
+    {
+        close_result?;
+        let entries = collect_workbuddy_process_entries_checked()
+            .map_err(|error| format!("WorkBuddy 关闭后进程复查失败，已取消切换: {error}"))?;
+        let target_dirs = normalized
+            .iter()
+            .map(|value| normalize_path_for_compare(value))
+            .filter(|value| !value.is_empty())
+            .collect::<HashSet<_>>();
+        let remaining =
+            filter_entries_by_target_dirs(entries, &target_dirs, default_dir.as_deref());
+        if !remaining.is_empty() {
+            return Err(format!(
+                "WorkBuddy 关闭后仍检测到目标实例: {}",
+                summarize_process_entries_for_log(&remaining)
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    close_result
 }
 
 fn request_antigravity_graceful_close(pid: u32) {
@@ -8639,7 +9161,7 @@ fn send_close_signal(pid: u32) {
     {
         use std::os::windows::process::CommandExt;
 
-        crate::modules::logger::log_info(&format!("[AG Close] taskkill start pid={}", pid));
+        crate::modules::logger::log_info(&format!("[Process Close] taskkill start pid={}", pid));
         let output = Command::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .creation_flags(CREATE_NO_WINDOW)
@@ -8651,13 +9173,13 @@ fn send_close_signal(pid: u32) {
             Ok(value) => {
                 if value.status.success() {
                     crate::modules::logger::log_info(&format!(
-                        "[AG Close] taskkill success pid={} status={}",
+                        "[Process Close] taskkill success pid={} status={}",
                         pid, value.status
                     ));
                 } else {
                     let stderr = String::from_utf8_lossy(&value.stderr);
                     crate::modules::logger::log_warn(&format!(
-                        "[AG Close] taskkill failed pid={} status={} stderr={}",
+                        "[Process Close] taskkill failed pid={} status={} stderr={}",
                         pid,
                         value.status,
                         stderr.trim()
@@ -8666,7 +9188,7 @@ fn send_close_signal(pid: u32) {
             }
             Err(err) => {
                 crate::modules::logger::log_warn(&format!(
-                    "[AG Close] taskkill error pid={} err={}",
+                    "[Process Close] taskkill error pid={} err={}",
                     pid, err
                 ));
             }
@@ -8802,6 +9324,14 @@ fn collect_running_pids(pids: &[u32]) -> Vec<u32> {
 }
 
 fn close_pids(pids: &[u32], timeout_secs: u64) -> Result<(), String> {
+    close_pids_with_options(pids, timeout_secs, false)
+}
+
+fn close_pids_with_options(
+    pids: &[u32],
+    timeout_secs: u64,
+    allow_elevation: bool,
+) -> Result<(), String> {
     if pids.is_empty() {
         return Ok(());
     }
@@ -8825,24 +9355,154 @@ fn close_pids(pids: &[u32], timeout_secs: u64) -> Result<(), String> {
         send_close_signal(*pid);
     }
 
-    if wait_pids_exit(&targets, timeout_secs) {
+    // taskkill /F should finish almost immediately. WorkBuddy may be elevated,
+    // so do not make the user wait for the full close timeout before showing UAC.
+    let initial_wait_secs = if allow_elevation {
+        timeout_secs.min(2)
+    } else {
+        timeout_secs
+    };
+    if wait_pids_exit(&targets, initial_wait_secs) {
         crate::modules::logger::log_info(&format!(
             "[ClosePids] all exited, targets={}",
             summarize_pid_list_for_log(&targets)
         ));
         Ok(())
     } else {
-        let remaining: Vec<u32> = targets
+        let mut remaining: Vec<u32> = targets
             .iter()
             .copied()
             .filter(|pid| is_pid_running(*pid))
             .collect();
+
+        let mut elevation_errors = Vec::new();
+        if allow_elevation && !remaining.is_empty() {
+            crate::modules::logger::log_warn(&format!(
+                "[WorkBuddy Close] 普通权限无法关闭进程，尝试请求管理员权限 targets={}",
+                summarize_pid_list_for_log(&remaining)
+            ));
+            for pid in remaining.iter().copied() {
+                if let Err(error) = run_elevated_taskkill(pid) {
+                    elevation_errors.push(format!("pid {}: {}", pid, error));
+                }
+            }
+            if wait_pids_exit(&remaining, timeout_secs.max(3).min(20)) {
+                crate::modules::logger::log_info(&format!(
+                    "[WorkBuddy Close] 管理员权限关闭成功 targets={}",
+                    summarize_pid_list_for_log(&targets)
+                ));
+                return Ok(());
+            }
+            remaining = targets
+                .iter()
+                .copied()
+                .filter(|pid| is_pid_running(*pid))
+                .collect();
+            if !elevation_errors.is_empty() {
+                crate::modules::logger::log_warn(&format!(
+                    "[WorkBuddy Close] 管理员权限关闭失败: {}",
+                    elevation_errors.join("; ")
+                ));
+            }
+        }
         crate::modules::logger::log_error(&format!(
             "[ClosePids] timeout, remaining={}",
             summarize_pid_list_for_log(&remaining)
         ));
-        Err("无法关闭实例进程，请手动关闭后重试".to_string())
+        if allow_elevation {
+            let error_detail = if elevation_errors.is_empty() {
+                "管理员 taskkill 已执行但目标进程仍存活".to_string()
+            } else {
+                format!("管理员关闭失败: {}", elevation_errors.join("; "))
+            };
+            Err(format!(
+                "{}; 仍有进程未退出: {}",
+                error_detail,
+                summarize_pid_list_for_log(&remaining)
+            ))
+        } else {
+            Err("无法关闭实例进程，请手动关闭后重试".to_string())
+        }
     }
+}
+
+#[cfg(target_os = "windows")]
+fn build_elevated_taskkill_arguments(pid: u32) -> Vec<String> {
+    vec![
+        "/PID".to_string(),
+        pid.to_string(),
+        "/T".to_string(),
+        "/F".to_string(),
+    ]
+}
+
+#[cfg(target_os = "windows")]
+fn run_elevated_taskkill(pid: u32) -> Result<(), String> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::{w, PCWSTR};
+    use windows::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, HWND, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+    use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+    use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+
+    if pid == 0 || !is_pid_running(pid) {
+        return Ok(());
+    }
+
+    let parameters = build_elevated_taskkill_arguments(pid).join(" ");
+    let parameters_wide: Vec<u16> = std::ffi::OsStr::new(&parameters)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut execute_info = SHELLEXECUTEINFOW {
+        cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
+        fMask: SEE_MASK_NOCLOSEPROCESS,
+        hwnd: HWND::default(),
+        lpVerb: w!("runas"),
+        lpFile: w!("taskkill.exe"),
+        lpParameters: PCWSTR(parameters_wide.as_ptr()),
+        nShow: SW_HIDE.0,
+        ..Default::default()
+    };
+
+    crate::modules::logger::log_info(&format!(
+        "[WorkBuddy Close] 请求管理员权限执行 taskkill pid={}",
+        pid
+    ));
+    if let Err(error) = unsafe { ShellExecuteExW(&mut execute_info) } {
+        if error.code().0 as u32 == ERROR_CANCELLED.0 {
+            return Err("用户取消了管理员权限确认".to_string());
+        }
+        return Err(format!("启动管理员关闭命令失败: {}", error));
+    }
+
+    if execute_info.hProcess.is_invalid() {
+        return Err("管理员关闭命令未返回进程句柄".to_string());
+    }
+    let wait_result = unsafe { WaitForSingleObject(execute_info.hProcess, 20_000) };
+    if wait_result != WAIT_OBJECT_0 {
+        unsafe {
+            let _ = CloseHandle(execute_info.hProcess);
+        }
+        return Err("管理员关闭命令超时".to_string());
+    }
+
+    let mut exit_code = 1u32;
+    let exit_result = unsafe { GetExitCodeProcess(execute_info.hProcess, &mut exit_code) };
+    unsafe {
+        let _ = CloseHandle(execute_info.hProcess);
+    }
+    exit_result.map_err(|error| format!("读取管理员关闭结果失败: {}", error))?;
+    if exit_code == 0 {
+        Ok(())
+    } else {
+        Err(format!("管理员 taskkill 退出码 {}", exit_code))
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn run_elevated_taskkill(_pid: u32) -> Result<(), String> {
+    Err("当前平台不支持管理员 taskkill".to_string())
 }
 
 fn is_legacy_platform_adapter_executable(executable: &str) -> bool {
@@ -10387,17 +11047,13 @@ fn get_default_codex_home() -> std::path::PathBuf {
 pub fn close_codex_default(timeout_secs: u64) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        let default_home = get_default_codex_home()
-            .to_string_lossy()
-            .to_string();
+        let default_home = get_default_codex_home().to_string_lossy().to_string();
         return close_codex_instances(&[default_home], timeout_secs);
     }
 
     #[cfg(target_os = "windows")]
     {
-        let default_home = get_default_codex_home()
-            .to_string_lossy()
-            .to_string();
+        let default_home = get_default_codex_home().to_string_lossy().to_string();
         return close_codex_instances(&[default_home], timeout_secs);
     }
 
@@ -10527,11 +11183,8 @@ pub fn close_codex_instances(codex_homes: &[String], timeout_secs: u64) -> Resul
             return Ok(());
         }
 
-        let default_home = normalize_path_for_compare(
-            &get_default_codex_home()
-                .to_string_lossy()
-                .to_string(),
-        );
+        let default_home =
+            normalize_path_for_compare(&get_default_codex_home().to_string_lossy().to_string());
         let entries = collect_codex_process_entries();
         let mut pids: Vec<u32> = entries
             .iter()
@@ -10613,11 +11266,8 @@ pub fn close_codex_instances(codex_homes: &[String], timeout_secs: u64) -> Resul
     {
         crate::modules::logger::log_info("正在关闭受管 Codex 实例...");
 
-        let default_home = normalize_path_for_compare(
-            &get_default_codex_home()
-                .to_string_lossy()
-                .to_string(),
-        );
+        let default_home =
+            normalize_path_for_compare(&get_default_codex_home().to_string_lossy().to_string());
         let mut target_app_dirs: HashSet<String> = HashSet::new();
         let mut includes_default = false;
 
@@ -10645,9 +11295,7 @@ pub fn close_codex_instances(codex_homes: &[String], timeout_secs: u64) -> Resul
 
         let current_default_app_dirs = if includes_default {
             get_default_codex_windows_app_user_data_dirs(
-                get_default_codex_home()
-                    .to_string_lossy()
-                    .as_ref(),
+                get_default_codex_home().to_string_lossy().as_ref(),
             )
         } else {
             HashSet::new()
@@ -12258,6 +12906,17 @@ pub fn start_workbuddy_default_with_args_with_new_window(
         let child = spawn_command_with_trace(&mut cmd)
             .map_err(|e| format!("启动 WorkBuddy 失败：{}", e))?;
         crate::modules::logger::log_info("WorkBuddy 默认实例启动命令已发送");
+        let probe_started = Instant::now();
+        while probe_started.elapsed() < Duration::from_secs(6) {
+            if let Some(resolved_pid) = resolve_workbuddy_pid(None, None) {
+                return Ok(resolved_pid);
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+        crate::modules::logger::log_warn(&format!(
+            "[WorkBuddy Start] 启动后 6s 内未匹配到默认实例 PID，回退 child pid={}",
+            child.id()
+        ));
         return Ok(child.id());
     }
 
@@ -12285,6 +12944,17 @@ pub fn start_workbuddy_default_with_args_with_new_window(
         let child =
             spawn_detached_unix(&mut cmd).map_err(|e| format!("启动 WorkBuddy 失败：{}", e))?;
         crate::modules::logger::log_info("WorkBuddy 默认实例启动命令已发送");
+        let probe_started = Instant::now();
+        while probe_started.elapsed() < Duration::from_secs(6) {
+            if let Some(resolved_pid) = resolve_workbuddy_pid(None, None) {
+                return Ok(resolved_pid);
+            }
+            thread::sleep(Duration::from_millis(200));
+        }
+        crate::modules::logger::log_warn(&format!(
+            "[WorkBuddy Start] 启动后 6s 内未匹配到默认实例 PID，回退 child pid={}",
+            child.id()
+        ));
         return Ok(child.id());
     }
 
@@ -12909,11 +13579,7 @@ pub fn start_trae_platform_default_with_args_with_new_window(
         let _ = use_new_window;
 
         return launch_trae_macos_with_verification(
-            platform,
-            &app_root,
-            &args,
-            None,
-            /* prefer_new_instance */ false,
+            platform, &app_root, &args, None, /* prefer_new_instance */ false,
         );
     }
 
@@ -13123,6 +13789,7 @@ pub fn close_vscode(user_data_dirs: &[String], timeout_secs: u64) -> Result<(), 
         "无法关闭受管 VS Code 实例进程，请手动关闭后重试",
         user_data_dirs,
         timeout_secs,
+        false,
         collect_vscode_process_entries,
         |entries, target_dirs| {
             select_main_pids_by_target_dirs(entries, target_dirs, default_dir.as_deref())
@@ -13400,8 +14067,8 @@ mod codex_path_migration_tests {
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
     use super::{
-        running_app_candidate_matches, windows_app_launch_signature,
-        windows_trae_candidate_matches_platform,
+        build_elevated_taskkill_arguments, running_app_candidate_matches,
+        windows_app_launch_signature, windows_trae_candidate_matches_platform,
     };
     use crate::modules::trae_account::TraePlatformKind;
     use std::path::Path;
@@ -13536,5 +14203,18 @@ mod tests {
             solo_cn,
             TraePlatformKind::TraeSolo
         ));
+    }
+
+    #[test]
+    fn elevated_taskkill_arguments_force_kill_process_tree() {
+        assert_eq!(
+            build_elevated_taskkill_arguments(26784),
+            vec![
+                "/PID".to_string(),
+                "26784".to_string(),
+                "/T".to_string(),
+                "/F".to_string()
+            ]
+        );
     }
 }

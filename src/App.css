@@ -918,3 +918,69 @@
     bottom: 12px;
   }
 }
+
+/* ===== 侧边栏双面板布局适配（阶段 8）===== */
+
+/* 页面自带 padding（wc-page / ck-page），主区不再重复加内边距；
+   并清除上游悬浮导航遗留的 120px 起始留白（侧边栏与内容间的灰色竖条） */
+.with-sidebar .main-wrapper {
+  padding: 0;
+  margin-inline-start: 0;
+}
+
+/* 上游 layout.css 的 .nav-item 44x44 胶囊尺寸泄漏到侧边栏导航，
+   文字被挤成竖排；恢复为自适应宽度 */
+.with-sidebar .sidebar .nav-item {
+  width: auto;
+  height: auto;
+  white-space: nowrap;
+}
+
+/* 品牌区图标与标题水平对齐 */
+.with-sidebar .sidebar-brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* 侧边栏 gh 状态指示 */
+.app-sidebar-gh {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+
+.app-sidebar-gh-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.app-sidebar-gh-dot--ok {
+  background: #16a34a;
+}
+
+/* 窄窗口：侧栏收窄为图标模式，文字隐藏 */
+@media (max-width: 860px) {
+  .with-sidebar .sidebar {
+    width: 64px;
+    padding: 20px 10px;
+  }
+
+  .with-sidebar .sidebar-brand h1,
+  .with-sidebar .nav-item span {
+    display: none;
+  }
+
+  .with-sidebar .nav-item {
+    justify-content: center;
+  }
+
+  .with-sidebar .app-sidebar-gh span:last-child {
+    display: none;
+  }
+}

@@ -5,6 +5,7 @@ pub mod quota;
 pub mod token;
 pub mod trae;
 pub mod work_cn;
+pub mod workbuddy;
 
 pub use account::{Account, AccountIndex, AccountSummary, QuotaErrorInfo};
 pub use instance::{

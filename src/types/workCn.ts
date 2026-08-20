@@ -45,6 +45,10 @@ export interface WorkCnAccountView {
   hasDevicePublicKey: boolean;
   validForSwitch: boolean;
   warnings: string[];
+  /** access token 的 exp（秒级时间戳），签到面板倒计时预警用；无法解析为 null。 */
+  tokenExpiresAt: number | null;
+  /** access token 的 iat（秒级时间戳），只用于确认 Token 是否真实轮换。 */
+  tokenIssuedAt: number | null;
 }
 
 // Result of a one-click Work CN account switch.
@@ -54,6 +58,8 @@ export interface WorkCnSwitchResult {
   userId: string | null;
   launched: boolean;
   verified: boolean;
+  /** 切换期间后端确认 access 或 refresh token 已变化，不包含凭证内容。 */
+  tokenChanged: boolean;
   githubSynced: boolean;
   warning: string | null;
 }
@@ -105,6 +111,8 @@ export interface WorkCnGitHubConfig {
   enabled: boolean;
   repository: string;
   slots: WorkCnGitHubSlot[];
+  /** 签到 workflow 文件名；旧配置缺省时后端取默认值 daily-checkin.yml。 */
+  workflowFile?: string;
 }
 
 // Result of syncing one account's credentials to GitHub.

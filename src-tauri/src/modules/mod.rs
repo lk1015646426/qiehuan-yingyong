@@ -7,6 +7,7 @@ pub mod db;
 pub mod deferred_account_rewrite;
 pub mod diagnostics;
 pub mod floating_card_window;
+pub mod gh_setup;
 pub mod i18n;
 pub mod instance;
 pub mod instance_store;
@@ -30,8 +31,14 @@ pub mod trae_instance;
 pub mod trae_oauth;
 pub mod tray;
 pub mod webkit_cache_maintenance;
+pub mod work_cn_checkin;
 pub mod work_cn_github;
 pub mod work_cn_session_watcher;
+pub mod workbuddy_account;
+pub mod workbuddy_github;
+pub mod workbuddy_session_watcher;
+pub mod workbuddy_settings;
+pub mod workbuddy_status;
 
 // 重新导出常用函数
 pub use account::*;

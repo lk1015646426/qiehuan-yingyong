@@ -1,91 +1,17 @@
 // TRAE Work CN — GitHub Secrets 同步设置对话框（开发指南 §8.5 / 阶段 6）。
 //
 // 只保存仓库 owner/repo 与「账号 → 槽位」映射，绝不保存 GitHub PAT；secret 名
-// 默认自动生成为 TRAE{N}_TOKEN / TRAE{N}_DEVICE_ID。真实同步走已登录的 gh CLI。
+// 默认自动生成为 {账号槽位名}_TOKEN / {账号槽位名}_DEVICE_ID。真实同步走已登录的 gh CLI。
 
 import { useEffect, useState } from 'react';
-import type { CSSProperties } from 'react';
 import { useWorkCnStore } from '../../stores/useWorkCnStore';
+import { accountSecretStem } from '../../utils/accountNaming';
 import type { WorkCnGitHubSlot } from '../../types/workCn';
 
 interface Props {
   open: boolean;
   onClose: () => void;
 }
-
-const overlayStyle: CSSProperties = {
-  position: 'fixed',
-  inset: 0,
-  background: 'rgba(15, 23, 42, 0.35)',
-  display: 'flex',
-  alignItems: 'center',
-  justifyContent: 'center',
-  zIndex: 1000,
-};
-
-const dialogStyle: CSSProperties = {
-  width: 520,
-  maxWidth: '92vw',
-  maxHeight: '88vh',
-  overflowY: 'auto',
-  background: '#ffffff',
-  borderRadius: 12,
-  padding: '22px 24px',
-  boxShadow: '0 12px 40px rgba(15, 23, 42, 0.25)',
-  boxSizing: 'border-box',
-};
-
-const inputStyle: CSSProperties = {
-  width: '100%',
-  height: 34,
-  padding: '0 10px',
-  fontSize: 13,
-  border: '1px solid #d7dae0',
-  borderRadius: 6,
-  boxSizing: 'border-box',
-  marginBottom: 4,
-};
-
-const actionsStyle: CSSProperties = {
-  display: 'flex',
-  justifyContent: 'flex-end',
-  gap: 8,
-  marginTop: 16,
-};
-
-const buttonStyle: CSSProperties = {
-  height: 34,
-  padding: '0 16px',
-  fontSize: 13,
-  color: '#1f2430',
-  background: '#f1f3f6',
-  border: '1px solid #d7dae0',
-  borderRadius: 6,
-  cursor: 'pointer',
-};
-
-const primaryStyle: CSSProperties = {
-  color: '#ffffff',
-  background: '#2563eb',
-  border: '1px solid #2563eb',
-};
-
-const errorStyle: CSSProperties = {
-  marginTop: 12,
-  fontSize: 12,
-  color: '#ef4444',
-  background: '#fef2f2',
-  border: '1px solid #fecaca',
-  borderRadius: 6,
-  padding: '8px 10px',
-};
-
-const noteStyle: CSSProperties = {
-  fontSize: 12,
-  color: '#8a909c',
-  lineHeight: 1.6,
-  marginTop: 4,
-};
 
 export function WorkCnSettingsDialog({ open, onClose }: Props) {
   const accounts = useWorkCnStore((s) => s.accounts);
@@ -98,7 +24,8 @@ export function WorkCnSettingsDialog({ open, onClose }: Props) {
 
   const [enabled, setEnabled] = useState(false);
   const [repository, setRepository] = useState('');
-  const [slotByAccount, setSlotByAccount] = useState<Record<string, number>>({});
+  const [workflowFile, setWorkflowFile] = useState('daily-checkin.yml');
+  const [boundIds, setBoundIds] = useState<Set<string>>(new Set());
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
@@ -114,11 +41,8 @@ export function WorkCnSettingsDialog({ open, onClose }: Props) {
     if (!open) return;
     setEnabled(githubConfig.enabled);
     setRepository(githubConfig.repository);
-    const map: Record<string, number> = {};
-    for (const slot of githubConfig.slots) {
-      map[slot.accountId] = slot.slot;
-    }
-    setSlotByAccount(map);
+    setWorkflowFile(githubConfig.workflowFile || 'daily-checkin.yml');
+    setBoundIds(new Set(githubConfig.slots.map((slot) => slot.accountId)));
     setError(null);
   }, [open, githubConfig]);
 
@@ -126,14 +50,20 @@ export function WorkCnSettingsDialog({ open, onClose }: Props) {
     return null;
   }
 
+  // 槽位号按账号列表顺序自动分配（1,2,3…），勾选即绑定，无数量上限。
+  const slotNumbers = new Map<string, number>();
+  {
+    let n = 1;
+    for (const account of accounts) {
+      if (boundIds.has(account.id)) slotNumbers.set(account.id, n++);
+    }
+  }
+
   const buildConfig = (): { config: import('../../types/workCn').WorkCnGitHubConfig; dup: boolean } => {
     const slots: WorkCnGitHubSlot[] = [];
-    const seenSlots = new Set<number>();
     for (const account of accounts) {
-      const slot = slotByAccount[account.id] ?? 0;
-      if (slot >= 1 && slot <= 4) {
-        if (seenSlots.has(slot)) return { config: githubConfig, dup: true };
-        seenSlots.add(slot);
+      const slot = slotNumbers.get(account.id);
+      if (slot !== undefined) {
         slots.push({
           slot,
           accountId: account.id,
@@ -143,7 +73,12 @@ export function WorkCnSettingsDialog({ open, onClose }: Props) {
       }
     }
     return {
-      config: { enabled, repository: repository.trim(), slots },
+      config: {
+        enabled,
+        repository: repository.trim(),
+        slots,
+        workflowFile: workflowFile.trim() || 'daily-checkin.yml',
+      },
       dup: false,
     };
   };
@@ -193,11 +128,11 @@ export function WorkCnSettingsDialog({ open, onClose }: Props) {
         : `gh 未登录${githubCliStatus.detail ? `：${githubCliStatus.detail}` : ''}`;
 
   return (
-    <div style={overlayStyle} onClick={onClose}>
-      <div style={dialogStyle} onClick={(e) => e.stopPropagation()}>
-        <h3 style={{ margin: '0 0 12px', fontSize: 16 }}>GitHub Secrets 同步设置</h3>
+    <div className="wc-overlay" onClick={onClose}>
+      <div className="wc-dialog" onClick={(e) => e.stopPropagation()}>
+        <h3 className="wc-dialog-title">GitHub Secrets 同步设置</h3>
 
-        <label style={rowLabelStyle}>
+        <label className="wc-row-label" style={{ marginTop: 0, display: 'flex', alignItems: 'center' }}>
           <input
             type="checkbox"
             checked={enabled}
@@ -206,83 +141,88 @@ export function WorkCnSettingsDialog({ open, onClose }: Props) {
           />
           启用 GitHub Secrets 同步
         </label>
-        <p style={noteStyle}>
+        <p className="wc-dialog-note">
           把每个账号的最新签到凭证（access token + 设备 ID）同步到 GitHub Actions 仓库的 Secrets。
           本软件只同步凭证、绝不在本地签到。
         </p>
 
-        <label style={rowLabelStyle}>GitHub 仓库（owner/repo）</label>
+        <label className="wc-row-label">GitHub 仓库（owner/repo）</label>
         <input
           value={repository}
           onChange={(e) => setRepository(e.target.value)}
           placeholder="lk1015646426/daily-checkin"
           disabled={!enabled}
-          style={inputStyle}
+          className="wc-input"
         />
 
-        <div style={{ marginTop: 12, fontSize: 13, color: '#1f2430' }}>
+        <label className="wc-row-label">Workflow 文件名</label>
+        <input
+          value={workflowFile}
+          onChange={(e) => setWorkflowFile(e.target.value)}
+          placeholder="daily-checkin.yml"
+          disabled={!enabled}
+          className="wc-input"
+        />
+        <p className="wc-dialog-note">
+          云端签到仓库中 workflow 文件名（.github/workflows/ 目录下），用于触发签到与查询运行状态。
+        </p>
+
+        <div style={{ marginTop: 12, fontSize: 13 }}>
           GitHub CLI 状态：<b>{cliText}</b>
         </div>
 
         <div style={{ marginTop: 12 }}>
-          <div style={rowLabelStyle}>账号 → 槽位绑定（secret 名自动为 TRAE{'{N}'}_TOKEN / TRAE{'{N}'}_DEVICE_ID）</div>
+          <div className="wc-row-label">账号 → 槽位绑定（按列表顺序自动编号，secret 名自动为「账号名_TOKEN / 账号名_DEVICE_ID」，数量不限）</div>
           {accounts.length === 0 ? (
-            <div style={noteStyle}>还没有已导入的账号。请先在主页导入账号。</div>
+            <div className="wc-dialog-note">还没有已导入的账号。请先在主页导入账号。</div>
           ) : (
-            accounts.map((account) => (
-              <div key={account.id} style={slotRowStyle}>
-                <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {account.tags?.[0] ?? account.nickname ?? account.email ?? account.userId ?? account.id}
-                </span>
-                <select
-                  value={slotByAccount[account.id] ?? 0}
-                  disabled={!enabled}
-                  onChange={(e) =>
-                    setSlotByAccount((prev) => ({
-                      ...prev,
-                      [account.id]: Number(e.target.value),
-                    }))
-                  }
-                  style={{ height: 30, fontSize: 13 }}
-                >
-                  <option value={0}>未绑定</option>
-                  <option value={1}>槽位 1</option>
-                  <option value={2}>槽位 2</option>
-                  <option value={3}>槽位 3</option>
-                  <option value={4}>槽位 4</option>
-                </select>
-              </div>
-            ))
+            accounts.map((account) => {
+              const slot = slotNumbers.get(account.id);
+              return (
+                <div key={account.id} className="wc-slot-row">
+                  <label style={{ display: 'flex', alignItems: 'center', gap: 8, flex: 1, minWidth: 0 }}>
+                    <input
+                      type="checkbox"
+                      checked={slot !== undefined}
+                      disabled={!enabled}
+                      onChange={(e) =>
+                        setBoundIds((prev) => {
+                          const next = new Set(prev);
+                          if (e.target.checked) next.add(account.id);
+                          else next.delete(account.id);
+                          return next;
+                        })
+                      }
+                    />
+                    <span className="wc-slot-row-name">
+                      {account.tags?.[0] ?? account.nickname ?? account.email ?? account.userId ?? account.id}
+                    </span>
+                  </label>
+                  {slot !== undefined ? (
+                    <span className="wc-slot-row-slot">槽位 {slot} · {accountSecretStem(account)}_TOKEN</span>
+                  ) : (
+                    <span className="wc-slot-row-slot wc-slot-row-slot--unbound">未绑定</span>
+                  )}
+                </div>
+              );
+            })
           )}
         </div>
 
-        <div
-          style={{
-            marginTop: 24,
-            paddingTop: 16,
-            borderTop: '1px solid #f0f1f4',
-          }}
-        >
-          <div style={{ fontSize: 13, fontWeight: 600, color: '#b91c1c' }}>危险操作</div>
-          <p style={noteStyle}>
+        <div className="wc-danger-zone">
+          <div className="wc-danger-title">危险操作</div>
+          <p className="wc-dialog-note">
             清除本地保存的全部账号凭证与 GitHub 同步配置。此操作不可撤销，清除后需重新导入账号。
           </p>
           {confirmClear ? (
-            <div
-              style={{
-                padding: '10px 12px',
-                border: '1px solid #fecaca',
-                borderRadius: 6,
-                background: '#fef2f2',
-              }}
-            >
-              <div style={{ fontSize: 12, color: '#b91c1c', marginBottom: 8 }}>
+            <div className="wc-danger-confirm">
+              <div className="wc-danger-confirm-text">
                 确认要清除全部本地凭证吗？此操作不可撤销。
               </div>
-              <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+              <div className="wc-danger-confirm-actions">
                 <button
                   type="button"
-                  style={buttonStyle}
+                  className="wc-btn"
                   onClick={() => setConfirmClear(false)}
                   disabled={clearing}
                 >
@@ -290,12 +230,7 @@ export function WorkCnSettingsDialog({ open, onClose }: Props) {
                 </button>
                 <button
                   type="button"
-                  style={{
-                    ...buttonStyle,
-                    color: '#ffffff',
-                    background: '#dc2626',
-                    border: '1px solid #dc2626',
-                  }}
+                  className="wc-btn wc-btn-danger"
                   onClick={handleClear}
                   disabled={clearing}
                 >
@@ -306,12 +241,7 @@ export function WorkCnSettingsDialog({ open, onClose }: Props) {
           ) : (
             <button
               type="button"
-              style={{
-                ...buttonStyle,
-                color: '#dc2626',
-                borderColor: '#fecaca',
-                background: '#fef2f2',
-              }}
+              className="wc-btn wc-btn-danger"
               onClick={() => setConfirmClear(true)}
             >
               清除本地凭证
@@ -319,14 +249,14 @@ export function WorkCnSettingsDialog({ open, onClose }: Props) {
           )}
         </div>
 
-        {error ? <div style={errorStyle}>{error}</div> : null}
-        <div style={actionsStyle}>
-          <button type="button" style={buttonStyle} onClick={onClose} disabled={saving}>
+        {error ? <div className="wc-dialog-error">{error}</div> : null}
+        <div className="wc-dialog-actions">
+          <button type="button" className="wc-btn" onClick={onClose} disabled={saving}>
             取消
           </button>
           <button
             type="button"
-            style={{ ...buttonStyle, ...primaryStyle }}
+            className="wc-btn wc-btn-primary"
             onClick={handleSave}
             disabled={saving}
           >
@@ -337,19 +267,3 @@ export function WorkCnSettingsDialog({ open, onClose }: Props) {
     </div>
   );
 }
-
-const rowLabelStyle: CSSProperties = {
-  fontSize: 13,
-  color: '#1f2430',
-  display: 'block',
-  marginBottom: 6,
-  marginTop: 10,
-};
-
-const slotRowStyle: CSSProperties = {
-  display: 'flex',
-  alignItems: 'center',
-  gap: 10,
-  padding: '6px 0',
-  borderBottom: '1px solid #f0f1f4',
-};

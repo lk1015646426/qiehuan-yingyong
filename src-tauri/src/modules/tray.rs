@@ -402,7 +402,9 @@ fn handle_tray_event<R: Runtime>(tray: &TrayIcon<R>, event: TrayIconEvent) {
 fn get_text(key: &str, lang: &str) -> String {
     let lang = lang.to_ascii_lowercase();
     match (key, lang.as_str()) {
-        ("show_window", "zh-cn") | ("show_window", "zh-tw") => "打开 TRAE Work CN 切换器".to_string(),
+        ("show_window", "zh-cn") | ("show_window", "zh-tw") => {
+            "打开 TRAE Work CN 切换器".to_string()
+        }
         ("quit", "zh-cn") | ("quit", "zh-tw") => "退出".to_string(),
         ("show_window", "ja") => "TRAE Work CN 切替器を開く".to_string(),
         ("quit", "ja") => "終了".to_string(),

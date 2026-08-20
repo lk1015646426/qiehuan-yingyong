@@ -58,8 +58,7 @@ pub fn get_work_cn_installation() -> Result<WorkCnInstallation, String> {
 
     Ok(WorkCnInstallation {
         installed,
-        executable_path: executable_path
-            .map(|path| path.to_string_lossy().to_string()),
+        executable_path: executable_path.map(|path| path.to_string_lossy().to_string()),
         user_data_dir: user_data_dir.map(|path| path.to_string_lossy().to_string()),
         storage_path,
         display_name,
@@ -169,9 +168,8 @@ pub fn delete_work_cn_account(account_id: String) -> Result<(), String> {
     let Some(account) = trae_account::load_account(&account_id) else {
         return Err("账号不存在".to_string());
     };
-    if !trae_account::is_work_cn_account_kind(trae_account::resolve_account_platform_kind(
-        &account,
-    )) {
+    if !trae_account::is_work_cn_account_kind(trae_account::resolve_account_platform_kind(&account))
+    {
         return Err("该账号不是 TRAE Work CN 账号".to_string());
     }
     trae_account::remove_account(&account_id)?;
@@ -179,7 +177,9 @@ pub fn delete_work_cn_account(account_id: String) -> Result<(), String> {
     // 解绑该账号占用的 GitHub 槽位（若有），避免设置界面残留失效绑定。
     let mut github_config = crate::modules::work_cn_github::load_github_config();
     let before = github_config.slots.len();
-    github_config.slots.retain(|slot| slot.account_id != account_id);
+    github_config
+        .slots
+        .retain(|slot| slot.account_id != account_id);
     if github_config.slots.len() != before {
         crate::modules::work_cn_github::save_github_config(&github_config)?;
     }

@@ -1027,6 +1027,17 @@ fn detect_device_brand(platform: trae_account::TraePlatformKind, device_type: &s
     "unknown".to_string()
 }
 
+/// Device headers used by the official TRAE Work check-in request.
+/// The brand reuses the official-client log probe so it stays aligned with
+/// `common_params.device_model`; the type is the lowercase OS family.
+pub(crate) fn official_checkin_device_headers(
+    platform: trae_account::TraePlatformKind,
+) -> (String, String) {
+    let device_type = detect_device_type();
+    let device_brand = detect_device_brand(platform, device_type.as_str());
+    (device_brand, device_type)
+}
+
 fn collect_trae_login_context(platform: trae_account::TraePlatformKind) -> TraeLoginContext {
     let storage_root = read_trae_storage_root(platform);
     let product_info = detect_trae_product_info(platform);

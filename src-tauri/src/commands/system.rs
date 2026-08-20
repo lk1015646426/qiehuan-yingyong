@@ -2037,7 +2037,6 @@ pub fn patch_general_config(
         }
     };
 
-
     if floating_always_on_top_changed {
         if let Err(err) = modules::floating_card_window::apply_floating_card_always_on_top(&app) {
             modules::logger::log_warn(&format!(
@@ -2691,7 +2690,6 @@ pub fn save_general_config(
 
         Ok(())
     })?;
-
 
     if current_app_auto_launch_enabled != new_config.app_auto_launch_enabled {
         apply_app_auto_launch_enabled(&app, new_config.app_auto_launch_enabled)?;
