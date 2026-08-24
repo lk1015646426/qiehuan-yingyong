@@ -142,7 +142,9 @@ function WorkBuddyCheckinCard({ account }: { account: WorkBuddyAccountView }) {
         <span className="ck-card-title" title={account.displayName}>{account.displayName}</span>
       </div>
       <div className="ck-card-sub account-card__identity" title={account.uid}>{account.maskedPhone ?? '未提供手机号'} · UID {compactUid(account.uid)}</div>
-      <div className="ck-card-sub">令牌到期 {account.tokenExpiresAt ? new Date(account.tokenExpiresAt * 1000).toLocaleString('zh-CN', { hour12: false }) : '未知'}</div>
+      <div className="account-card__metrics">
+        <div className="ck-card-sub">令牌到期 {account.tokenExpiresAt ? new Date(account.tokenExpiresAt * 1000).toLocaleString('zh-CN', { hour12: false }) : '未知'}</div>
+      </div>
       <div className="account-card__status">
         <div
           className={`ck-flow-line${githubSync.tone === 'failed' ? ' ck-flow-line--failed' : githubSync.tone === 'synced' ? ' ck-flow-line--done' : ''}`}

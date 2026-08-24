@@ -6,7 +6,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map as JsonMap, Value as JsonValue};
 use tauri::Manager;
-use tauri_plugin_autostart::ManagerExt as _;
 
 use crate::modules;
 use crate::modules::config::{
@@ -748,22 +747,16 @@ fn apply_general_config_updates(
     Ok(())
 }
 
-fn get_app_auto_launch_enabled(app: &tauri::AppHandle) -> Result<bool, String> {
-    app.autolaunch()
-        .is_enabled()
-        .map_err(|err| format!("读取应用自启动状态失败: {}", err))
+fn get_app_auto_launch_enabled(_app: &tauri::AppHandle) -> Result<bool, String> {
+    // 自启动插件已移除：无对应 UI 且不再对接系统启动项，仅保留配置字段以兼容旧配置
+    Ok(false)
 }
 
-fn apply_app_auto_launch_enabled(app: &tauri::AppHandle, enabled: bool) -> Result<(), String> {
-    if enabled {
-        app.autolaunch()
-            .enable()
-            .map_err(|err| format!("启用应用自启动失败: {}", err))
-    } else {
-        app.autolaunch()
-            .disable()
-            .map_err(|err| format!("停用应用自启动失败: {}", err))
-    }
+fn apply_app_auto_launch_enabled(
+    _app: &tauri::AppHandle,
+    _enabled: bool,
+) -> Result<(), String> {
+    Ok(())
 }
 
 fn sanitize_ui_scale(raw: f64) -> f64 {
@@ -1089,7 +1082,7 @@ fn build_auto_backup_zip_bytes(file_name: &str, content: &str) -> Result<Vec<u8>
         .map_err(|err| format!("自动备份 JSON 解析失败，无法生成 ZIP: {}", err))?;
     let platforms = collect_auto_backup_platforms_from_value(&root);
     let manifest = serde_json::json!({
-        "schema": "cockpit-tools.auto-backup-archive",
+        "schema": "qiehuan-yingyong.auto-backup-archive",
         "version": 1,
         "source_file_name": file_name,
         "platforms": &platforms,

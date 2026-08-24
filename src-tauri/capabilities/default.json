@@ -19,9 +19,6 @@
         }
       ]
     },
-    "dialog:default",
-    "fs:default",
-    "notification:default",
-    "process:default"
+    "notification:default"
   ]
 }

@@ -114,7 +114,7 @@ final class NativeMenuPopoverController: NSObject, ObservableObject, NSMenuDeleg
             dispatchRustMenuAction(action: "view_all_accounts", platformId: platform.id)
         case .openCockpitTools:
             self.closeMenu()
-            dispatchRustMenuAction(action: "open_cockpit_tools")
+            dispatchRustMenuAction(action: "open_qiehuan_yingyong")
         case .settings:
             self.closeMenu()
             dispatchRustMenuAction(action: "settings")
@@ -302,7 +302,7 @@ final class NativeMenuPopoverController: NSObject, ObservableObject, NSMenuDeleg
             menu.addItem(.separator())
         }
         menu.addItem(self.makeActionMenuItem(
-            title: snapshot.strings.open_cockpit_tools,
+            title: snapshot.strings.open_qiehuan_yingyong,
             systemName: "macwindow",
             action: #selector(self.handleOpenCockpitTools(_:))
         ))

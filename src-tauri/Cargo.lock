@@ -608,7 +608,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "cockpit-tools"
+name = "qiehuan-yingyong"
 version = "0.21.5"
 dependencies = [
  "aes",

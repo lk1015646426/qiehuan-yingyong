@@ -15,7 +15,6 @@ pub mod logger;
 pub mod main_window_state;
 pub mod oauth;
 pub mod oauth_pending_state;
-pub mod oauth_server;
 pub mod process;
 pub mod process_memory;
 pub mod process_timeout;

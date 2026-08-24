@@ -5,7 +5,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -27,17 +27,73 @@ static LIST_ACCOUNTS_LOAD_LOCK: std::sync::LazyLock<Mutex<()>> =
 const QUOTA_ALERT_COOLDOWN_SECONDS: i64 = 300;
 const LIST_ACCOUNTS_CACHE_TTL_MS: u64 = 800;
 
-// TRAE Work CN 专用数据目录：禁止与原 Cockpit Tools 共用账号库和加密密钥。
-const DATA_DIR: &str = ".trae_work_cn_switcher";
-const DEV_DATA_DIR: &str = ".trae_work_cn_switcher_dev";
-const DATA_DIR_ENV: &str = "TRAE_WORK_CN_SWITCHER_DATA_DIR";
-const PROFILE_ENV: &str = "TRAE_WORK_CN_SWITCHER_PROFILE";
+// Machine-readable identity for the renamed app. User-facing strings use 切换应用.
+const DATA_DIR: &str = ".qiehuan_yingyong";
+const DEV_DATA_DIR: &str = ".qiehuan_yingyong_dev";
+const DATA_DIR_ENV: &str = "QIEHUAN_YINGYONG_DATA_DIR";
+const PROFILE_ENV: &str = "QIEHUAN_YINGYONG_PROFILE";
+const LEGACY_DATA_DIR_ENVS: [&str; 3] = [
+    "TRAE_WORK_CN_SWITCHER_DATA_DIR",
+    "COCKPIT_TOOLS_DATA_DIR",
+    "COCKPIT_DATA_DIR",
+];
+const LEGACY_PROFILE_ENVS: [&str; 2] = ["TRAE_WORK_CN_SWITCHER_PROFILE", "COCKPIT_TOOLS_PROFILE"];
 
 const ACCOUNTS_INDEX: &str = "accounts.json";
 const ACCOUNTS_DIR: &str = "accounts";
 const ACCOUNT_TOKEN_KEY_FILE: &str = "account-token.key";
 const ACCOUNT_TOKEN_ENCRYPTION_VERSION: u32 = 1;
 const ACCOUNT_TOKEN_ROTATION_SECONDS: i64 = 30 * 24 * 60 * 60;
+
+fn legacy_data_dir_names() -> &'static [&'static str] {
+    &[
+        ".trae_work_cn_switcher",
+        ".trae_work_cn_switcher_dev",
+        ".antigravity_cockpit",
+        ".antigravity_cockpit_dev",
+        ".cockpit_tools",
+        ".cockpit-tools",
+    ]
+}
+
+fn copy_dir_contents(source: &Path, target: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(target)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let target_path = target.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_dir_contents(&source_path, &target_path)?;
+        } else if file_type.is_file() && !target_path.exists() {
+            fs::copy(&source_path, &target_path)?;
+        }
+    }
+    Ok(())
+}
+
+fn migrate_legacy_data_dirs(home: &Path, target: &Path) {
+    for name in legacy_data_dir_names() {
+        let source = home.join(name);
+        if !source.exists() || source == target {
+            continue;
+        }
+        if let Err(error) = copy_dir_contents(&source, target) {
+            eprintln!(
+                "切换应用旧数据迁移失败，保留旧目录继续运行: source={}, target={}, error={}",
+                source.display(),
+                target.display(),
+                error
+            );
+        } else {
+            eprintln!(
+                "切换应用已兼容旧数据目录: source={}, target={}",
+                source.display(),
+                target.display()
+            );
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct EncryptedTokenEnvelope {
@@ -238,31 +294,25 @@ pub fn is_dev_profile() -> bool {
         return true;
     }
 
-    std::env::var(PROFILE_ENV)
-        .map(|value| value.trim().eq_ignore_ascii_case("dev"))
-        .unwrap_or(false)
+    std::iter::once(PROFILE_ENV)
+        .chain(LEGACY_PROFILE_ENVS.iter().copied())
+        .filter_map(|key| std::env::var(key).ok())
+        .any(|value| value.trim().eq_ignore_ascii_case("dev"))
 }
 
 pub fn resolve_data_dir() -> Result<PathBuf, String> {
-    if let Ok(raw) = std::env::var(DATA_DIR_ENV) {
-        let trimmed = raw.trim();
-        if !trimmed.is_empty() {
-            return Ok(PathBuf::from(trimmed));
+    for key in std::iter::once(DATA_DIR_ENV).chain(LEGACY_DATA_DIR_ENVS.iter().copied()) {
+        if let Ok(raw) = std::env::var(key) {
+            let trimmed = raw.trim();
+            if !trimmed.is_empty() {
+                return Ok(PathBuf::from(trimmed));
+            }
         }
     }
 
     let home = dirs::home_dir().ok_or("无法获取用户主目录")?;
-    // dev 与 release 统一使用同一数据目录：此前 dev 构建写
-    // `~/.trae_work_cn_switcher_dev`、安装包读 `~/.trae_work_cn_switcher`，
-    // 目录分裂导致“重启后数据丢失”的观感。首次统一时把旧 dev 目录
-    // 迁移过来（同盘 rename，失败则忽略，用户重新导入即可）。
     let data_dir = home.join(DATA_DIR);
-    if !data_dir.exists() {
-        let dev_dir = home.join(DEV_DATA_DIR);
-        if dev_dir.exists() {
-            let _ = fs::rename(&dev_dir, &data_dir);
-        }
-    }
+    migrate_legacy_data_dirs(&home, &data_dir);
     Ok(data_dir)
 }
 
@@ -272,6 +322,8 @@ pub fn get_data_dir() -> Result<PathBuf, String> {
     // the upstream aliases so the inherited suite stays isolated from real user data.
     #[cfg(test)]
     let override_keys = [
+        "QIEHUAN_YINGYONG_TEST_DATA_DIR",
+        "QIEHUAN_YINGYONG_DATA_DIR",
         "TRAE_WORK_CN_SWITCHER_TEST_DATA_DIR",
         "TRAE_WORK_CN_SWITCHER_DATA_DIR",
         "COCKPIT_TOOLS_TEST_DATA_DIR",
@@ -279,8 +331,11 @@ pub fn get_data_dir() -> Result<PathBuf, String> {
     ];
     #[cfg(not(test))]
     let override_keys = [
+        "QIEHUAN_YINGYONG_DATA_DIR",
         "TRAE_WORK_CN_SWITCHER_TEST_DATA_DIR",
         "TRAE_WORK_CN_SWITCHER_DATA_DIR",
+        "COCKPIT_TOOLS_DATA_DIR",
+        "COCKPIT_DATA_DIR",
     ];
 
     for key in override_keys {
@@ -876,4 +931,26 @@ pub fn update_account_quota(account_id: &str, quota: QuotaData) -> Result<(), St
         let _ = modules::quota_cache::write_quota_cache("authorized", &account.email, quota);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{legacy_data_dir_names, DATA_DIR, DEV_DATA_DIR};
+
+    #[test]
+    fn uses_qiehuan_yingyong_storage_names() {
+        assert_eq!(DATA_DIR, ".qiehuan_yingyong");
+        assert_eq!(DEV_DATA_DIR, ".qiehuan_yingyong_dev");
+    }
+
+    #[test]
+    fn keeps_all_known_legacy_storage_names_for_migration() {
+        let names = legacy_data_dir_names();
+        assert!(names.contains(&".trae_work_cn_switcher"));
+        assert!(names.contains(&".trae_work_cn_switcher_dev"));
+        assert!(names.contains(&".antigravity_cockpit"));
+        assert!(names.contains(&".antigravity_cockpit_dev"));
+        assert!(names.contains(&".cockpit_tools"));
+        assert!(names.contains(&".cockpit-tools"));
+    }
 }

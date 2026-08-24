@@ -122,10 +122,10 @@ fn run_windows_shutdown_message_loop(
         .set(shutdown_tx)
         .map_err(|_| "Windows 关机监听已初始化".to_string())?;
 
-    let class_name = format!("CockpitToolsShutdownListener-{}\0", std::process::id())
+    let class_name = format!("QiehuanYingyongShutdownListener-{}\0", std::process::id())
         .encode_utf16()
         .collect::<Vec<_>>();
-    let window_name = "Cockpit Tools Shutdown Listener\0"
+    let window_name = "切换应用 Shutdown Listener\0"
         .encode_utf16()
         .collect::<Vec<_>>();
 

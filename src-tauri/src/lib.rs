@@ -191,8 +191,6 @@ pub fn run() {
     }
 
     let app = tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_deep_link::init())
@@ -206,7 +204,7 @@ pub fn run() {
             }
         }))
         .setup(|app| {
-            info!("Cockpit Tools 启动...");
+            info!("切换应用启动...");
             let current_exe = std::env::current_exe()
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|err| format!("unknown: {}", err));
@@ -248,17 +246,6 @@ pub fn run() {
                     )),
                 }
             });
-
-            // 初始化 Process + Autostart 插件（Updater 已于阶段 8 移除）
-            #[cfg(desktop)]
-            {
-                app.handle().plugin(tauri_plugin_process::init())?;
-                app.handle().plugin(tauri_plugin_autostart::init(
-                    tauri_plugin_autostart::MacosLauncher::LaunchAgent,
-                    None::<Vec<&'static str>>,
-                ))?;
-                info!("[Plugin] Tauri Process + Autostart 插件已初始化");
-            }
 
             // 启动时同步设置合并（移至后台线程，不阻塞窗口显示）
             std::thread::spawn(|| {

@@ -1,13 +1,13 @@
-# Contributing to Cockpit Tools
+# Contributing to 切换应用
 
-Thank you for your interest in contributing to Cockpit Tools! This project aims to be the universal manager for AI IDEs, and we welcome contributions of all kinds.
+Thank you for your interest in contributing to 切换应用, an account manager for AI IDEs. Contributions of all kinds are welcome.
 
 ## 🚀 Getting Started
 
 1.  **Fork** the repository on GitHub.
 2.  **Clone** your fork locally:
     ```bash
-    git clone https://github.com/YOUR_USERNAME/cockpit-tools.git
+    git clone https://github.com/YOUR_USERNAME/<repository>.git
     ```
 3.  **Create a branch** for your feature or bug fix:
     ```bash
@@ -17,9 +17,9 @@ Thank you for your interest in contributing to Cockpit Tools! This project aims 
 ## 🛠️ Project Structure
 
 This project is a Cargo Workspace:
-- `crates/cockpit-core`: Shared business logic (Library).
+- `crates/qiehuan-yingyong-core`: Shared business logic (Library).
 - `src-tauri`: The GUI application (Tauri + React).
-- `crates/cockpit-cli`: The command-line interface.
+- `crates/qiehuan-yingyong-cli`: The command-line interface.
 
 ## 📝 Coding Standards
 
@@ -30,8 +30,8 @@ This project is a Cargo Workspace:
 ## 🧪 Testing
 
 - **GUI:** `npm run tauri dev`
-- **CLI:** `cargo run --package cockpit-cli -- <commands>`
-- **Core:** `cargo test --package cockpit-core`
+- **CLI:** `cargo run --package qiehuan-yingyong-cli -- <commands>`
+- **Core:** `cargo test --package qiehuan-yingyong-core`
 
 ## 📬 Submitting a Pull Request
 

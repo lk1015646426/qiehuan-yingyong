@@ -42,6 +42,9 @@ function AccountCard({ account, active }: { account: WorkBuddyAccountView; activ
   };
   const statusSummary = `${account.checkinEnabled ? '自动签到已开启' : '自动签到未开启'} · ${githubSync.label}`;
   const statusDetail = githubSync.detail ?? '';
+  const statusErrors = [status?.creditsError, status?.activityError]
+    .filter((value): value is string => Boolean(value))
+    .filter((value, index, values) => values.indexOf(value) === index);
   return <article className={active ? 'wc-slot account-card account-card--compact wb-slot wb-slot--active' : 'wc-slot account-card account-card--compact wb-slot'}>
     {active ? <span className="wc-slot-active-badge">当前账号</span> : null}
     <div className="wc-slot-head account-card__head">
@@ -51,14 +54,16 @@ function AccountCard({ account, active }: { account: WorkBuddyAccountView; activ
       <span className={`wb-sync wb-sync--${githubSync.tone}`} title={githubSync.detail ?? githubSync.label}>{githubSync.label}</span>
     </div>
     <div className="wc-slot-sub account-card__identity" title={account.uid}>{account.maskedPhone ?? '未提供手机号'} · UID {compactUid(account.uid)}</div>
-    <div className="wc-slot-sub">令牌到期 {timeText(account.tokenExpiresAt)}</div>
+    <div className="account-card__metrics">
+      <div className="wc-slot-sub">令牌到期 {timeText(account.tokenExpiresAt)}</div>
+    </div>
     <div className="wb-status-block">
       <div className="wb-status-line" aria-label="WorkBuddy 状态">
         <span>真实积分 <strong>{statusLoading && !status ? '查询中…' : status?.credits != null ? status.credits.toLocaleString('zh-CN', { maximumFractionDigits: 2 }) : '暂无数据'}</strong></span>
         <span>今日奖励 <strong>{status?.todayReward != null ? status.todayReward.toLocaleString('zh-CN', { maximumFractionDigits: 2 }) : '暂无数据'}</strong></span>
         <span>连续签到 <strong>{status?.streakDays != null ? `${status.streakDays} 天` : '暂无数据'}</strong></span>
       </div>
-      {status?.creditsError || status?.activityError ? <div className="wb-status-error">{[status.creditsError, status.activityError].filter(Boolean).join('；')}</div> : null}
+      {statusErrors.length ? <div className="wb-status-error">{statusErrors.join('；')}</div> : null}
     </div>
     <div className="account-card__status account-card__status--toggle" title={statusDetail || statusSummary}>
       <label className="wb-checkin-toggle">

@@ -1,4 +1,4 @@
-// TRAE Work CN 账号切换器 - 主页面
+// 切换应用的 TRAE Work CN 账号页面
 //
 // 样式全部走 work-cn.css（基于 base.css 设计系统 token，自动适配暗色主题）：
 // - 快照完整度折叠为一行摘要（悬浮 title 展示缺失项明细）
@@ -111,11 +111,24 @@ function CreditsBlock({
   );
 }
 
+// 切号各阶段文案（stage 与后端 WORK_CN_SWITCH_STAGE_* 常量一致）。
+// 切换全程最长约 50 秒（关闭 20s + 验证 30s），无阶段提示时用户只能干等。
+const SWITCH_STAGE_LABELS: Record<string, string> = {
+  validating: '正在校验账号快照',
+  closing: '正在关闭客户端（最长 20 秒）',
+  injecting: '正在注入账号凭证',
+  binding: '正在绑定默认实例',
+  launching: '正在启动客户端',
+  verifying: '正在验证切换结果（最长 30 秒）',
+  syncing: '正在同步会话与 GitHub',
+};
+
 function AccountCard({
   account,
   credits,
   creditsError,
   switching,
+  switchStage,
   deleting,
   refreshingCredits,
   githubEnabled,
@@ -129,6 +142,7 @@ function AccountCard({
   credits: WorkCnCreditsSummary | null;
   creditsError: string | null;
   switching: boolean;
+  switchStage: string | null;
   deleting: boolean;
   refreshingCredits: boolean;
   githubEnabled: boolean;
@@ -171,7 +185,13 @@ function AccountCard({
       </div>
       <div className="account-card__metrics">
         <CreditsBlock credits={credits} error={creditsError} />
-        <div className="wc-credits-sub">{account.validForSwitch ? '快照可切换' : '快照需重新导入'}</div>
+        <div className="wc-credits-sub">
+          {switching
+            ? `${SWITCH_STAGE_LABELS[switchStage ?? ''] ?? '正在准备'}…`
+            : account.validForSwitch
+              ? '快照可切换'
+              : '快照需重新导入'}
+        </div>
       </div>
       <div className="account-card__status">
         <div
@@ -268,6 +288,7 @@ export function WorkCnSwitcherPage() {
   const ensureAccountsLoaded = useWorkCnStore((s) => s.ensureAccountsLoaded);
   const lastImportWarning = useWorkCnStore((s) => s.lastImportWarning);
   const switchingId = useWorkCnStore((s) => s.switchingId);
+  const switchStage = useWorkCnStore((s) => s.switchStage);
   const switchTo = useWorkCnStore((s) => s.switchTo);
   const deletingId = useWorkCnStore((s) => s.deletingId);
   const deleteAccount = useWorkCnStore((s) => s.deleteAccount);
@@ -352,7 +373,7 @@ export function WorkCnSwitcherPage() {
       <header className="wc-header">
         <h1 className="wc-title">
           <img className="wc-title-icon" src={traeCnIcon} alt="TRAE" />
-          TRAE Work CN 账号切换器
+          切换应用 · TRAE Work CN
         </h1>
         <div className="wc-header-actions">
           <button
@@ -428,6 +449,7 @@ export function WorkCnSwitcherPage() {
               credits={creditsById[account.id] ?? null}
               creditsError={creditsErrorById[account.id] ?? null}
               switching={switchingId === account.id}
+              switchStage={switchingId === account.id ? switchStage : null}
               deleting={deletingId === account.id}
               refreshingCredits={!!refreshingCreditsIds[account.id]}
               githubEnabled={githubConfig.enabled}

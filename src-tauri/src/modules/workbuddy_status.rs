@@ -1,6 +1,7 @@
 use crate::models::workbuddy::WorkBuddyAccountStatus;
 use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, ORIGIN, REFERER, USER_AGENT};
 use serde_json::{json, Value};
+use std::time::Instant;
 
 const RESOURCE_URL: &str = "https://copilot.tencent.com/v2/billing/meter/get-user-resource";
 const ACTIVITY_URL: &str = "https://copilot.tencent.com/v2/billing/meter/checkin-activity-status";
@@ -65,6 +66,9 @@ fn business_error(payload: &Value) -> Option<String> {
         })
         .filter(|value| !value.trim().is_empty())
         .unwrap_or_else(|| "上游返回业务错误".to_string());
+    if code == 401 || code == 403 {
+        return Some(format!("认证已失效：{message} (code={code})"));
+    }
     Some(format!("{message} (code={code})"))
 }
 
@@ -78,6 +82,11 @@ async fn query_json(
     token: &str,
     label: &str,
 ) -> Result<Value, String> {
+    let started = Instant::now();
+    crate::modules::logger::log_info(&format!(
+        "[WorkBuddy Network] request_start label={} url={}",
+        label, url
+    ));
     let response = client
         .post(url)
         .header(AUTHORIZATION, format!("Bearer {token}"))
@@ -89,8 +98,23 @@ async fn query_json(
         .json(&json!({}))
         .send()
         .await
-        .map_err(|error| network_error_message(label, error))?;
+        .map_err(|error| {
+            let detail = crate::utils::http::format_request_error(label, &error);
+            crate::modules::logger::log_warn(&format!(
+                "[WorkBuddy Network] request_failed label={} elapsed_ms={} detail={}",
+                label,
+                started.elapsed().as_millis(),
+                detail
+            ));
+            detail
+        })?;
     let status = response.status();
+    crate::modules::logger::log_info(&format!(
+        "[WorkBuddy Network] response_received label={} status={} elapsed_ms={}",
+        label,
+        status.as_u16(),
+        started.elapsed().as_millis()
+    ));
     if status == reqwest::StatusCode::UNAUTHORIZED {
         return Err(format!(
             "{label}认证已失效，请重新登录 WorkBuddy 后更新账号"
@@ -107,6 +131,20 @@ async fn query_json(
         return Err(format!("{label}失败: {error}"));
     }
     Ok(payload)
+}
+
+fn is_auth_error(error: &str) -> bool {
+    error.contains("认证已失效")
+}
+
+async fn query_both(
+    client: &reqwest::Client,
+    token: &str,
+) -> (Result<Value, String>, Result<Value, String>) {
+    tokio::join!(
+        query_json(client, RESOURCE_URL, token, "积分查询"),
+        query_json(client, ACTIVITY_URL, token, "签到状态查询"),
+    )
 }
 
 fn assemble_status(
@@ -133,12 +171,41 @@ fn assemble_status(
 }
 
 pub async fn query_account_status(account_id: &str) -> Result<WorkBuddyAccountStatus, String> {
+    let client = crate::utils::http::create_domestic_client(30, "copilot.tencent.com");
     let token = crate::modules::workbuddy_account::access_token(account_id)?;
-    let client = crate::utils::http::create_direct_client(30);
-    let (credits_payload, activity_payload) = tokio::join!(
-        query_json(&client, RESOURCE_URL, &token, "积分查询"),
-        query_json(&client, ACTIVITY_URL, &token, "签到状态查询"),
-    );
+    let (mut credits_payload, mut activity_payload) = query_both(&client, &token).await;
+    if credits_payload
+        .as_ref()
+        .err()
+        .is_some_and(|error| is_auth_error(error))
+        || activity_payload
+            .as_ref()
+            .err()
+            .is_some_and(|error| is_auth_error(error))
+    {
+        match crate::modules::workbuddy_account::refresh_account_auth(account_id).await {
+            Ok(new_token) => {
+                (credits_payload, activity_payload) = query_both(&client, &new_token).await;
+            }
+            Err(error) => {
+                let refresh_error = format!("认证刷新失败：{error}");
+                if credits_payload
+                    .as_ref()
+                    .err()
+                    .is_some_and(|value| is_auth_error(value))
+                {
+                    credits_payload = Err(format!("积分查询{refresh_error}"));
+                }
+                if activity_payload
+                    .as_ref()
+                    .err()
+                    .is_some_and(|value| is_auth_error(value))
+                {
+                    activity_payload = Err(format!("签到状态查询{refresh_error}"));
+                }
+            }
+        }
+    }
     let credits = credits_payload.and_then(|payload| {
         parse_real_credits(&payload).ok_or_else(|| "积分查询返回结构不完整".to_string())
     });
@@ -235,5 +302,19 @@ mod tests {
         let message = network_error_message("积分查询", "connection refused");
         assert!(message.contains("国内网络请求失败"));
         assert!(!message.contains("认证已失效"));
+    }
+
+    #[test]
+    fn workbuddy_business_auth_codes_are_refreshable() {
+        assert!(
+            super::business_error(&json!({"code": 401, "message": "unauthorized"}))
+                .unwrap()
+                .contains("认证已失效")
+        );
+        assert!(
+            super::business_error(&json!({"code": 403, "message": "forbidden"}))
+                .unwrap()
+                .contains("认证已失效")
+        );
     }
 }

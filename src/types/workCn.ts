@@ -78,7 +78,9 @@ export type WorkCnErrorCode =
   | 'VERIFY_TIMEOUT'
   | 'VERIFY_ACCOUNT_MISMATCH'
   | 'ROLLBACK_FAILED'
-  | 'BUSY';
+  | 'BUSY'
+  | 'CREDITS_TOKEN_EXPIRED'
+  | 'CREDITS_NETWORK_ERROR';
 
 export interface WorkCnCommandError {
   code: WorkCnErrorCode;

@@ -22,7 +22,7 @@ use crate::modules::logger;
 pub const TRAY_ID: &str = "main-tray";
 
 #[cfg(target_os = "macos")]
-const MACOS_STATUS_ITEM_AUTOSAVE_NAME: &str = "com.jlcodes.cockpit-tools.main-tray";
+const MACOS_STATUS_ITEM_AUTOSAVE_NAME: &str = "com.qiehuanyingyong.desktop.main-tray";
 
 #[cfg(target_os = "macos")]
 const MACOS_TRAY_TEMPLATE_ICON_SIZE: u32 = 36;
@@ -273,7 +273,7 @@ pub fn create_tray_skeleton<R: Runtime>(
     let builder = TrayIconBuilder::with_id(TRAY_ID)
         .icon(tray_icon)
         .show_menu_on_left_click(false)
-        .tooltip("TRAE Work CN 账号切换器")
+        .tooltip("切换应用")
         .on_menu_event(handle_menu_event)
         .on_tray_icon_event(handle_tray_event);
 
@@ -402,13 +402,11 @@ fn handle_tray_event<R: Runtime>(tray: &TrayIcon<R>, event: TrayIconEvent) {
 fn get_text(key: &str, lang: &str) -> String {
     let lang = lang.to_ascii_lowercase();
     match (key, lang.as_str()) {
-        ("show_window", "zh-cn") | ("show_window", "zh-tw") => {
-            "打开 TRAE Work CN 切换器".to_string()
-        }
+        ("show_window", "zh-cn") | ("show_window", "zh-tw") => "打开切换应用".to_string(),
         ("quit", "zh-cn") | ("quit", "zh-tw") => "退出".to_string(),
-        ("show_window", "ja") => "TRAE Work CN 切替器を開く".to_string(),
+        ("show_window", "ja") => "切换应用を開く".to_string(),
         ("quit", "ja") => "終了".to_string(),
-        ("show_window", _) => "Open TRAE Work CN Switcher".to_string(),
+        ("show_window", _) => "Open 切换应用".to_string(),
         ("quit", _) => "Quit".to_string(),
         _ => key.to_string(),
     }

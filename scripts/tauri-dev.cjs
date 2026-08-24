@@ -22,9 +22,9 @@ function resolveMacosSdkRoot() {
 
 const env = {
   ...process.env,
-  TRAE_WORK_CN_SWITCHER_PROFILE: process.env.TRAE_WORK_CN_SWITCHER_PROFILE || 'dev',
-  COCKPIT_TOOLS_API_PORT: process.env.COCKPIT_TOOLS_API_PORT || '1456',
-  VITE_COCKPIT_TOOLS_PROFILE: process.env.VITE_COCKPIT_TOOLS_PROFILE || 'dev',
+  QIEHUAN_YINGYONG_PROFILE: process.env.QIEHUAN_YINGYONG_PROFILE || 'dev',
+  QIEHUAN_YINGYONG_API_PORT: process.env.QIEHUAN_YINGYONG_API_PORT || '1456',
+  VITE_QIEHUAN_YINGYONG_PROFILE: process.env.VITE_QIEHUAN_YINGYONG_PROFILE || 'dev',
 };
 const macosSdkRoot = resolveMacosSdkRoot();
 if (macosSdkRoot) {

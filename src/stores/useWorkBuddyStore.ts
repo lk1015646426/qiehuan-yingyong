@@ -12,6 +12,7 @@ import {
   triggerWorkBuddyCheckin,
   getWorkBuddyAccountStatus,
   updateWorkBuddyAccount,
+  WORKBUDDY_INSTALLATION_RUNNING_EVENT,
 } from '../services/workBuddyService';
 import type { WorkBuddyAccountStatus, WorkBuddyAccountUpdate, WorkBuddyAccountView, WorkBuddyInstallation, WorkBuddySessionWatchStatus } from '../types/workbuddy';
 import { shouldLoadWorkBuddyAccounts } from '../utils/workBuddyLifecycle';
@@ -216,9 +217,9 @@ export const useWorkBuddyStore = create<WorkBuddyState>((set, get) => ({
     }
   },
   async refreshAllStatuses() {
-    for (const account of get().accounts) {
-      await get().refreshAccountStatus(account.id);
-    }
+    // 逐账号联网查询积分/活跃度；串行 for-await 会让 N 个账号的网络等待
+    // 叠加（页面加载时"检测账号"迟迟不出结果的主因），改为并行。
+    await Promise.allSettled(get().accounts.map((account) => get().refreshAccountStatus(account.id)));
   },
   async loadSessionWatchStatus() {
     try { set({ sessionWatchStatus: await getWorkBuddySessionWatchStatus() }); } catch { /* 后台不可用时不影响账号管理。 */ }
@@ -232,3 +233,13 @@ export const useWorkBuddyStore = create<WorkBuddyState>((set, get) => ({
   },
   clearFeedback() { set({ error: null, notice: null }); },
 }));
+
+// 安装检测的"运行中"状态由后端后台探测补发（PowerShell 探测慢，不阻塞
+// get_workbuddy_installation 返回）；常驻监听一次，事件到达时合并进当前
+// installation，避免每次 refreshInstallation 重复注册/注销监听。
+void listen<boolean>(WORKBUDDY_INSTALLATION_RUNNING_EVENT, (event) => {
+  const { installation } = useWorkBuddyStore.getState();
+  if (installation && installation.running !== event.payload) {
+    useWorkBuddyStore.setState({ installation: { ...installation, running: event.payload } });
+  }
+});

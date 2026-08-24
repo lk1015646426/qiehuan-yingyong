@@ -9,16 +9,20 @@ const packageLock = JSON.parse(readFileSync('package-lock.json', 'utf8'));
 const tauriConfig = JSON.parse(readFileSync('src-tauri/tauri.conf.json', 'utf8'));
 const baseCss = readFileSync('src/styles/base.css', 'utf8');
 
-test('Work CN switcher uses an isolated application data directory', () => {
-  assert.match(accountSource, /const DATA_DIR: &str = "\.trae_work_cn_switcher";/);
-  assert.match(accountSource, /const DEV_DATA_DIR: &str = "\.trae_work_cn_switcher_dev";/);
-  assert.match(accountSource, /const DATA_DIR_ENV: &str = "TRAE_WORK_CN_SWITCHER_DATA_DIR";/);
-  assert.match(accountSource, /const PROFILE_ENV: &str = "TRAE_WORK_CN_SWITCHER_PROFILE";/);
+test('切换应用使用隔离的数据目录并兼容旧环境变量', () => {
+  assert.match(accountSource, /const DATA_DIR: &str = "\.qiehuan_yingyong";/);
+  assert.match(accountSource, /const DEV_DATA_DIR: &str = "\.qiehuan_yingyong_dev";/);
+  assert.match(accountSource, /const DATA_DIR_ENV: &str = "QIEHUAN_YINGYONG_DATA_DIR";/);
+  assert.match(accountSource, /const PROFILE_ENV: &str = "QIEHUAN_YINGYONG_PROFILE";/);
+  assert.match(accountSource, /"QIEHUAN_YINGYONG_TEST_DATA_DIR"/);
   assert.match(accountSource, /"TRAE_WORK_CN_SWITCHER_TEST_DATA_DIR"/);
+  assert.match(accountSource, /"COCKPIT_TOOLS_TEST_DATA_DIR"/);
   assert.match(accountSource, /cfg!\(debug_assertions\)/);
   assert.doesNotMatch(accountSource, /const DATA_DIR: &str = "\.antigravity_cockpit";/);
-  assert.match(tauriDevScript, /TRAE_WORK_CN_SWITCHER_PROFILE/);
-  assert.doesNotMatch(tauriDevScript, /process\.env\.COCKPIT_TOOLS_PROFILE/);
+  assert.match(tauriDevScript, /QIEHUAN_YINGYONG_PROFILE/);
+  assert.match(tauriDevScript, /QIEHUAN_YINGYONG_API_PORT/);
+  assert.match(tauriDevScript, /VITE_QIEHUAN_YINGYONG_PROFILE/);
+  assert.doesNotMatch(tauriDevScript, /TRAE_WORK_CN_SWITCHER_PROFILE|COCKPIT_TOOLS_PROFILE/);
   assert.match(tauriDevScript, /process\.platform === 'win32' \? 'npm\.cmd' : 'npm'/);
   assert.match(tauriDevScript, /npx(?:\.cmd)?/);
   assert.match(tauriDevScript, /src-tauri\/tauri\.dev\.conf\.json/);
@@ -31,11 +35,12 @@ test('package lock root metadata matches the specialized package', () => {
   assert.equal(packageLock.packages[''].version, packageJson.version);
 });
 
-test('updater plugin keeps valid inert config without upstream endpoints', () => {
-  assert.equal(typeof tauriConfig.plugins.updater.pubkey, 'string');
-  assert.ok(tauriConfig.plugins.updater.pubkey.length > 0);
-  assert.deepEqual(tauriConfig.plugins.updater.endpoints, []);
-  assert.equal(JSON.stringify(tauriConfig).includes('jlcodes99/cockpit-tools/releases'), false);
+test('Tauri bundle uses the renamed identity and keeps the legacy deep link', () => {
+  assert.equal(tauriConfig.productName, '切换应用');
+  assert.equal(tauriConfig.identifier, 'com.qiehuanyingyong.desktop');
+  assert.deepEqual(tauriConfig.plugins?.updater, undefined);
+  assert.ok(tauriConfig.plugins['deep-link'].desktop.schemes.includes('qiehuanyingyong'));
+  assert.ok(tauriConfig.plugins['deep-link'].desktop.schemes.includes('cockpit-tools'));
   assert.equal(tauriConfig.bundle.createUpdaterArtifacts, false);
 });
 

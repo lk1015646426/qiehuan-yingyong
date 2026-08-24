@@ -38,14 +38,6 @@ export default defineConfig(async () => ({
           if (id.includes("/src/i18n/")) {
             return "i18n-core";
           }
-
-          if (
-            id.includes("/src/components/UpdateNotification") ||
-            id.includes("/src/components/VersionJumpNotification") ||
-            id.includes("/src/utils/updater")
-          ) {
-            return "update-flow";
-          }
         },
       },
     },

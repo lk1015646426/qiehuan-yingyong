@@ -8,11 +8,11 @@ use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha512};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::Mutex as AsyncMutex;
 
@@ -2085,10 +2085,15 @@ pub fn get_default_trae_data_dir() -> Result<PathBuf, String> {
 pub fn get_default_trae_storage_path_for_platform(
     platform: TraePlatformKind,
 ) -> Result<PathBuf, String> {
-    Ok(get_default_trae_data_dir_for_platform(platform)?
+    let data_dir = resolve_trae_data_dir_for_platform(platform)?;
+    Ok(storage_path_for_data_dir(&data_dir))
+}
+
+fn storage_path_for_data_dir(data_dir: &Path) -> PathBuf {
+    data_dir
         .join("User")
         .join("globalStorage")
-        .join("storage.json"))
+        .join("storage.json")
 }
 
 pub fn get_default_trae_storage_path() -> Result<PathBuf, String> {
@@ -2213,7 +2218,33 @@ pub fn resolve_trae_data_dir_for_platform(platform: TraePlatformKind) -> Result<
 
 /// Read the product version from `product.json` shipped next to the official
 /// executable. Returns `None` when the file is missing or has no version.
+/// 版本探测缓存（键：exe 路径）。客户端检测每次页面挂载都会调用，
+/// 内部逐候选读 JSON 文件；版本在运行期间基本不变，30s 内复用。
+static TRAE_VERSION_CACHE: LazyLock<Mutex<HashMap<String, (Instant, Option<String>)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+const TRAE_VERSION_TTL: Duration = Duration::from_secs(30);
+
 pub fn detect_trae_product_version_for_exe(exe_path: &Path) -> Option<String> {
+    let cache_key = exe_path.to_string_lossy().to_string();
+    if let Some((at, cached)) = TRAE_VERSION_CACHE
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&cache_key).cloned())
+    {
+        if at.elapsed() < TRAE_VERSION_TTL {
+            return cached;
+        }
+    }
+
+    let version = detect_trae_product_version_uncached(exe_path);
+    if let Ok(mut cache) = TRAE_VERSION_CACHE.lock() {
+        cache.insert(cache_key, (Instant::now(), version.clone()));
+    }
+    version
+}
+
+fn detect_trae_product_version_uncached(exe_path: &Path) -> Option<String> {
     let base = if exe_path.is_dir() {
         exe_path.to_path_buf()
     } else {
@@ -4610,6 +4641,26 @@ async fn sync_work_cn_github_for_switch(account: &TraeAccount) -> bool {
 pub async fn switch_work_cn_account(
     account_id: String,
 ) -> Result<WorkCnSwitchResult, WorkCnCommandError> {
+    switch_work_cn_account_with_progress(account_id, |_| {}).await
+}
+
+/// 切换流程进度阶段 id（前端据此渲染阶段文案，由命令层经
+/// `work-cn-switch-progress` 事件推送）。顺序与下方步骤一致。
+pub const WORK_CN_SWITCH_STAGE_VALIDATING: &str = "validating";
+pub const WORK_CN_SWITCH_STAGE_CLOSING: &str = "closing";
+pub const WORK_CN_SWITCH_STAGE_INJECTING: &str = "injecting";
+pub const WORK_CN_SWITCH_STAGE_BINDING: &str = "binding";
+pub const WORK_CN_SWITCH_STAGE_LAUNCHING: &str = "launching";
+pub const WORK_CN_SWITCH_STAGE_VERIFYING: &str = "verifying";
+pub const WORK_CN_SWITCH_STAGE_SYNCING: &str = "syncing";
+
+/// 带进度回调的切换实现：每个阶段开始时调用 `on_progress(stage)`。
+/// 切换最长可耗时约 50 秒（关闭 20s + 验证 30s），无阶段事件时用户只能
+/// 对着转圈等待，体感等同卡死。
+pub async fn switch_work_cn_account_with_progress(
+    account_id: String,
+    on_progress: impl Fn(&str) + Send + Sync,
+) -> Result<WorkCnSwitchResult, WorkCnCommandError> {
     let platform = TraePlatformKind::TraeSoloCn;
 
     // 步骤 1：全局切号锁，禁止并发。
@@ -4624,6 +4675,7 @@ pub async fn switch_work_cn_account(
     };
 
     // 步骤 2：加载并校验目标账号。
+    on_progress(WORK_CN_SWITCH_STAGE_VALIDATING);
     let mut account = match load_account(&account_id) {
         Some(found) => found,
         None => {
@@ -4654,6 +4706,7 @@ pub async fn switch_work_cn_account(
 
     // 切换到"当前账号"：只打开客户端，不重复注入。
     if previous_bind.as_deref() == Some(account_id.as_str()) {
+        on_progress(WORK_CN_SWITCH_STAGE_LAUNCHING);
         let launched = if work_cn_switch_skip_process() {
             false
         } else {
@@ -4672,6 +4725,7 @@ pub async fn switch_work_cn_account(
                 }
             }
         };
+        on_progress(WORK_CN_SWITCH_STAGE_VERIFYING);
         verify_work_cn_switched_account(&account, Duration::from_secs(30), &storage_path).await?;
         return Ok(WorkCnSwitchResult {
             account_id,
@@ -4684,7 +4738,8 @@ pub async fn switch_work_cn_account(
         });
     }
 
-    // 步骤 5：正常关闭官方客户端（不默认强杀）。
+    // 步骤 5：正常关闭官方客户端（不默认强杀）。最长等待 20 秒。
+    on_progress(WORK_CN_SWITCH_STAGE_CLOSING);
     if !work_cn_switch_skip_process() {
         if let Err(error) = crate::modules::process::close_trae_platform_default("trae_solo_cn", 20)
         {
@@ -4696,6 +4751,7 @@ pub async fn switch_work_cn_account(
     }
 
     // 步骤 6：注入目标账号到 storage.json。
+    on_progress(WORK_CN_SWITCH_STAGE_INJECTING);
     if let Err(error) = inject_to_trae_at_path(&storage_path, &account_id) {
         rollback_storage_bytes(&storage_path, previous_bytes.as_deref());
         return Err(WorkCnCommandError::new(
@@ -4705,6 +4761,7 @@ pub async fn switch_work_cn_account(
     }
 
     // 步骤 7：绑定默认实例。
+    on_progress(WORK_CN_SWITCH_STAGE_BINDING);
     if let Err(error) = crate::modules::trae_instance::update_default_settings_for_platform(
         platform,
         Some(Some(account_id.clone())),
@@ -4720,6 +4777,7 @@ pub async fn switch_work_cn_account(
     }
 
     // 步骤 8：绑定并启动默认实例。
+    on_progress(WORK_CN_SWITCH_STAGE_LAUNCHING);
     let launched = if work_cn_switch_skip_process() {
         false
     } else {
@@ -4744,7 +4802,8 @@ pub async fn switch_work_cn_account(
         }
     };
 
-    // 步骤 9：启动后验证。
+    // 步骤 9：启动后验证。最长等待 30 秒。
+    on_progress(WORK_CN_SWITCH_STAGE_VERIFYING);
     if let Err(error) =
         verify_work_cn_switched_account(&account, Duration::from_secs(30), &storage_path).await
     {
@@ -4778,6 +4837,7 @@ pub async fn switch_work_cn_account(
     }
 
     // GitHub 同步（best-effort，不影响本地切号）。
+    on_progress(WORK_CN_SWITCH_STAGE_SYNCING);
     let github_synced = sync_work_cn_github_for_switch(&account).await;
 
     Ok(WorkCnSwitchResult {
@@ -5548,7 +5608,7 @@ async fn request_trae_json(
     let mut request = client
         .request(method, url)
         .header("Accept", "application/json")
-        .header("User-Agent", "Trae/1.0.0 antigravity-cockpit-tools")
+        .header("User-Agent", "Trae/1.0.0 qiehuan-yingyong")
         .header("Authorization", format!("Bearer {}", access_token))
         .header("x-cloudide-token", access_token);
 
@@ -5612,7 +5672,7 @@ async fn request_trae_pay_json(
     let mut request = client
         .request(method, url)
         .header("Accept", "application/json")
-        .header("User-Agent", "Trae/1.0.0 antigravity-cockpit-tools")
+        .header("User-Agent", "Trae/1.0.0 qiehuan-yingyong")
         .header("Authorization", format!("Cloud-IDE-JWT {}", access_token));
 
     if let Some(cookie_header) = cookie.and_then(|value| normalize_non_empty(Some(value))) {
@@ -6732,14 +6792,50 @@ fn work_cn_credits_now_secs() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
+/// 积分刷新失败的分类：区分「凭证失效」与「网络故障」。
+/// 之前一律报 "access token 可能已失效，请重新导入"，把断网/超时也误导成
+/// 需要重新登录导入，用户白白重做导入流程。
+///
+/// 错误字符串来源（request_trae_pay_json / parse_trae_response_body）：
+/// - HTTP 401/403 → "Trae 会话已过期或未认证，请重新登录"
+/// - reqwest 发送失败 → "请求 Trae 接口失败({url}): {e}"（超时/DNS/连接拒绝）
+/// - 响应读取失败 → "读取 Trae 响应失败({url}): {e}"
+/// - JSON 解析失败 → "解析 Trae 响应 JSON 失败(...)"（服务端异常响应）
+fn classify_credits_refresh_error(detail: &str) -> WorkCnCommandError {
+    if detail.contains("会话已过期") || detail.contains("未认证") {
+        return WorkCnCommandError::new(
+            WorkCnErrorCode::CreditsTokenExpired,
+            "登录凭证已失效（服务端返回 401/403），请在官方客户端重新登录该账号后重新导入",
+        );
+    }
+    if detail.contains("请求 Trae 接口失败")
+        || detail.contains("读取 Trae 响应失败")
+        || detail.contains("创建 HTTP 客户端失败")
+    {
+        return WorkCnCommandError::new(
+            WorkCnErrorCode::CreditsNetworkError,
+            "网络请求失败或超时，请检查网络连接后重试",
+        );
+    }
+    WorkCnCommandError::new(
+        WorkCnErrorCode::SnapshotIncomplete,
+        "积分查询失败（服务端响应异常），请稍后重试",
+    )
+}
+
 /// Query the credit balance for a saved Work CN account. Query only — this never
 /// performs a local check-in / claim.
 ///
 /// `force_refresh=true` calls the upstream usage-only refresh
 /// (`refresh_account_usage_only_async`), reusing the existing request chain; it
-/// must NOT call `/trae/api/v2/ug/checkin_credits/claim`. On failure (e.g. an
-/// expired access token) a structured error is returned — it never clears the
-/// local account and never blocks switching.
+/// must NOT call `/trae/api/v2/ug/checkin_credits/claim`. On failure a
+/// classified structured error is returned（凭证失效 / 网络故障 / 服务端异常，
+/// 见 `classify_credits_refresh_error`）— it never clears the local account and
+/// never blocks switching.
+///
+/// 注意：`refresh_quota_snapshot` 网络失败时**不返回 Err**，只把错误静默写进
+/// `quota_query_last_error` 并返回 Ok+旧缓存数据——这里必须显式检查该字段，
+/// 否则刷新失败会被当成成功，用户看着过期积分毫无感知。
 pub async fn get_work_cn_credits(
     account_id: &str,
     force_refresh: bool,
@@ -6749,13 +6845,16 @@ pub async fn get_work_cn_credits(
 
     let account = if force_refresh {
         match refresh_account_usage_only_async(account_id, None).await {
-            Ok(updated) => updated,
+            Ok(updated) => {
+                // 本次刷新没拿到 usage 数据（refresh_quota_snapshot 静默失败）。
+                // 该字段成功时会被清空，Some 即代表本次失败。
+                if let Some(last_error) = updated.quota_query_last_error.clone() {
+                    return Err(classify_credits_refresh_error(&last_error).with_detail(last_error));
+                }
+                updated
+            }
             Err(err) => {
-                return Err(WorkCnCommandError::new(
-                    WorkCnErrorCode::SnapshotIncomplete,
-                    "积分查询失败：access token 可能已失效，请在官方客户端重新登录后重新导入本账号",
-                )
-                .with_detail(err));
+                return Err(classify_credits_refresh_error(&err).with_detail(err));
             }
         }
     } else {
@@ -7726,6 +7825,28 @@ mod tests {
         let root = work_cn_test_temp_dir("work_cn_select_none");
         let candidates = vec![root.join("a"), root.join("b")];
         assert_eq!(select_trae_data_dir_candidate(&candidates), None);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn work_cn_storage_path_uses_selected_renamed_data_dir() {
+        let root = work_cn_test_temp_dir("work_cn_storage_selected_path");
+        let legacy = root.join("TRAE SOLO CN");
+        let renamed = root.join("TRAE Work CN");
+        work_cn_write_storage(&legacy, true);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        let renamed_storage = work_cn_write_storage(&renamed, true);
+
+        let candidates = vec![legacy, renamed];
+        let selected = select_trae_data_dir_candidate(&candidates).expect("selected dir");
+        let selected_storage = selected
+            .join("User")
+            .join("globalStorage")
+            .join("storage.json");
+
+        assert_eq!(selected_storage, renamed_storage);
+        assert_eq!(storage_path_for_data_dir(&selected), renamed_storage);
+
         let _ = fs::remove_dir_all(&root);
     }
 

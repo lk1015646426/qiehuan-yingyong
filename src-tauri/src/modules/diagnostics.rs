@@ -12,8 +12,8 @@ use uuid::Uuid;
 
 use crate::modules::{config, logger};
 
-const SENTRY_CLIENT: &str = "cockpit-tools/1.0";
-const PROFILE_ENV: &str = "COCKPIT_TOOLS_PROFILE";
+const SENTRY_CLIENT: &str = "qiehuan-yingyong/1.0";
+const PROFILE_ENV: &str = "QIEHUAN_YINGYONG_PROFILE";
 const FRONTEND_READY_TIMEOUT_MS: u64 = 15_000;
 const SAME_EVENT_THROTTLE_MS: u128 = 60_000;
 const MAX_EVENTS_PER_MINUTE: usize = 30;
@@ -345,7 +345,7 @@ fn build_sentry_event(
     contexts.insert(
         "runtime".to_string(),
         json!({
-            "appName": "Cockpit Tools",
+            "appName": "切换应用",
             "appVersion": env!("CARGO_PKG_VERSION"),
             "profile": profile_name(),
             "os": std::env::consts::OS,
@@ -366,7 +366,7 @@ fn build_sentry_event(
         "timestamp": Utc::now().to_rfc3339(),
         "platform": "rust",
         "level": level,
-        "release": format!("cockpit-tools@{}", env!("CARGO_PKG_VERSION")),
+        "release": format!("qiehuan-yingyong@{}", env!("CARGO_PKG_VERSION")),
         "environment": if cfg!(debug_assertions) { "development" } else { "production" },
         "message": message,
         "tags": tags,
@@ -416,9 +416,11 @@ fn send_sentry_event(dsn: &SentryDsn, event: &Value) -> Result<(), String> {
 }
 
 fn current_dsn() -> Option<String> {
-    let runtime = std::env::var("COCKPIT_SENTRY_DSN")
+    let runtime = std::env::var("QIEHUAN_YINGYONG_SENTRY_DSN")
         .ok()
+        .or_else(|| std::env::var("COCKPIT_SENTRY_DSN").ok())
         .or_else(|| std::env::var("SENTRY_DSN").ok())
+        .or_else(|| option_env!("QIEHUAN_YINGYONG_SENTRY_DSN").map(ToString::to_string))
         .or_else(|| option_env!("COCKPIT_SENTRY_DSN").map(ToString::to_string))
         .or_else(|| option_env!("SENTRY_DSN").map(ToString::to_string))
         .unwrap_or_default();
@@ -448,8 +450,9 @@ fn parse_dsn(raw: &str) -> Option<SentryDsn> {
 }
 
 fn should_send(level: &str, message: &str, source: Option<&str>, phase: Option<&str>) -> bool {
-    let env_disabled = std::env::var("COCKPIT_DISABLE_ERROR_REPORTING")
+    let env_disabled = std::env::var("QIEHUAN_YINGYONG_DISABLE_ERROR_REPORTING")
         .ok()
+        .or_else(|| std::env::var("COCKPIT_DISABLE_ERROR_REPORTING").ok())
         .map(|value| {
             let value = value.trim().to_ascii_lowercase();
             value == "1" || value == "true" || value == "yes"

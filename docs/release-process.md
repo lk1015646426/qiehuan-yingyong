@@ -1,4 +1,4 @@
-# 发布流程（TRAE Work CN 切换工具 / Windows NSIS）
+# 发布流程（切换应用 / Windows NSIS）
 
 > 本 fork 唯一发布目标：Windows x64 NSIS 安装包。上游的 macOS dmg / Homebrew Cask / Linux / updater 流程**均不适用**（bundle targets 仅 `["nsis"]`，`createUpdaterArtifacts: false`）。
 
@@ -20,7 +20,7 @@
 npm run tauri -- build --ci
 ```
 
-产物：`target\release\bundle\nsis\切换工具_<version>_x64-setup.exe`
+产物：`target\release\bundle\nsis\切换应用_<version>_x64-setup.exe`
 
 - NSIS `installMode: currentUser`，无需管理员（gh 安装等操作中 UAC 由系统按需弹出）。
 - `installer-hooks.nsh` 会在安装时自动结束旧版本进程，支持覆盖安装。
@@ -28,7 +28,7 @@ npm run tauri -- build --ci
 ## 3. 校验与冒烟
 
 ```powershell
-Get-FileHash "target\release\bundle\nsis\切换工具_<version>_x64-setup.exe" -Algorithm SHA256
+Get-FileHash "target\release\bundle\nsis\切换应用_<version>_x64-setup.exe" -Algorithm SHA256
 ```
 
 装机冒烟清单（人工）：

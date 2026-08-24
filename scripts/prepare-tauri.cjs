@@ -6,17 +6,17 @@ if (process.platform !== 'win32') {
 }
 
 const repoRoot = path.resolve(__dirname, '..');
-const targetExe = path.join(repoRoot, 'target', 'debug', 'cockpit_tools.exe');
+const targetExe = path.join(repoRoot, 'target', 'debug', 'qiehuan-yingyong.exe');
 const escapedTarget = targetExe.replace(/'/g, "''").toLowerCase();
 
 const script = `
 $ErrorActionPreference = 'Stop'
 $target = '${escapedTarget}'
-$processes = Get-CimInstance Win32_Process -Filter "Name = 'cockpit_tools.exe'" |
+$processes = Get-CimInstance Win32_Process -Filter "Name = 'qiehuan-yingyong.exe'" |
   Where-Object { $_.ExecutablePath -and ($_.ExecutablePath.ToLowerInvariant() -eq $target) }
 foreach ($process in $processes) {
   Stop-Process -Id $process.ProcessId -Force
-  Write-Output ("Stopped stale Cockpit Tools debug process PID " + $process.ProcessId)
+  Write-Output ("Stopped stale 切换应用 debug process PID " + $process.ProcessId)
 }
 `;
 

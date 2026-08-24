@@ -1,4 +1,4 @@
-// TRAE Work CN 切换工具 - 应用入口
+// 切换应用 - 应用入口
 //
 // 侧边栏双面板布局（复用上游 pages/sidebar.css 的 .with-sidebar 体系）：
 // - TRAE：WorkCnSwitcherPage（账号快照管理 / 一键切换）
@@ -48,7 +48,7 @@ export default function App() {
         <div className="sidebar-header">
           <div className="sidebar-brand">
             <img src={traeCnIcon} alt="TRAE" width={22} height={22} />
-            <h1>切换工具</h1>
+            <h1>切换应用</h1>
           </div>
         </div>
         <nav className="sidebar-nav">

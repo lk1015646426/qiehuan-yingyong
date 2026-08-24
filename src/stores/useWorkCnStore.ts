@@ -16,8 +16,9 @@ import {
   setupGhCli,
   switchWorkCnAccount,
   syncWorkCnGitHubAccount,
+  WORK_CN_SWITCH_PROGRESS_EVENT,
 } from '../services/workCnService';
-import type { GhSetupProgress } from '../services/workCnService';
+import type { GhSetupProgress, WorkCnSwitchProgress } from '../services/workCnService';
 import type {
   WorkCnAccountView,
   WorkCnCreditsSummary,
@@ -35,6 +36,9 @@ interface WorkCnState {
   loading: boolean;
   importing: boolean;
   switchingId: string | null;
+  // 当前切号所处的阶段（validating/closing/injecting/binding/launching/
+  // verifying/syncing），由后端 work-cn-switch-progress 事件驱动。
+  switchStage: WorkCnSwitchProgress['stage'] | null;
   deletingId: string | null;
   error: string | null;
   lastImportWarning: string | null;
@@ -83,6 +87,7 @@ export const useWorkCnStore = create<WorkCnState>((set, get) => ({
   loading: false,
   importing: false,
   switchingId: null,
+  switchStage: null,
   deletingId: null,
   error: null,
   lastImportWarning: null,
@@ -174,19 +179,34 @@ export const useWorkCnStore = create<WorkCnState>((set, get) => ({
     }
   },
   async switchTo(accountId) {
-    set({ switchingId: accountId, error: null, lastSwitchResult: null });
+    set({ switchingId: accountId, switchStage: null, error: null, lastSwitchResult: null });
+    // 先注册进度监听再发起调用，确保第一阶段事件不丢失。
+    let unlisten: (() => void) | undefined;
     try {
+      unlisten = await listen<WorkCnSwitchProgress>(
+        WORK_CN_SWITCH_PROGRESS_EVENT,
+        (event) => {
+          if (event.payload.accountId === accountId) {
+            set({ switchStage: event.payload.stage });
+          }
+        },
+      );
       const result = await switchWorkCnAccount(accountId);
-      set({ switchingId: null, lastSwitchResult: result });
+      set({ switchingId: null, switchStage: null, lastSwitchResult: result });
       // Refresh the account list so the "current" marker (if any) updates.
       void listWorkCnAccounts()
         .then((accounts) => set({ accounts }))
         .catch(() => undefined);
+      // 切换到新账号后强制联网刷新该账号积分，避免卡片一直显示旧账号的缓存余额。
+      void get().refreshCredits(accountId, true);
     } catch (err) {
       set({
         error: err instanceof Error ? err.message : String(err),
         switchingId: null,
+        switchStage: null,
       });
+    } finally {
+      unlisten?.();
     }
   },
   async deleteAccount(accountId) {

@@ -240,6 +240,10 @@ pub enum WorkCnErrorCode {
     VerifyAccountMismatch,
     RollbackFailed,
     Busy,
+    /// 积分查询失败：登录凭证失效（HTTP 401/403）。
+    CreditsTokenExpired,
+    /// 积分查询失败：网络故障/超时（凭证本身未必有问题）。
+    CreditsNetworkError,
 }
 
 /// Unified command error: a machine-readable `code` plus a human message and

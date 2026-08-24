@@ -18,22 +18,43 @@ fn queue_workbuddy_github_sync(reason: &'static str) {
     workbuddy_github::queue_background_sync(reason, std::time::Duration::ZERO, false);
 }
 
+/// 运行状态后台探测完成事件（payload: bool，是否检测到运行中的客户端）。
+/// 进程探测（PowerShell，冷启动可达 5 秒）不阻塞安装检测结果，探测完成后
+/// 通过该事件补发，前端合并进 installation.running。
+pub const WORKBUDDY_INSTALLATION_RUNNING_EVENT: &str = "workbuddy:installation-running";
+
 #[tauri::command]
-pub async fn get_workbuddy_installation() -> Result<WorkBuddyInstallation, String> {
-    tauri::async_runtime::spawn_blocking(|| {
+pub async fn get_workbuddy_installation(
+    app: tauri::AppHandle,
+) -> Result<WorkBuddyInstallation, String> {
+    // 关键路径与 TRAE detect_installation 对齐：只做文件系统/注册表检测，
+    // 毫秒级返回；running 先给 false 占位，由后台探测补齐。
+    let installation = tauri::async_runtime::spawn_blocking(|| {
         let executable_path = process::resolve_workbuddy_launch_path().ok();
         let auth_file_path = workbuddy_account::default_auth_file_path()?;
         Ok(WorkBuddyInstallation {
             installed: executable_path.is_some(),
             executable_path: executable_path.map(|path| path.to_string_lossy().to_string()),
             auth_file_path: auth_file_path.to_string_lossy().to_string(),
-            running: !process::collect_workbuddy_process_entries().is_empty(),
+            running: false,
             current_account_id: workbuddy_account::current_managed_account_id(),
             github_cleanup_pending: workbuddy_github::github_cleanup_pending(),
         })
     })
     .await
-    .map_err(|error| format!("检测 WorkBuddy 安装状态任务失败: {error}"))?
+    .map_err(|error| format!("检测 WorkBuddy 安装状态任务失败: {error}"))?;
+
+    tauri::async_runtime::spawn(async move {
+        let running = tauri::async_runtime::spawn_blocking(|| {
+            !process::collect_workbuddy_process_entries().is_empty()
+        })
+        .await
+        .unwrap_or(false);
+        use tauri::Emitter;
+        let _ = app.emit(WORKBUDDY_INSTALLATION_RUNNING_EVENT, running);
+    });
+
+    installation
 }
 
 #[tauri::command]
@@ -74,9 +95,13 @@ pub async fn import_current_workbuddy_account(
     .map_err(|error| format!("导入 WorkBuddy 账号任务失败: {error}"))?
 }
 
+/// 账号列表涉及逐账号解密落盘文件，账号多时较重；在阻塞线程池执行，
+/// 避免同步命令占用主线程冻结窗口（与 work_cn 命令约定一致）。
 #[tauri::command]
-pub fn list_workbuddy_accounts() -> Result<Vec<WorkBuddyAccountView>, String> {
-    workbuddy_account::list_workbuddy_accounts()
+pub async fn list_workbuddy_accounts() -> Result<Vec<WorkBuddyAccountView>, String> {
+    tauri::async_runtime::spawn_blocking(workbuddy_account::list_workbuddy_accounts)
+        .await
+        .map_err(|error| format!("加载 WorkBuddy 账号列表任务失败: {error}"))?
 }
 
 #[tauri::command]
@@ -123,6 +148,17 @@ pub async fn delete_workbuddy_account(account_id: String) -> Result<bool, String
 
 #[tauri::command]
 pub async fn switch_workbuddy_account(account_id: String) -> Result<WorkBuddySwitchResult, String> {
+    // 目标账号可能已在 WorkBuddy 后台轮换过 access token；先用 refresh token
+    // 获取最新快照，避免把旧凭证重新写回官方客户端。
+    crate::modules::workbuddy_account::refresh_account_auth(&account_id)
+        .await
+        .map_err(|error| {
+            if crate::modules::workbuddy_account::refresh_error_requires_login(&error) {
+                format!("目标 WorkBuddy 账号的 refresh token 已失效，请重新登录后再导入：{error}")
+            } else {
+                format!("目标 WorkBuddy 账号认证刷新失败，请稍后重试：{error}")
+            }
+        })?;
     tauri::async_runtime::spawn_blocking(move || switch_workbuddy_account_blocking(&account_id))
         .await
         .map_err(|error| format!("切换 WorkBuddy 账号任务失败: {error}"))?
@@ -133,6 +169,7 @@ fn switch_workbuddy_account_blocking(
     account_id: &str,
 ) -> Result<WorkBuddySwitchResult, WorkBuddyCommandError> {
     let _switch_guard = try_lock_workbuddy_switch()?;
+    let transaction_id = uuid::Uuid::new_v4().to_string();
 
     let snapshot = workbuddy_account::snapshot_json(account_id).map_err(|_| {
         WorkBuddyCommandError::new(
@@ -176,6 +213,7 @@ fn switch_workbuddy_account_blocking(
             .with_detail(error.to_string()));
         }
     };
+    log_workbuddy_auth_checkpoint(&transaction_id, "before_close", &auth_path);
     process::close_workbuddy_instances(std::slice::from_ref(&user_data_dir), 20).map_err(
         |error| {
             WorkBuddyCommandError::new(
@@ -188,21 +226,25 @@ fn switch_workbuddy_account_blocking(
 
     // 客户端退出期间可能完成最后一次 token 刷新并写回认证文件。此处必须在
     // 关闭成功后马上保存当前托管账号的新快照，避免下次切回时回写旧 token。
-    workbuddy_account::refresh_current_managed_snapshot().map_err(|error| {
-        WorkBuddyCommandError::new(
+    if let Err(error) = workbuddy_account::refresh_current_managed_snapshot() {
+        restore_previous_workbuddy_auth(&auth_path, previous_auth.as_deref(), previous_auth_exists);
+        return Err(WorkBuddyCommandError::new(
             WorkBuddyErrorCode::InjectFailed,
             "读取当前 WorkBuddy 登录状态失败，未执行切换",
         )
-        .with_detail(error)
-    })?;
+        .with_detail(error));
+    }
+    log_workbuddy_auth_checkpoint(&transaction_id, "after_close_refresh", &auth_path);
 
-    workbuddy_account::write_account_to_default_client(account_id).map_err(|error| {
-        WorkBuddyCommandError::new(
+    if let Err(error) = workbuddy_account::write_account_to_default_client(account_id) {
+        restore_previous_workbuddy_auth(&auth_path, previous_auth.as_deref(), previous_auth_exists);
+        return Err(WorkBuddyCommandError::new(
             WorkBuddyErrorCode::InjectFailed,
             "写入 WorkBuddy 目标账号失败",
         )
-        .with_detail(error)
-    })?;
+        .with_detail(error));
+    }
+    log_workbuddy_auth_checkpoint(&transaction_id, "after_target_write", &auth_path);
 
     let pid = match process::start_workbuddy_default_with_args_with_new_window(&[], true) {
         Ok(pid) => pid,
@@ -219,30 +261,59 @@ fn switch_workbuddy_account_blocking(
             .with_detail(error));
         }
     };
-    workbuddy_account::mark_last_used(account_id).map_err(|error| {
-        WorkBuddyCommandError::new(
-            WorkBuddyErrorCode::InjectFailed,
-            "WorkBuddy 已启动，但更新当前账号状态失败",
-        )
-        .with_detail(error)
-    })?;
+    spawn_workbuddy_post_launch_auth_checks(transaction_id.clone(), auth_path.clone());
+    if let Err(error) = workbuddy_account::mark_last_used(account_id) {
+        crate::modules::logger::log_warn(&format!(
+            "[WorkBuddy] 客户端已启动，但记录当前账号失败: account_id={}, error={}",
+            account_id, error
+        ));
+    }
     queue_workbuddy_github_sync("switch");
     if let Err(error) = process::activate_workbuddy_window_for_pid(pid) {
-        return Err(WorkBuddyCommandError::new(
-            WorkBuddyErrorCode::WindowActivationFailed,
-            "账号已切换并启动，但 WorkBuddy 窗口激活失败",
-        )
-        .with_detail(format!("pid={pid}; {error}")));
+        // 进程和认证状态已经成功切换；窗口激活失败不应再向前端报告“切换失败”，
+        // 否则用户会误以为旧账号仍在使用。记录警告后交由用户手动切到已启动窗口。
+        crate::modules::logger::log_warn(&format!(
+            "[WorkBuddy] 账号已切换并启动，但窗口激活失败: pid={}, error={}",
+            pid, error
+        ));
     }
     let github_sync_pending = true;
 
     Ok(WorkBuddySwitchResult {
-        transaction_id: uuid::Uuid::new_v4().to_string(),
+        transaction_id,
         account_id: account_id.to_string(),
         verified_uid: expected_uid,
         forced_close: false,
         github_sync_pending,
     })
+}
+
+fn log_workbuddy_auth_checkpoint(transaction_id: &str, stage: &str, auth_path: &Path) {
+    match workbuddy_account::auth_file_diagnostic(auth_path) {
+        Ok(diagnostic) => crate::modules::logger::log_info(&format!(
+            "[WorkBuddy AuthTrace] tx={} stage={} {}",
+            transaction_id, stage, diagnostic
+        )),
+        Err(error) => crate::modules::logger::log_warn(&format!(
+            "[WorkBuddy AuthTrace] tx={} stage={} read_failed={}",
+            transaction_id, stage, error
+        )),
+    }
+}
+
+fn spawn_workbuddy_post_launch_auth_checks(transaction_id: String, auth_path: std::path::PathBuf) {
+    let _ = std::thread::Builder::new()
+        .name("workbuddy-auth-trace".to_string())
+        .spawn(move || {
+            for (delay, stage) in [
+                (std::time::Duration::from_secs(1), "post_launch_1s"),
+                (std::time::Duration::from_secs(2), "post_launch_3s"),
+                (std::time::Duration::from_secs(7), "post_launch_10s"),
+            ] {
+                std::thread::sleep(delay);
+                log_workbuddy_auth_checkpoint(&transaction_id, stage, &auth_path);
+            }
+        });
 }
 
 fn restore_previous_workbuddy_auth(path: &Path, previous: Option<&[u8]>, existed: bool) {
@@ -284,5 +355,36 @@ mod tests {
             error.code,
             crate::models::workbuddy::WorkBuddyErrorCode::Busy
         );
+    }
+
+    #[test]
+    fn target_auth_write_failure_branch_restores_previous_auth() {
+        let source = include_str!("workbuddy.rs");
+        let write_branch = source
+            .split("workbuddy_account::write_account_to_default_client(account_id)")
+            .nth(1)
+            .expect("目标认证写入分支应存在");
+        let before_launch = write_branch
+            .split("start_workbuddy_default_with_args_with_new_window")
+            .next()
+            .expect("写入失败分支应位于启动前");
+
+        assert!(before_launch.contains("restore_previous_workbuddy_auth"));
+    }
+
+    #[test]
+    fn window_activation_failure_does_not_report_switch_failure_after_launch() {
+        let source = include_str!("workbuddy.rs");
+        let activation_branch = source
+            .split("process::activate_workbuddy_window_for_pid(pid)")
+            .nth(1)
+            .expect("窗口激活分支应存在");
+        let branch_body = activation_branch
+            .split("let github_sync_pending")
+            .next()
+            .expect("窗口激活分支应在结果构造前结束");
+
+        assert!(!branch_body.contains("return Err"));
+        assert!(branch_body.contains("log_warn"));
     }
 }

@@ -1,6 +1,6 @@
 # NOTICE
 
-本项目 **TRAE Work CN 账号切换器**（`trae-work-cn-switcher`）是
+本项目 **切换应用**（`qiehuan-yingyong`）是
 [Cockpit Tools](https://github.com/jlcodes99/cockpit-tools) 的派生作品。
 
 ## 上游来源
@@ -13,9 +13,9 @@
 ## 派生说明
 
 本项目在上游 Cockpit Tools 的基础上进行改造，目标是构建 Windows 专用的
-TRAE Work CN 四账号一键切换器。主要改动包括：
+切换应用的 Windows 多账号管理体验。主要改动包括：
 
-- 收敛产品品牌与应用壳为“TRAE Work CN 账号切换器”；
+- 收敛产品品牌与应用壳为“切换应用”；
 - 隐藏 Cockpit Tools 原有的多平台入口，仅保留 TRAE Work CN 相关界面；
 - 关闭指向上游 Cockpit Tools 发布源的应用内更新通道。
 

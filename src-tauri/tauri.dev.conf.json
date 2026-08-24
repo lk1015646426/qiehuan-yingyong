@@ -1,12 +1,12 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "TRAE Work CN 账号切换器 Dev",
-  "identifier": "com.lk.trae-work-cn-switcher.dev",
+  "productName": "切换应用 Dev",
+  "identifier": "com.qiehuanyingyong.desktop.dev",
   "app": {
     "windows": [
       {
         "label": "main",
-        "title": "TRAE Work CN 账号切换器 Dev",
+        "title": "切换应用 Dev",
         "width": 960,
         "height": 680,
         "minWidth": 820,
@@ -19,7 +19,7 @@
       },
       {
         "label": "floating-card",
-        "title": "TRAE Work CN 账号切换器 Dev",
+        "title": "切换应用 Dev",
         "create": false,
         "width": 250,
         "height": 290,

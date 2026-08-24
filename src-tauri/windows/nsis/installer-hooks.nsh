@@ -9,11 +9,17 @@ Var ShortcutRepairRequired
 
   ; 升级安装：旧版本可能仍在运行（托盘常驻），文件被锁会导致覆盖失败。
   ; 静默结束运行中的进程后继续安装：
-  ;  - 切换工具.exe：当前产品名（同产品名原地升级时的自锁定）。
-  ;  - cockpit-tools.exe：历史产品名副本（用户正运行的旧版）。
+  ;  - qiehuan-yingyong.exe：当前机器标识（同产品名原地升级时的自锁定）。
+  ;  - cockpit-tools.exe / trae-work-cn-switcher.exe：历史产品名副本。
   nsExec::Exec 'taskkill /F /IM "${PRODUCTNAME}.exe" /T'
   Pop $R9
+  nsExec::Exec 'taskkill /F /IM qiehuan-yingyong.exe /T'
+  Pop $R9
+  nsExec::Exec 'taskkill /F /IM qiehuan_yingyong.exe /T'
+  Pop $R9
   nsExec::Exec 'taskkill /F /IM cockpit-tools.exe /T'
+  Pop $R9
+  nsExec::Exec 'taskkill /F /IM trae-work-cn-switcher.exe /T'
   Pop $R9
   Sleep 500
 

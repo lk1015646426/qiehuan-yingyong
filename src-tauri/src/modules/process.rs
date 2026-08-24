@@ -3,6 +3,7 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::{LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 #[cfg(not(target_os = "macos"))]
@@ -41,6 +42,38 @@ const WINDOWS_PROCESS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(target_os = "windows")]
 static CODEX_STORE_APP_USER_MODEL_ID_CACHE: std::sync::OnceLock<String> =
     std::sync::OnceLock::new();
+
+/// Trae 安装路径解析缓存（键：平台标识 + 配置的自定义路径）。
+/// 路径探测含配置读取与多路径存在性检查，切换 / 检测 / 关闭流程每次
+/// 都全量重跑。Ok 结果 30s 内复用；Err 结果 3s（"未安装"场景避免反复
+/// 全量探测，又能较快感知新安装）。用户修改配置路径时键变化自动失效。
+static TRAE_LAUNCH_PATH_CACHE: LazyLock<
+    Mutex<HashMap<(String, String), (Instant, Result<std::path::PathBuf, String>)>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+const TRAE_LAUNCH_PATH_TTL_OK: Duration = Duration::from_secs(30);
+const TRAE_LAUNCH_PATH_TTL_ERR: Duration = Duration::from_secs(3);
+
+/// Windows 进程探测节流缓存（键：期望启动路径 + 平台标识）。
+/// PowerShell（Get-CimInstance）单次探测 300ms~1s+，而关闭 / 启动验证
+/// 的轮询循环以 150ms 间隔连发、页面加载也会密集探测，节流后 800ms
+/// 窗口内复用上次非空结果。空结果不缓存（避免 PowerShell 漏检时跳过
+/// sysinfo 兜底）；send_close_signal 主动清空缓存，保证 kill 后验证
+/// 探测反映真实状态。
+#[cfg(target_os = "windows")]
+static TRAE_PROCESS_PROBE_CACHE: LazyLock<
+    Mutex<HashMap<(String, String), (Instant, Vec<(u32, Option<String>)>)>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+#[cfg(target_os = "windows")]
+const TRAE_PROCESS_PROBE_MIN_INTERVAL: Duration = Duration::from_millis(800);
+
+/// WorkBuddy 进程探测节流缓存（与 TRAE_PROCESS_PROBE_CACHE 同策略）。
+/// PowerShell（Get-CimInstance）单次 300ms~1s+，页面加载 / 关闭轮询会连发；
+/// 800ms 窗口内复用上次非空结果。空结果不缓存；send_close_signal 主动清空。
+#[cfg(target_os = "windows")]
+static WORKBUDDY_PROCESS_PROBE_CACHE: LazyLock<Mutex<Option<(Instant, Vec<(u32, Option<String>)>)>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AppLaunchCandidate {
@@ -89,7 +122,10 @@ fn parse_env_bool(value: &str) -> Option<bool> {
 }
 
 fn command_trace_enabled() -> bool {
-    if let Ok(value) = std::env::var("COCKPIT_COMMAND_TRACE") {
+    for key in ["QIEHUAN_YINGYONG_COMMAND_TRACE", "COCKPIT_COMMAND_TRACE"] {
+        let Ok(value) = std::env::var(key) else {
+            continue;
+        };
         if let Some(enabled) = parse_env_bool(&value) {
             return enabled;
         }
@@ -1521,13 +1557,19 @@ exit 0
 }
 
 fn should_detach_child() -> bool {
-    if let Ok(value) = std::env::var("COCKPIT_CHILD_LOGS") {
+    for key in ["QIEHUAN_YINGYONG_CHILD_LOGS", "COCKPIT_CHILD_LOGS"] {
+        let Ok(value) = std::env::var(key) else {
+            continue;
+        };
         let lowered = value.trim().to_lowercase();
         if matches!(lowered.as_str(), "1" | "true" | "yes" | "on") {
             return false;
         }
     }
-    if let Ok(value) = std::env::var("COCKPIT_CHILD_DETACH") {
+    for key in ["QIEHUAN_YINGYONG_CHILD_DETACH", "COCKPIT_CHILD_DETACH"] {
+        let Ok(value) = std::env::var(key) else {
+            continue;
+        };
         let lowered = value.trim().to_lowercase();
         if matches!(lowered.as_str(), "0" | "false" | "no" | "off") {
             return false;
@@ -4355,6 +4397,35 @@ fn trae_configured_app_scan_roots(
 pub(crate) fn resolve_trae_launch_path_for_platform(
     platform: crate::modules::trae_account::TraePlatformKind,
 ) -> Result<std::path::PathBuf, String> {
+    let configured =
+        trae_configured_app_path(&config::get_user_config(), platform).to_string();
+    let key = (platform.provider_key().to_string(), configured);
+
+    if let Some((at, cached)) = TRAE_LAUNCH_PATH_CACHE
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&key).cloned())
+    {
+        let ttl = if cached.is_ok() {
+            TRAE_LAUNCH_PATH_TTL_OK
+        } else {
+            TRAE_LAUNCH_PATH_TTL_ERR
+        };
+        if at.elapsed() < ttl {
+            return cached;
+        }
+    }
+
+    let result = resolve_trae_launch_path_uncached(platform);
+    if let Ok(mut cache) = TRAE_LAUNCH_PATH_CACHE.lock() {
+        cache.insert(key, (Instant::now(), result.clone()));
+    }
+    result
+}
+
+fn resolve_trae_launch_path_uncached(
+    platform: crate::modules::trae_account::TraePlatformKind,
+) -> Result<std::path::PathBuf, String> {
     let current = config::get_user_config();
     if let Some(custom) = normalize_custom_path(Some(trae_configured_app_path(&current, platform)))
     {
@@ -4382,7 +4453,42 @@ pub(crate) fn resolve_trae_launch_path_for_platform(
     Err(app_path_missing_error(platform.provider_key()))
 }
 
+/// WorkBuddy 安装路径解析缓存（键：两处配置路径）。与 TRAE 同策略：
+/// Ok 30s / Err 3s；用户在设置里改路径时键变化自动失效。
+static WORKBUDDY_LAUNCH_PATH_CACHE: LazyLock<
+    Mutex<HashMap<(String, String), (Instant, Result<std::path::PathBuf, String>)>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
 pub fn resolve_workbuddy_launch_path() -> Result<std::path::PathBuf, String> {
+    let settings_path = crate::modules::workbuddy_settings::load_workbuddy_settings()
+        .executable_path
+        .unwrap_or_default();
+    let config_path = config::get_user_config().workbuddy_app_path;
+    let key = (settings_path, config_path);
+
+    if let Some((at, cached)) = WORKBUDDY_LAUNCH_PATH_CACHE
+        .lock()
+        .ok()
+        .and_then(|cache| cache.get(&key).cloned())
+    {
+        let ttl = if cached.is_ok() {
+            TRAE_LAUNCH_PATH_TTL_OK
+        } else {
+            TRAE_LAUNCH_PATH_TTL_ERR
+        };
+        if at.elapsed() < ttl {
+            return cached;
+        }
+    }
+
+    let result = resolve_workbuddy_launch_path_uncached();
+    if let Ok(mut cache) = WORKBUDDY_LAUNCH_PATH_CACHE.lock() {
+        cache.insert(key, (Instant::now(), result.clone()));
+    }
+    result
+}
+
+fn resolve_workbuddy_launch_path_uncached() -> Result<std::path::PathBuf, String> {
     if let Some(custom) =
         crate::modules::workbuddy_settings::load_workbuddy_settings().executable_path
     {
@@ -7928,12 +8034,28 @@ pub fn collect_trae_process_entries_for_platform(
         let expected = expected_launch
             .as_deref()
             .expect("expected launch path must exist");
+        // 节流：800ms 内的重复探测复用上次非空结果，见
+        // TRAE_PROCESS_PROBE_CACHE 注释。kill 动作（send_close_signal）会
+        // 清空缓存，关闭流程 kill 后的验证探测仍是真实数据。
+        let probe_key = (expected.to_string(), platform.provider_key().to_string());
+        if let Some((at, entries)) = TRAE_PROCESS_PROBE_CACHE
+            .lock()
+            .ok()
+            .and_then(|cache| cache.get(&probe_key).cloned())
+        {
+            if at.elapsed() < TRAE_PROCESS_PROBE_MIN_INTERVAL && !entries.is_empty() {
+                return entries;
+            }
+        }
         let entries = collect_named_electron_process_entries_from_powershell(
             expected,
             "Trae.exe",
             platform.display_name(),
         );
         if !entries.is_empty() {
+            if let Ok(mut cache) = TRAE_PROCESS_PROBE_CACHE.lock() {
+                cache.insert(probe_key, (Instant::now(), entries.clone()));
+            }
             return entries;
         }
         crate::modules::logger::log_warn(
@@ -7989,6 +8111,16 @@ fn resolve_workbuddy_probe_result(
 
 #[cfg(target_os = "windows")]
 fn collect_workbuddy_process_entries_checked() -> Result<Vec<(u32, Option<String>)>, String> {
+    // 节流：800ms 内复用上次非空结果，见 WORKBUDDY_PROCESS_PROBE_CACHE 注释。
+    if let Some((at, entries)) = WORKBUDDY_PROCESS_PROBE_CACHE
+        .lock()
+        .ok()
+        .and_then(|cache| cache.clone())
+    {
+        if at.elapsed() < TRAE_PROCESS_PROBE_MIN_INTERVAL && !entries.is_empty() {
+            return Ok(entries);
+        }
+    }
     let powershell = collect_workbuddy_process_entries_from_powershell();
     let fallback = if powershell
         .as_ref()
@@ -7999,7 +8131,15 @@ fn collect_workbuddy_process_entries_checked() -> Result<Vec<(u32, Option<String
     } else {
         Vec::new()
     };
-    resolve_workbuddy_probe_result(powershell, fallback)
+    let result = resolve_workbuddy_probe_result(powershell, fallback);
+    if let Ok(entries) = &result {
+        if !entries.is_empty() {
+            if let Ok(mut cache) = WORKBUDDY_PROCESS_PROBE_CACHE.lock() {
+                *cache = Some((Instant::now(), entries.clone()));
+            }
+        }
+    }
+    result
 }
 
 pub fn collect_workbuddy_process_entries() -> Vec<(u32, Option<String>)> {
@@ -9159,6 +9299,14 @@ fn send_close_signal(pid: u32) {
 
     #[cfg(target_os = "windows")]
     {
+        // kill 信号发出后进程状态立即失效，清空探测节流缓存，
+        // 保证关闭流程 kill 后的验证探测反映真实状态。
+        if let Ok(mut cache) = TRAE_PROCESS_PROBE_CACHE.lock() {
+            cache.clear();
+        }
+        if let Ok(mut cache) = WORKBUDDY_PROCESS_PROBE_CACHE.lock() {
+            *cache = None;
+        }
         use std::os::windows::process::CommandExt;
 
         crate::modules::logger::log_info(&format!("[Process Close] taskkill start pid={}", pid));
@@ -11376,10 +11524,13 @@ pub fn close_codex_instances(codex_homes: &[String], timeout_secs: u64) -> Resul
             }
         }
         if includes_default
-            && std::env::var("COCKPIT_CODEX_CLOSE_RESOURCE_CLEANUP")
-                .ok()
-                .as_deref()
-                == Some("1")
+            && [
+                "QIEHUAN_YINGYONG_CODEX_CLOSE_RESOURCE_CLEANUP",
+                "COCKPIT_CODEX_CLOSE_RESOURCE_CLEANUP",
+            ]
+            .iter()
+            .filter_map(|key| std::env::var(key).ok())
+            .any(|value| value.trim() == "1")
         {
             let resource_pids = collect_codex_windows_resource_process_pids();
             if !resource_pids.is_empty() {

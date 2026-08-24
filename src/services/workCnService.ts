@@ -38,9 +38,26 @@ export function validateWorkCnAccount(accountId: string): Promise<WorkCnSnapshot
   return invoke<WorkCnSnapshotValidation>('validate_work_cn_account', { accountId });
 }
 
+// 切号进度事件名（与 Rust `WORK_CN_SWITCH_PROGRESS_EVENT` 保持一致）。
+export const WORK_CN_SWITCH_PROGRESS_EVENT = 'work-cn-switch-progress';
+
+// 切号进度事件载荷。stage 与 Rust `WORK_CN_SWITCH_STAGE_*` 常量一致。
+export interface WorkCnSwitchProgress {
+  accountId: string;
+  stage:
+    | 'validating'
+    | 'closing'
+    | 'injecting'
+    | 'binding'
+    | 'launching'
+    | 'verifying'
+    | 'syncing';
+}
+
 // One-click switch to a saved Work CN account and open the official client.
 // Orchestrates close → inject → bind → launch → verify → rollback on failure.
 // On error the backend returns a serialized `WorkCnCommandError` JSON string.
+// 阶段进度经 WORK_CN_SWITCH_PROGRESS_EVENT 事件推送。
 export async function switchWorkCnAccount(accountId: string): Promise<WorkCnSwitchResult> {
   try {
     return await invoke<WorkCnSwitchResult>('switch_work_cn_account', { accountId });

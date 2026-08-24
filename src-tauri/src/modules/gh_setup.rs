@@ -43,7 +43,7 @@ fn emit(app: &tauri::AppHandle, phase: &str, received: u64, total: u64) {
 
 fn http_client() -> Result<reqwest::blocking::Client, String> {
     reqwest::blocking::Client::builder()
-        .user_agent("cockpit-tools-gh-setup")
+        .user_agent("qiehuan-yingyong-gh-setup")
         // 版本探测超时收紧：网络不佳时快速回退固定版本，别让用户干等。
         .timeout(Duration::from_secs(10))
         .build()

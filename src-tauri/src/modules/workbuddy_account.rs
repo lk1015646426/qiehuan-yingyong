@@ -1,5 +1,6 @@
 use crate::models::workbuddy::{WorkBuddyAccountUpdate, WorkBuddyAccountView};
 use base64::Engine;
+use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -13,6 +14,8 @@ const DETAILS_DIR: &str = "workbuddy_accounts";
 const SNAPSHOT_KIND: &str = "workbuddy";
 
 static ACCOUNT_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static REFRESH_LOCK: LazyLock<tokio::sync::Mutex<()>> =
+    LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkBuddyAccountRecord {
@@ -74,6 +77,37 @@ struct ParsedSnapshot {
     nickname: Option<String>,
     masked_phone: Option<String>,
     token_expires_at: Option<i64>,
+}
+
+/// 可写入日志的认证摘要。只保留不可逆的短指纹，绝不保留 token 原文。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkBuddyAuthDiagnostic {
+    pub account_id: String,
+    pub access_token_fingerprint: String,
+    pub refresh_token_fingerprint: Option<String>,
+    pub expires_at: Option<i64>,
+    pub refresh_expires_at: Option<i64>,
+    pub byte_len: usize,
+}
+
+impl WorkBuddyAuthDiagnostic {
+    pub fn to_log_fields(&self) -> String {
+        format!(
+            "account_id={} access_fp={} refresh_fp={} expires_at={} refresh_expires_at={} bytes={}",
+            self.account_id,
+            self.access_token_fingerprint,
+            self.refresh_token_fingerprint
+                .as_deref()
+                .unwrap_or("<missing>"),
+            self.expires_at
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "<missing>".to_string()),
+            self.refresh_expires_at
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "<missing>".to_string()),
+            self.byte_len
+        )
+    }
 }
 
 fn non_empty(value: Option<&str>) -> Option<String> {
@@ -169,6 +203,112 @@ fn access_token_from_value(value: &Value) -> Option<String> {
     raw_access_token_from_value(value).and_then(|token| normalize_access_token(&token))
 }
 
+fn merge_refreshed_auth(
+    snapshot: &mut Value,
+    access_token: &str,
+    refresh_token: Option<&str>,
+    expires_at: Option<i64>,
+    refresh_expires_at: Option<i64>,
+) -> Result<(), String> {
+    let auth = snapshot
+        .as_object_mut()
+        .ok_or_else(|| "WorkBuddy 认证快照结构无效".to_string())?
+        .entry("auth")
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    let auth = auth
+        .as_object_mut()
+        .ok_or_else(|| "WorkBuddy 认证快照 auth 结构无效".to_string())?;
+    auth.insert(
+        "accessToken".to_string(),
+        Value::String(access_token.to_string()),
+    );
+    if let Some(refresh_token) = refresh_token.filter(|value| !value.trim().is_empty()) {
+        auth.insert(
+            "refreshToken".to_string(),
+            Value::String(refresh_token.to_string()),
+        );
+    }
+    if let Some(expires_at) = expires_at {
+        auth.insert("expiresAt".to_string(), Value::Number(expires_at.into()));
+    }
+    if let Some(refresh_expires_at) = refresh_expires_at {
+        auth.insert(
+            "refreshExpiresAt".to_string(),
+            Value::Number(refresh_expires_at.into()),
+        );
+    }
+    Ok(())
+}
+
+fn token_from_value_by_keys(value: &Value, keys: &[&str]) -> Option<String> {
+    match value {
+        Value::String(_) => None,
+        Value::Array(values) => values
+            .iter()
+            .find_map(|value| token_from_value_by_keys(value, keys)),
+        Value::Object(object) => {
+            for key in keys {
+                if let Some(token) = object.get(*key).and_then(Value::as_str) {
+                    if let Some(token) = non_empty(Some(token)) {
+                        return Some(token);
+                    }
+                }
+            }
+            for key in ["auth", "session", "data"] {
+                if let Some(token) = object
+                    .get(key)
+                    .and_then(|value| token_from_value_by_keys(value, keys))
+                {
+                    return Some(token);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+fn secret_fingerprint(value: &str) -> String {
+    let digest = Sha256::digest(value.as_bytes());
+    format!("sha256:{}", &format!("{:x}", digest)[..12])
+}
+
+fn auth_snapshot_diagnostic(raw: &str) -> Result<WorkBuddyAuthDiagnostic, String> {
+    let parsed = parse_snapshot_json(raw)?;
+    let access_token = access_token_from_value(&parsed.value)
+        .ok_or_else(|| "WorkBuddy 认证文件缺少 access token".to_string())?;
+    let auth = parsed.value.get("auth");
+    let refresh_expires_at = object_i64(
+        Some(&parsed.value),
+        &["refreshExpiresAt", "refresh_expires_at"],
+    )
+    .or_else(|| object_i64(auth, &["refreshExpiresAt", "refresh_expires_at"]))
+    .map(normalize_epoch_seconds);
+    let refresh_token_fingerprint =
+        token_from_value_by_keys(&parsed.value, &["refreshToken", "refresh_token"])
+            .as_deref()
+            .map(secret_fingerprint);
+
+    Ok(WorkBuddyAuthDiagnostic {
+        account_id: stable_account_id(&parsed.uid),
+        access_token_fingerprint: secret_fingerprint(&access_token),
+        refresh_token_fingerprint,
+        expires_at: parsed.token_expires_at,
+        refresh_expires_at,
+        byte_len: raw.len(),
+    })
+}
+
+pub(crate) fn auth_file_diagnostic(path: &Path) -> Result<String, String> {
+    let raw = read_stable_auth_file(path)?;
+    let marker = PathBuf::from(format!("{}.logged-out", path.to_string_lossy()));
+    Ok(format!(
+        "{} logout_marker={}",
+        auth_snapshot_diagnostic(&raw)?.to_log_fields(),
+        marker.exists()
+    ))
+}
+
 fn uid_from_jwt(token: &str) -> Option<String> {
     let payload = token.split('.').nth(1)?;
     let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
@@ -262,19 +402,71 @@ pub(crate) fn detail_path(account_id: &str) -> Result<PathBuf, String> {
     Ok(details_dir()?.join(format!("{}.json", account_id)))
 }
 
+/// 索引对账缓存：`load_index` 历史上每次调用都会触发对账（解密全部账号
+/// 明细文件），账号多且杀软实时扫描时可达数秒，是页面加载账号列表慢的
+/// 主因。这里以（索引文件 mtime + 明细目录文件名/mtime 清单）为指纹，
+/// 磁盘状态未变化时直接复用上次对账结果（list_workbuddy_accounts 与
+/// has_account_id 均受益）。
+static INDEX_RECONCILE_CACHE: LazyLock<
+    Mutex<Option<(IndexFingerprint, WorkBuddyAccountIndex)>>,
+> = LazyLock::new(|| Mutex::new(None));
+
+#[derive(Clone, PartialEq, Eq)]
+struct IndexFingerprint {
+    index_modified: Option<std::time::SystemTime>,
+    details: Vec<(String, Option<std::time::SystemTime>)>,
+}
+
+fn index_fingerprint() -> Result<IndexFingerprint, String> {
+    let index_modified = index_path()?
+        .metadata()
+        .and_then(|meta| meta.modified())
+        .ok();
+    let mut details = Vec::new();
+    if let Ok(entries) = fs::read_dir(details_dir()?) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            let modified = entry.metadata().and_then(|meta| meta.modified()).ok();
+            details.push((name, modified));
+        }
+    }
+    details.sort();
+    Ok(IndexFingerprint {
+        index_modified,
+        details,
+    })
+}
+
 fn load_index() -> Result<WorkBuddyAccountIndex, String> {
+    let fingerprint = index_fingerprint()?;
+    if let Some((cached_at, cached)) = INDEX_RECONCILE_CACHE
+        .lock()
+        .ok()
+        .and_then(|cache| cache.clone())
+    {
+        if cached_at == fingerprint {
+            return Ok(cached);
+        }
+    }
+
     let path = index_path()?;
-    if !path.exists() {
-        return repair_index_from_details("索引文件不存在");
+    let reconciled = if !path.exists() {
+        repair_index_from_details("索引文件不存在")?
+    } else {
+        let content = fs::read_to_string(&path)
+            .map_err(|error| format!("读取 WorkBuddy 账号索引失败: {}", error))?;
+        match crate::modules::atomic_write::parse_json_with_auto_restore::<WorkBuddyAccountIndex>(
+            &path, &content,
+        ) {
+            Ok(index) => reconcile_index_with_details(index)?,
+            Err(_) => repair_index_from_details("索引文件损坏")?,
+        }
+    };
+
+    if let Ok(mut cache) = INDEX_RECONCILE_CACHE.lock() {
+        *cache = Some((fingerprint, reconciled.clone()));
     }
-    let content = fs::read_to_string(&path)
-        .map_err(|error| format!("读取 WorkBuddy 账号索引失败: {}", error))?;
-    match crate::modules::atomic_write::parse_json_with_auto_restore::<WorkBuddyAccountIndex>(
-        &path, &content,
-    ) {
-        Ok(index) => reconcile_index_with_details(index),
-        Err(_) => repair_index_from_details("索引文件损坏"),
-    }
+    Ok(reconciled)
 }
 
 fn save_index(index: &WorkBuddyAccountIndex) -> Result<(), String> {
@@ -746,6 +938,139 @@ pub(crate) fn access_token(account_id: &str) -> Result<String, String> {
     snapshot_access_token(&snapshot).ok_or_else(|| "WorkBuddy 快照缺少 access token".to_string())
 }
 
+fn snapshot_refresh_token(snapshot: &Value) -> Option<String> {
+    token_from_value_by_keys(snapshot, &["refreshToken", "refresh_token"])
+}
+
+fn snapshot_domain(snapshot: &Value) -> Option<String> {
+    snapshot_string(snapshot, &["domain"])
+}
+
+fn parse_refresh_response(
+    payload: &Value,
+) -> Result<(String, Option<String>, Option<i64>, Option<i64>), String> {
+    let data = payload.get("data").unwrap_or(payload);
+    let access = data
+        .get("accessToken")
+        .or_else(|| data.get("access_token"))
+        .and_then(Value::as_str)
+        .and_then(|value| normalize_access_token(value))
+        .ok_or_else(|| "刷新响应缺少 access token".to_string())?;
+    let refresh = data
+        .get("refreshToken")
+        .or_else(|| data.get("refresh_token"))
+        .and_then(Value::as_str)
+        .and_then(|value| non_empty(Some(value)));
+    let expires_at =
+        object_i64(Some(data), &["expiresAt", "expires_at"]).map(normalize_epoch_seconds);
+    let refresh_expires_at = object_i64(Some(data), &["refreshExpiresAt", "refresh_expires_at"])
+        .map(normalize_epoch_seconds);
+    Ok((access, refresh, expires_at, refresh_expires_at))
+}
+
+async fn request_refreshed_auth(
+    refresh_token: &str,
+    domain: Option<&str>,
+) -> Result<(String, Option<String>, Option<i64>, Option<i64>), String> {
+    let client = crate::utils::http::create_domestic_client(30, "copilot.tencent.com");
+    let headers = build_refresh_headers(refresh_token, domain)?;
+    let request = client
+        .post("https://copilot.tencent.com/v2/plugin/auth/token/refresh")
+        .headers(headers)
+        .header("Content-Type", "application/json")
+        .json(&serde_json::json!({}));
+    let response = request
+        .send()
+        .await
+        .map_err(|error| format!("WorkBuddy 刷新请求失败: {error}"))?;
+    let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err("refresh token 已失效，请重新登录 WorkBuddy".to_string());
+    }
+    let payload = response
+        .json::<Value>()
+        .await
+        .map_err(|error| format!("WorkBuddy 刷新响应无法解析: {error}"))?;
+    if !status.is_success() {
+        return Err(format!("WorkBuddy 刷新失败（HTTP {}）", status.as_u16()));
+    }
+    if let Some(code) = payload.get("code").and_then(Value::as_i64) {
+        if code != 0 && code != 200 {
+            let message = payload
+                .get("message")
+                .or_else(|| payload.get("msg"))
+                .and_then(Value::as_str)
+                .unwrap_or("refresh token 已失效");
+            return Err(format!("WorkBuddy 刷新失败（code={code}）：{message}"));
+        }
+    }
+    parse_refresh_response(&payload)
+}
+
+fn build_refresh_headers(
+    refresh_token: &str,
+    domain: Option<&str>,
+) -> Result<HeaderMap, String> {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "X-Refresh-Token",
+        HeaderValue::from_str(refresh_token)
+            .map_err(|error| format!("刷新 token 请求头无效: {error}"))?,
+    );
+    headers.insert("X-Auth-Refresh-Source", HeaderValue::from_static("plugin"));
+    if let Some(domain) = domain.filter(|value| !value.trim().is_empty()) {
+        headers.insert(
+            "X-Domain",
+            HeaderValue::from_str(domain)
+                .map_err(|error| format!("WorkBuddy 域名请求头无效: {error}"))?,
+        );
+    }
+    Ok(headers)
+}
+
+pub(crate) async fn refresh_account_auth(account_id: &str) -> Result<String, String> {
+    let _refresh_guard = REFRESH_LOCK.lock().await;
+    let record = load_record_read_only(account_id)?;
+    let old_snapshot = record.snapshot;
+    let refresh_token = snapshot_refresh_token(&old_snapshot)
+        .ok_or_else(|| "WorkBuddy 快照缺少 refresh token，请重新登录 WorkBuddy".to_string())?;
+    let domain = snapshot_domain(&old_snapshot);
+    let (new_access, new_refresh, expires_at, refresh_expires_at) =
+        request_refreshed_auth(&refresh_token, domain.as_deref()).await?;
+
+    let _guard = ACCOUNT_LOCK
+        .lock()
+        .map_err(|_| "WorkBuddy 账号锁已损坏".to_string())?;
+    let mut index = load_index()?;
+    let mut record = load_record(account_id)?;
+    merge_refreshed_auth(
+        &mut record.snapshot,
+        &new_access,
+        new_refresh.as_deref(),
+        expires_at,
+        refresh_expires_at,
+    )?;
+    record.token_expires_at = expires_at.or(record.token_expires_at);
+    record.updated_at = chrono::Utc::now().timestamp();
+    save_record(&record)?;
+    if let Some(entry) = index
+        .accounts
+        .iter_mut()
+        .find(|entry| entry.id == account_id)
+    {
+        *entry = summary(&record);
+    }
+    save_index(&index)?;
+    Ok(new_access)
+}
+
+pub(crate) fn refresh_error_requires_login(error: &str) -> bool {
+    let value = error.to_ascii_lowercase();
+    value.contains("refresh token 已失效")
+        || value.contains("缺少 refresh token")
+        || value.contains("refresh token 无效")
+}
+
 pub(crate) fn request_identity(
     account_id: &str,
 ) -> Result<(String, Option<String>, Option<String>), String> {
@@ -799,6 +1124,121 @@ mod tests {
     use super::*;
     use base64::Engine;
     use std::fs;
+
+    #[test]
+    fn refresh_client_uses_official_copilot_route() {
+        let production_source = include_str!("workbuddy_account.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("生产代码应在测试模块之前");
+        assert!(production_source.contains("create_domestic_client(30, \"copilot.tencent.com\")"));
+        assert!(production_source.contains("https://copilot.tencent.com/v2/plugin/auth/token/refresh"));
+    }
+
+    #[test]
+    fn refresh_request_headers_match_official_workbuddy_protocol() {
+        let headers = build_refresh_headers("refresh-token", Some("www.workbuddy.cn"))
+        .expect("刷新请求头应可构造");
+
+        assert_eq!(
+            headers
+                .get("x-refresh-token")
+                .and_then(|value| value.to_str().ok()),
+            Some("refresh-token")
+        );
+        assert_eq!(
+            headers
+                .get("x-auth-refresh-source")
+                .and_then(|value| value.to_str().ok()),
+            Some("plugin")
+        );
+        assert_eq!(
+            headers
+                .get("x-domain")
+                .and_then(|value| value.to_str().ok()),
+            Some("www.workbuddy.cn")
+        );
+        assert!(headers.get("authorization").is_none());
+    }
+
+    #[test]
+    fn refreshed_auth_tokens_are_merged_into_snapshot() {
+        let mut snapshot = serde_json::json!({
+            "account": {"uid": "uid-refresh"},
+            "auth": {
+                "accessToken": "old-access",
+                "refreshToken": "old-refresh",
+                "expiresAt": 1000_i64,
+                "refreshExpiresAt": 2000_i64
+            }
+        });
+
+        merge_refreshed_auth(
+            &mut snapshot,
+            "new-access",
+            Some("new-refresh"),
+            Some(3000),
+            None,
+        )
+        .expect("刷新凭证应写回快照");
+
+        assert_eq!(
+            snapshot
+                .pointer("/auth/accessToken")
+                .and_then(Value::as_str),
+            Some("new-access")
+        );
+        assert_eq!(
+            snapshot
+                .pointer("/auth/refreshToken")
+                .and_then(Value::as_str),
+            Some("new-refresh")
+        );
+        assert_eq!(
+            snapshot.pointer("/auth/expiresAt").and_then(Value::as_i64),
+            Some(3000)
+        );
+        assert_eq!(
+            snapshot
+                .pointer("/auth/refreshExpiresAt")
+                .and_then(Value::as_i64),
+            Some(2000)
+        );
+    }
+
+    #[test]
+    fn refresh_response_accepts_nested_tokens_and_millisecond_expiry() {
+        let payload = serde_json::json!({
+            "code": 0,
+            "data": {
+                "access_token": "new-access",
+                "refresh_token": "new-refresh",
+                "expires_at": 1_900_000_000_000_i64,
+                "refresh_expires_at": 2_000_000_000_000_i64
+            }
+        });
+        let parsed = parse_refresh_response(&payload).expect("刷新响应应可解析");
+        assert_eq!(parsed.0, "new-access");
+        assert_eq!(parsed.1.as_deref(), Some("new-refresh"));
+        assert_eq!(parsed.2, Some(1_900_000_000));
+        assert_eq!(parsed.3, Some(2_000_000_000));
+    }
+
+    #[test]
+    fn refresh_error_only_requests_login_for_invalid_refresh_token() {
+        assert!(refresh_error_requires_login(
+            "refresh token 已失效，请重新登录 WorkBuddy"
+        ));
+        assert!(refresh_error_requires_login(
+            "WorkBuddy 快照缺少 refresh token，请重新登录 WorkBuddy"
+        ));
+        assert!(!refresh_error_requires_login(
+            "WorkBuddy 刷新请求失败: connection reset"
+        ));
+        assert!(!refresh_error_requires_login(
+            "WorkBuddy 刷新失败（HTTP 503）"
+        ));
+    }
 
     fn fixture(uid: &str, token: &str) -> String {
         format!(
@@ -967,6 +1407,36 @@ mod tests {
         .unwrap();
 
         assert_eq!(parsed.token_expires_at, Some(1_791_974_976));
+    }
+
+    #[test]
+    fn workbuddy_auth_diagnostic_fingerprints_tokens_without_exposing_them() {
+        let raw = serde_json::json!({
+            "account": {"uid": "uid-diagnostic"},
+            "auth": {
+                "accessToken": "access-secret-value",
+                "refreshToken": "refresh-secret-value",
+                "expiresAt": 1_900_000_000_i64,
+                "refreshExpiresAt": 2_000_000_000_i64
+            }
+        })
+        .to_string();
+
+        let diagnostic = auth_snapshot_diagnostic(&raw).unwrap();
+
+        assert_eq!(diagnostic.account_id, stable_account_id("uid-diagnostic"));
+        assert_eq!(diagnostic.expires_at, Some(1_900_000_000));
+        assert_eq!(diagnostic.refresh_expires_at, Some(2_000_000_000));
+        assert_ne!(diagnostic.access_token_fingerprint, "access-secret-value");
+        assert_ne!(
+            diagnostic.refresh_token_fingerprint.as_deref(),
+            Some("refresh-secret-value")
+        );
+        let rendered = diagnostic.to_log_fields();
+        assert!(!rendered.contains("access-secret-value"));
+        assert!(!rendered.contains("refresh-secret-value"));
+        assert!(rendered.contains("access_fp="));
+        assert!(rendered.contains("refresh_fp="));
     }
 
     #[test]

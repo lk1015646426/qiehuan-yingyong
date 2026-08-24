@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "切换工具",
-  "version": "0.1.2",
-  "identifier": "com.lk.trae-work-cn-switcher",
+  "productName": "切换应用",
+  "version": "0.1.8",
+  "identifier": "com.qiehuanyingyong.desktop",
   "build": {
     "beforeDevCommand": "node scripts/prepare-tauri.cjs && npm run dev",
     "devUrl": "http://localhost:1420",
@@ -14,7 +14,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "切换工具",
+        "title": "切换应用",
         "width": 960,
         "height": 680,
         "minWidth": 820,
@@ -27,7 +27,7 @@
       },
       {
         "label": "floating-card",
-        "title": "切换工具",
+        "title": "切换应用",
         "create": false,
         "width": 250,
         "height": 290,
@@ -73,7 +73,7 @@
       "../src/assets/icons/trae-solo-cn.png": "native-menu-icons/trae-solo-cn.png"
     },
     "macOS": {
-      "bundleName": "切换工具",
+      "bundleName": "切换应用",
       "infoPlist": "Info.plist"
     }
   },
@@ -81,6 +81,7 @@
     "deep-link": {
       "desktop": {
         "schemes": [
+          "qiehuanyingyong",
           "cockpit-tools"
         ]
       }

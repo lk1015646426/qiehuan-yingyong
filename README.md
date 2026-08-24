@@ -1,8 +1,10 @@
-# TRAE Work CN 账号切换器
+# 切换应用
 
 一款 **Windows 专用**的 [TRAE Work CN](https://www.trae.cn/) 多账号管理工具，支持最多 4 个积分制账号的一键切换与免登录打开。
 
 > 本项目基于开源项目 [Cockpit Tools](https://github.com/jlcodes99/cockpit-tools) `v1.3.16` 改造而来，复用其成熟的 TRAE 账号管理与切号实现。详见 [NOTICE.md](./NOTICE.md)。
+
+当前项目仓库为私有仓库：[lk1015646426/qiehuan-yingyong](https://github.com/lk1015646426/qiehuan-yingyong)。本次版本已完成 Work CN 与 WorkBuddy 多账号切换链路的稳定性修复。
 
 ## 功能定位
 
@@ -20,7 +22,7 @@
 
 正常情况下无需再次输入密码、扫码、手动退出账号或编辑 `storage.json`。
 
-主指标为 **总积分 / 已用积分 / 剩余积分**；积分签到继续由现有 GitHub Actions 完成，本软件只查询积分、维护登录快照并同步签到凭证。
+主指标为 **总积分 / 已用积分 / 剩余积分**；积分签到继续由现有 GitHub Actions 完成，本软件只查询积分、维护登录快照并同步签到凭证。签到工作流由独立的 [daily-checkin](https://github.com/lk1015646426/daily-checkin) 仓库维护，本项目不新增或替代该工作流。
 
 ## WorkBuddy 多账号
 
@@ -32,6 +34,24 @@
 - 默认自动检测 WorkBuddy；可在“路径设置”中填写 EXE 或认证文件路径。认证文件路径会同时用于导入、切换与后台凭证监测。
 - 启用“参与自动签到”的账号会同步到一个 `WORKBUDDY_ACCOUNTS_JSON` GitHub Secret。旧的 `WB1_TOKEN`、`WB2_TOKEN` 在聚合 Secret 尚未部署时仍可作为云端回退。
 - 账号卡片会显示真实积分、今日奖励和连续签到天数；打开页面或点击“刷新积分 / 刷新全部积分”时，仅调用 WorkBuddy 的只读状态接口，不会执行签到。
+
+## 最近修复
+
+- 统一 Work CN 的平台别名和客户端路径识别，避免重启后账号消失或切换时找不到数据。
+- WorkBuddy 认证写入失败时自动回滚，避免留下半保存状态。
+- 区分 WorkBuddy 账号切换成功与窗口激活失败，错误提示不再误报。
+- 统一 WorkBuddy 卡片 metrics 数据结构，修复积分和状态展示异常。
+- 补充 Work CN 会话监听器的异常清理，降低重复监听和状态错乱风险。
+- 同步前端锁文件版本，并补充切换、认证回滚、卡片数据和生命周期回归测试。
+
+## 验证状态
+
+- `npm test`：46 项通过。
+- `npm run typecheck`：通过。
+- `npm run build`：通过。
+- Rust 单元测试：255 项通过，3 项忽略。
+
+以上结果对应当前修复快照；发布前仍应在目标 Windows 环境验证 Tauri 启动和安装包行为。
 
 ## 支持平台
 

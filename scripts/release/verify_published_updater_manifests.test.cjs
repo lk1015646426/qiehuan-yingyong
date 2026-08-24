@@ -8,7 +8,8 @@ const {
 
 const TARGET = "windows-x86_64-nsis";
 const VERSION = "1.2.3";
-const ASSET_NAME = "Cockpit.Tools_1.2.3_x64-setup.exe";
+const ASSET_NAME = "切换应用_1.2.3_x64-setup.exe";
+const ENCODED_ASSET_NAME = encodeURIComponent(ASSET_NAME);
 
 async function withReleaseServer(handler, run) {
   const server = http.createServer(handler);
@@ -41,7 +42,7 @@ function manifestOptions(baseUrl, overrides = {}) {
 
 function releaseHandler(baseUrl, overrides = {}) {
   const entry = {
-    url: `${baseUrl}/releases/download/v${VERSION}/${ASSET_NAME}`,
+    url: `${baseUrl}/releases/download/v${VERSION}/${ENCODED_ASSET_NAME}`,
     signature: "test-signature",
     ...overrides.entry,
   };
@@ -71,7 +72,7 @@ function releaseHandler(baseUrl, overrides = {}) {
       response.end(JSON.stringify(legacyManifest));
       return;
     }
-    if (request.url === `/releases/download/v${VERSION}/${ASSET_NAME}`) {
+    if (request.url === `/releases/download/v${VERSION}/${ENCODED_ASSET_NAME}`) {
       response.statusCode = request.headers.range ? 206 : 200;
       response.end("x");
       return;
@@ -115,7 +116,7 @@ test("rejects a manifest that points to another release version", async () => {
     async (baseUrl) => {
       handler = releaseHandler(baseUrl, {
         entry: {
-          url: `${baseUrl}/releases/download/v9.9.9/${ASSET_NAME}`,
+          url: `${baseUrl}/releases/download/v9.9.9/${ENCODED_ASSET_NAME}`,
         },
       });
       await assert.rejects(
@@ -135,7 +136,7 @@ test("rejects a manifest whose release asset is unavailable", async () => {
     async (baseUrl) => {
       const baseHandler = releaseHandler(baseUrl);
       handler = (request, response) => {
-        if (request.url === `/releases/download/v${VERSION}/${ASSET_NAME}`) {
+        if (request.url === `/releases/download/v${VERSION}/${ENCODED_ASSET_NAME}`) {
           response.statusCode = 404;
           response.end("not found");
           return;

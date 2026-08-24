@@ -11,6 +11,7 @@ import type {
 } from '../types/workbuddy';
 
 export const WORKBUDDY_CHANGED_EVENT = 'workbuddy:changed';
+export const WORKBUDDY_INSTALLATION_RUNNING_EVENT = 'workbuddy:installation-running';
 
 export function parseWorkBuddyCommandError(error: unknown): Error & { code?: string } {
   const raw = error instanceof Error

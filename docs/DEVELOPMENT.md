@@ -1,15 +1,17 @@
-# TRAE Work CN 切换工具 — 开发文档（AI 快速理解版）
+# 切换应用 — 开发文档（AI 快速理解版）
 
-> 本文档面向 AI 助手与新接手的开发者，是项目的**唯一权威开发文档**，整合自已删除的各阶段报告/设计/交接文档。日期：2026-08-19。
+> 本文档面向 AI 助手与新接手的开发者，是项目的**唯一权威开发文档**，整合自已删除的各阶段报告/设计/交接文档。日期：2026-08-24。
 
 ## 1. 项目是什么
 
 **一句话**：Windows 桌面工具，分别管理 TRAE Work CN 与 WorkBuddy 的本地登录账号；支持一键切换客户端账号、同步云端签到凭证，以及查看 WorkBuddy 的真实积分和签到状态。
 
-- **本质**：上游开源项目 `cockpit-tools` v1.3.16（commit `e1ef55ce`）的 fork，特化为 Work CN 单平台。
+- **本质**：基于上游 `cockpit-tools` v1.3.16（commit `e1ef55ce`）改造并完成独立命名的 Windows 桌面应用。
 - **许可证**：继承上游 **CC-BY-NC-SA-4.0**（非商业、相同方式共享），不可更改。
-- **标识**：identifier `com.lk.trae-work-cn-switcher`；productName「切换工具」；前端包名 `trae-work-cn-switcher`；后端 crate 仍叫 `cockpit-tools`（勿改名，牵连过大）。
+- **标识**：identifier `com.qiehuanyingyong.desktop`；productName「切换应用」；Cargo 包名 `qiehuan-yingyong`；Rust 库 `qiehuan_yingyong_lib`；数据目录 `~/.qiehuan_yingyong`。
 - **日常签到在云端**：本地只同步凭证与触发 workflow，**绝不在本地执行签到/claim**。WorkBuddy 的桌面端“刷新积分”同样是只读查询，不会签到。
+- **仓库职责**：本项目源代码位于私有仓库 [lk1015646426/qiehuan-yingyong](https://github.com/lk1015646426/qiehuan-yingyong)；日常签到由独立仓库 [daily-checkin](https://github.com/lk1015646426/daily-checkin) 的 GitHub Actions 负责。本项目不新增、不复制签到工作流。
+- **敏感数据边界**：账号快照、Token、PAT、私钥、日志、数据库和构建产物不得进入 Git；上传快照只保留源码、配置模板、文档、测试和必要静态资源。
 
 ## 2. 快速上手
 
@@ -27,11 +29,11 @@ cargo test  --manifest-path src-tauri/Cargo.toml
 
 # 产出 Windows NSIS 安装包（唯一发布目标）
 npm run tauri -- build --ci
-# → target\release\bundle\nsis\切换工具_0.1.2_x64-setup.exe
+# → target\release\bundle\nsis\切换应用_0.1.2_x64-setup.exe
 ```
 
 - 开发目录：`...\Desktop\脚本\切换应用\source`；**禁止**改动原版 Cockpit Tools 安装目录（`AppData\Local\Cockpit Tools`），两者数据完全隔离。
-- 本工具数据目录：`~/.trae_work_cn_switcher`（可用环境变量 `TRAE_WORK_CN_SWITCHER_DATA_DIR` 覆盖；测试另有 `_TEST_DATA_DIR`）。dev 与 release **共用**同一数据目录（历史教训：曾分裂成 `_dev` 目录导致"重启数据丢失"，已做自动迁移）。
+- 本工具数据目录：`~/.qiehuan_yingyong`（可用环境变量 `QIEHUAN_YINGYONG_DATA_DIR` 覆盖；测试另有 `_TEST_DATA_DIR`）。dev 与 release **共用**同一数据目录，并自动迁移 TRAE、Antigravity、Cockpit 等旧目录及旧环境变量。
 - 用户客户端目录（探测目标）：`%USERPROFILE%\.trae-solo-cn\` 与 `%APPDATA%\TraeWork CN\`（见 §5 路径别名）。
 
 ## 3. 技术栈
@@ -42,7 +44,7 @@ npm run tauri -- build --ci
 | 样式 | 原生 CSS + 设计 token（`src/styles/base.css` 定义 `--primary/--success/--warning/--danger/--bg-*/--border*` 等变量，自动适配暗色）。**未启用** Tailwind/daisyUI（devDeps 存在但无配置，勿引入） |
 | 后端 | Tauri 2（tray-icon / image-png / macos-private-api features），Rust 2021 |
 | 关键依赖 | reqwest 0.12（blocking + async）、rusqlite(bundled)、tokio(full)、tracing、chrono、base64、winreg(Windows) |
-| 插件 | opener / dialog / fs / notification / autostart / single-instance / deep-link（scheme `cockpit-tools`） |
+| 插件 | opener / dialog / fs / notification / autostart / single-instance / deep-link（scheme `qiehuanyingyong`，兼容旧 `cockpit-tools`） |
 
 ## 4. 代码结构地图（核心：区分"本 fork 新增"与"上游遗留"）
 
@@ -182,6 +184,16 @@ access_token、refresh_token、`auth_device_id`（icube 数字）、`checkin_dev
 - 后端：`cargo test`；WorkBuddy 定向验证为 `cargo test workbuddy --manifest-path src-tauri/Cargo.toml`，覆盖账号快照、GitHub 同步、状态接口和积分过滤解析。
 - 前端：`npm run typecheck` 必过；WorkBuddy 页面契约为 `node --test src/utils/workBuddyLifecycle.test.ts`。
 - 验收纪律：任何改动本人跑 typecheck + cargo test + tauri build 并人工确认后才算完成（DoD）。
+
+### 当前修复快照验证记录（2026-08-24）
+
+- `npm test`：46 项通过，0 项失败。
+- `npm run typecheck`：退出码 0。
+- `npm run build`：退出码 0。
+- Rust 单元测试：255 项通过，0 项失败，3 项忽略。
+- `git diff --check`：退出码 0。
+
+以上是修复快照的已执行验证；Tauri 启动、Windows 安装包和真实客户端切换仍需在目标 Windows 环境进行人工验收。
 
 ## 10. 已知坑速查（按症状找原因）
 
