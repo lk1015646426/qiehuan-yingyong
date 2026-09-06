@@ -148,25 +148,34 @@ pub async fn delete_workbuddy_account(account_id: String) -> Result<bool, String
 
 #[tauri::command]
 pub async fn switch_workbuddy_account(account_id: String) -> Result<WorkBuddySwitchResult, String> {
-    // 目标账号可能已在 WorkBuddy 后台轮换过 access token；先用 refresh token
-    // 获取最新快照，避免把旧凭证重新写回官方客户端。
-    crate::modules::workbuddy_account::refresh_account_auth(&account_id)
-        .await
-        .map_err(|error| {
-            if crate::modules::workbuddy_account::refresh_error_requires_login(&error) {
-                format!("目标 WorkBuddy 账号的 refresh token 已失效，请重新登录后再导入：{error}")
-            } else {
-                format!("目标 WorkBuddy 账号认证刷新失败，请稍后重试：{error}")
-            }
-        })?;
-    tauri::async_runtime::spawn_blocking(move || switch_workbuddy_account_blocking(&account_id))
-        .await
-        .map_err(|error| format!("切换 WorkBuddy 账号任务失败: {error}"))?
-        .map_err(|error| command_error_to_string(&error))
+    // 目标账号可能已在 WorkBuddy 后台轮换过 access token；需先用 refresh token
+    // 获取最新快照，避免把旧凭证重新写回官方客户端。token 刷新（网络请求）
+    // 与客户端关闭（本地进程操作）互不依赖，因此并行执行：刷新任务在
+    // tauri 运行时上启动，结果经 channel 在关闭完成后汇合（见 blocking 内 recv）。
+    let (refresh_tx, refresh_rx) = std::sync::mpsc::channel::<Result<String, String>>();
+    let refresh_account_id = account_id.clone();
+    tauri::async_runtime::spawn(async move {
+        let result = workbuddy_account::refresh_account_auth(&refresh_account_id).await;
+        let _ = refresh_tx.send(result);
+    });
+    tauri::async_runtime::spawn_blocking(move || {
+        switch_workbuddy_account_blocking(&account_id, refresh_rx)
+    })
+    .await
+    .map_err(|error| format!("切换 WorkBuddy 账号任务失败: {error}"))?
+    .map_err(|error| {
+        // 认证刷新失败沿用纯文本错误（前端直接展示），
+        // 其余错误保持 JSON 结构由前端解析 code/message/detail。
+        if error.code == WorkBuddyErrorCode::AuthRefreshFailed {
+            return error.message;
+        }
+        command_error_to_string(&error)
+    })
 }
 
 fn switch_workbuddy_account_blocking(
     account_id: &str,
+    refresh_rx: std::sync::mpsc::Receiver<Result<String, String>>,
 ) -> Result<WorkBuddySwitchResult, WorkBuddyCommandError> {
     let _switch_guard = try_lock_workbuddy_switch()?;
     let transaction_id = uuid::Uuid::new_v4().to_string();
@@ -214,6 +223,15 @@ fn switch_workbuddy_account_blocking(
         }
     };
     log_workbuddy_auth_checkpoint(&transaction_id, "before_close", &auth_path);
+    // 切换前客户端是否在运行：刷新失败回滚时用于决定是否把客户端拉回原账号。
+    // 探测失败按"在运行"处理（宁可多一次无害的重启，也不把用户留在关闭状态）。
+    #[cfg(target_os = "windows")]
+    let was_running = process::collect_workbuddy_process_entries_checked()
+        .map(|entries| !entries.is_empty())
+        .unwrap_or(true);
+    #[cfg(not(target_os = "windows"))]
+    let was_running = !process::collect_workbuddy_process_entries().is_empty();
+    let close_started = std::time::Instant::now();
     process::close_workbuddy_instances(std::slice::from_ref(&user_data_dir), 20).map_err(
         |error| {
             WorkBuddyCommandError::new(
@@ -223,9 +241,14 @@ fn switch_workbuddy_account_blocking(
             .with_detail(error)
         },
     )?;
+    crate::modules::logger::log_info(&format!(
+        "[WorkBuddy Switch] close finished elapsed_ms={}",
+        close_started.elapsed().as_millis()
+    ));
 
     // 客户端退出期间可能完成最后一次 token 刷新并写回认证文件。此处必须在
     // 关闭成功后马上保存当前托管账号的新快照，避免下次切回时回写旧 token。
+    let snapshot_started = std::time::Instant::now();
     if let Err(error) = workbuddy_account::refresh_current_managed_snapshot() {
         restore_previous_workbuddy_auth(&auth_path, previous_auth.as_deref(), previous_auth_exists);
         return Err(WorkBuddyCommandError::new(
@@ -235,6 +258,42 @@ fn switch_workbuddy_account_blocking(
         .with_detail(error));
     }
     log_workbuddy_auth_checkpoint(&transaction_id, "after_close_refresh", &auth_path);
+    crate::modules::logger::log_info(&format!(
+        "[WorkBuddy Switch] current snapshot refreshed elapsed_ms={}",
+        snapshot_started.elapsed().as_millis()
+    ));
+
+    // 汇合点：客户端已关闭且当前账号快照已保存，等待并行执行的目标账号
+    // token 刷新结果。刷新失败则回滚认证文件；切换前客户端在运行的话，
+    // 尽力把它拉回原账号，避免用户停在"客户端被关闭"的状态。
+    let refresh_result = refresh_rx.recv().map_err(|_| {
+        WorkBuddyCommandError::new(
+            WorkBuddyErrorCode::AuthRefreshFailed,
+            "目标 WorkBuddy 账号认证刷新任务异常退出，请重试",
+        )
+    })?;
+    if let Err(error) = refresh_result {
+        restore_previous_workbuddy_auth(&auth_path, previous_auth.as_deref(), previous_auth_exists);
+        if was_running {
+            if let Err(restart_error) =
+                process::start_workbuddy_default_with_args_with_new_window(&[], true)
+            {
+                crate::modules::logger::log_warn(&format!(
+                    "[WorkBuddy] 刷新失败回滚后重启原客户端失败: {restart_error}"
+                ));
+            }
+        }
+        let message = if crate::modules::workbuddy_account::refresh_error_requires_login(&error) {
+            format!("目标 WorkBuddy 账号的 refresh token 已失效，请重新登录后再导入：{error}")
+        } else {
+            format!("目标 WorkBuddy 账号认证刷新失败，请稍后重试：{error}")
+        };
+        return Err(WorkBuddyCommandError::new(
+            WorkBuddyErrorCode::AuthRefreshFailed,
+            message,
+        ));
+    }
+    log_workbuddy_auth_checkpoint(&transaction_id, "after_target_refresh", &auth_path);
 
     if let Err(error) = workbuddy_account::write_account_to_default_client(account_id) {
         restore_previous_workbuddy_auth(&auth_path, previous_auth.as_deref(), previous_auth_exists);

@@ -4556,6 +4556,16 @@ fn rollback_bind(platform: TraePlatformKind, previous: Option<&str>) {
     }
 }
 
+/// 轻路径（已绑定目标账号）验证超时：客户端切换前已在运行时用 15s 上限，
+/// 冷启动保持 30s。验证在 UID 匹配后立即返回，该上限只影响失败场景的等待。
+fn work_cn_light_path_verify_timeout(was_running: bool) -> Duration {
+    if was_running {
+        Duration::from_secs(15)
+    } else {
+        Duration::from_secs(30)
+    }
+}
+
 /// 回滚后若切换前客户端正在运行，重新启动旧账号。
 async fn restart_previous_after_rollback() {
     if work_cn_switch_skip_process() {
@@ -4622,18 +4632,44 @@ pub async fn verify_work_cn_switched_account(
     }
 }
 
-/// 切换成功后把最新签到凭证同步到 GitHub（开发指南 §8.5）。阶段 6 落地；
-/// 失败绝不阻止本地切号，仅在日志记录。
-async fn sync_work_cn_github_for_switch(account: &TraeAccount) -> bool {
-    match crate::modules::work_cn_github::sync_account_secrets_if_bound(account) {
-        Ok(result) => result.synced,
-        Err(err) => {
-            logger::log_warn(&format!(
-                "[Work CN Switch] GitHub 同步失败（不阻止本地切号）: {err}"
-            ));
-            false
+/// 切换成功后把最新签到凭证同步到 GitHub（开发指南 §8.5）。
+///
+/// 这里只捕获账号 ID，后台执行时重新加载账号文件，避免切换完成后官方客户端
+/// 或会话监测器刚写入的新 token 被旧快照覆盖。GitHub 的所有写入由同步模块统一
+/// 加锁；失败绝不阻止本地切号，仅在日志记录。
+fn queue_work_cn_github_sync_for_switch(account_id: String) {
+    let _ = tauri::async_runtime::spawn_blocking(move || {
+        // Unit tests tear down their temporary data directory immediately after
+        // the local switch returns. Never let a detached test task fall back to
+        // the user's real account store after that cleanup.
+        #[cfg(test)]
+        if std::env::var_os("COCKPIT_TOOLS_TEST_DATA_DIR").is_none() {
+            logger::log_info("[Work CN Switch] 测试数据目录已清理，跳过后台 GitHub 同步");
+            return;
         }
-    }
+
+        let Some(account) = load_account(&account_id) else {
+            logger::log_warn(&format!(
+                "[Work CN Switch] GitHub 后台同步跳过：账号不存在 account_id={account_id}"
+            ));
+            return;
+        };
+
+        match crate::modules::work_cn_github::sync_account_secrets_if_bound(&account) {
+            Ok(result) => {
+                logger::log_info(&format!(
+                    "[Work CN Switch] GitHub 后台同步完成: account_id={}, synced={}, skipped={}",
+                    account_id, result.synced, result.skipped
+                ));
+            }
+            Err(err) => {
+                logger::log_warn(&format!(
+                    "[Work CN Switch] GitHub 后台同步失败（不阻止本地切号）: account_id={}, error={err}",
+                    account_id
+                ));
+            }
+        }
+    });
 }
 
 /// 一键切换并打开官方客户端（原子命令核心）。命令层 `switch_work_cn_account`
@@ -4655,8 +4691,8 @@ pub const WORK_CN_SWITCH_STAGE_VERIFYING: &str = "verifying";
 pub const WORK_CN_SWITCH_STAGE_SYNCING: &str = "syncing";
 
 /// 带进度回调的切换实现：每个阶段开始时调用 `on_progress(stage)`。
-/// 切换最长可耗时约 50 秒（关闭 20s + 验证 30s），无阶段事件时用户只能
-/// 对着转圈等待，体感等同卡死。
+/// 本地切换最长可耗时约 50 秒（关闭 20s + storage 验证 30s）；GitHub
+/// 同步在本地切换返回后后台执行。无阶段事件时用户只能对着转圈等待，体感等同卡死。
 pub async fn switch_work_cn_account_with_progress(
     account_id: String,
     on_progress: impl Fn(&str) + Send + Sync,
@@ -4704,7 +4740,7 @@ pub async fn switch_work_cn_account_with_progress(
             .and_then(|settings| settings.bind_account_id.clone());
     let was_running = crate::modules::process::is_trae_running_for_platform(platform);
 
-    // 切换到"当前账号"：只打开客户端，不重复注入。
+    // 已绑定目标账号时仍走完整启动校验，防止绑定记录与 storage UID 漂移。
     if previous_bind.as_deref() == Some(account_id.as_str()) {
         on_progress(WORK_CN_SWITCH_STAGE_LAUNCHING);
         let launched = if work_cn_switch_skip_process() {
@@ -4726,7 +4762,11 @@ pub async fn switch_work_cn_account_with_progress(
             }
         };
         on_progress(WORK_CN_SWITCH_STAGE_VERIFYING);
-        verify_work_cn_switched_account(&account, Duration::from_secs(30), &storage_path).await?;
+        // 轻路径：切换前客户端已在运行（热启动）时 storage.json 早已写入
+        // 目标 UID，验证通常首轮轮询即通过；超时上限收紧到 15s，仅缩短
+        // 失败场景的等待。冷启动（需完整拉起客户端）保持 30s。
+        let verify_timeout = work_cn_light_path_verify_timeout(was_running);
+        verify_work_cn_switched_account(&account, verify_timeout, &storage_path).await?;
         return Ok(WorkCnSwitchResult {
             account_id,
             user_id: account.user_id.clone(),
@@ -4781,7 +4821,7 @@ pub async fn switch_work_cn_account_with_progress(
     let launched = if work_cn_switch_skip_process() {
         false
     } else {
-        match crate::commands::trae_instance::trae_start_instance(
+        match crate::commands::trae_instance::trae_start_instance_after_switch(
             Some("trae_solo_cn".to_string()),
             "__default__".to_string(),
         )
@@ -4836,9 +4876,9 @@ pub async fn switch_work_cn_account_with_progress(
         account = refreshed;
     }
 
-    // GitHub 同步（best-effort，不影响本地切号）。
+    // GitHub 同步（best-effort，转后台，不影响本地切号返回）。
     on_progress(WORK_CN_SWITCH_STAGE_SYNCING);
-    let github_synced = sync_work_cn_github_for_switch(&account).await;
+    queue_work_cn_github_sync_for_switch(account.id.clone());
 
     Ok(WorkCnSwitchResult {
         account_id,
@@ -4846,8 +4886,8 @@ pub async fn switch_work_cn_account_with_progress(
         launched,
         verified: true,
         token_changed,
-        github_synced,
-        warning: None,
+        github_synced: false,
+        warning: Some("本地切换已完成，GitHub 同步已转后台".to_string()),
     })
 }
 
@@ -7320,6 +7360,20 @@ mod tests {
     use crate::models::trae::TraeAccount;
     use crate::models::work_cn::{WorkCnCommandError, WorkCnErrorCode};
 
+    #[test]
+    fn light_path_verify_timeout_is_adaptive() {
+        // 热启动（切换前客户端已在运行）：轻路径验证上限收紧到 15s。
+        assert_eq!(
+            work_cn_light_path_verify_timeout(true),
+            Duration::from_secs(15)
+        );
+        // 冷启动（需完整拉起客户端）：保持 30s 上限。
+        assert_eq!(
+            work_cn_light_path_verify_timeout(false),
+            Duration::from_secs(30)
+        );
+    }
+
     fn sample_account() -> TraeAccount {
         TraeAccount {
             id: "trae_test".to_string(),
@@ -9129,6 +9183,11 @@ mod tests {
         assert_eq!(result.account_id, account.id);
         assert!(result.verified, "切换后验证应通过");
         assert!(!result.launched, "skip_process 下不应报告已启动");
+        assert_eq!(
+            result.warning.as_deref(),
+            Some("本地切换已完成，GitHub 同步已转后台"),
+            "切换结果必须明确 GitHub 同步不再阻塞本地切号"
+        );
 
         // 注入后的 storage 必须包含目标 UID（证明写入的是目标账号）。
         let injected = super::read_local_trae_auth_from_storage_path(&storage_path)

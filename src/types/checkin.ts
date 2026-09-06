@@ -1,13 +1,4 @@
-// 云端签到面板类型。Mirrors `CheckinWorkflowRun` in src-tauri/src/models/work_cn.rs.
-
-import type { WorkCnAccountView } from './workCn';
-import type { WorkBuddyAccountView } from './workbuddy';
-
-export type CheckinProduct = 'all' | 'trae' | 'workbuddy';
-
-export type CheckinAccount =
-  | { product: 'trae'; account: WorkCnAccountView }
-  | { product: 'workbuddy'; account: WorkBuddyAccountView };
+// 云端签到类型（自独立面板合并至 TRAE 页）。Mirrors `CheckinWorkflowRun` in src-tauri/src/models/work_cn.rs.
 
 // 一次签到 workflow 运行（gh run list --json）。
 export interface CheckinWorkflowRun {

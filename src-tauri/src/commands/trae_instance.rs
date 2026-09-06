@@ -392,6 +392,48 @@ pub async fn trae_start_instance(
     Ok(view)
 }
 
+/// Start the default Trae instance after the caller has already performed the
+/// close/inject transaction. This skips the normal start path's pre-start
+/// refresh, second close, second inject, and post-start login check.
+pub async fn trae_start_instance_after_switch(
+    platform_id: Option<String>,
+    instance_id: String,
+) -> Result<InstanceProfileView, String> {
+    let platform = parse_platform(platform_id)?;
+    if instance_id != DEFAULT_INSTANCE_ID {
+        return Err("切号快速启动仅支持默认实例".to_string());
+    }
+
+    let default_dir =
+        modules::trae_instance::get_default_trae_user_data_dir_for_platform(platform)?;
+    let default_dir_str = default_dir.to_string_lossy().to_string();
+    let default_settings = modules::trae_instance::load_default_settings_for_platform(platform)?;
+    let extra_args = modules::process::parse_extra_args(&default_settings.extra_args);
+    let pid = modules::process::start_trae_platform_default_with_args_with_new_window(
+        platform.provider_key(),
+        &extra_args,
+        true,
+    )?;
+    let _ = modules::trae_instance::update_default_pid_for_platform(platform, Some(pid))?;
+    let running_pid = resolve_running_pid(platform, Some(pid), None);
+
+    Ok(InstanceProfileView {
+        id: DEFAULT_INSTANCE_ID.to_string(),
+        name: String::new(),
+        user_data_dir: default_dir_str,
+        working_dir: None,
+        extra_args: default_settings.extra_args,
+        bind_account_id: default_settings.bind_account_id,
+        created_at: 0,
+        last_launched_at: None,
+        last_pid: running_pid,
+        running: running_pid.is_some(),
+        initialized: is_profile_initialized(&default_dir.to_string_lossy()),
+        is_default: true,
+        follow_local_account: false,
+    })
+}
+
 #[tauri::command]
 pub async fn trae_stop_instance(
     platform_id: Option<String>,

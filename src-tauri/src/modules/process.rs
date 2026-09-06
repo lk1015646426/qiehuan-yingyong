@@ -55,11 +55,12 @@ const TRAE_LAUNCH_PATH_TTL_OK: Duration = Duration::from_secs(30);
 const TRAE_LAUNCH_PATH_TTL_ERR: Duration = Duration::from_secs(3);
 
 /// Windows 进程探测节流缓存（键：期望启动路径 + 平台标识）。
-/// PowerShell（Get-CimInstance）单次探测 300ms~1s+，而关闭 / 启动验证
-/// 的轮询循环以 150ms 间隔连发、页面加载也会密集探测，节流后 800ms
-/// 窗口内复用上次非空结果。空结果不缓存（避免 PowerShell 漏检时跳过
-/// sysinfo 兜底）；send_close_signal 主动清空缓存，保证 kill 后验证
-/// 探测反映真实状态。
+/// 探测以 sysinfo（毫秒级）为主路径，为空时才触发 PowerShell 复核
+/// （Get-CimInstance 单次 300ms~1s+）；关闭 / 启动验证的轮询循环以
+/// 150ms 间隔连发、页面加载也会密集探测，节流后 800ms 窗口内复用上次
+/// 结果。空结果仅在 PowerShell 复核确认后缓存（sysinfo 主路径的空
+/// 不缓存，漏检时仍会触发复核）；send_close_signal 主动清空缓存，
+/// 保证 kill 后验证探测反映真实状态。
 #[cfg(target_os = "windows")]
 static TRAE_PROCESS_PROBE_CACHE: LazyLock<
     Mutex<HashMap<(String, String), (Instant, Vec<(u32, Option<String>)>)>>,
@@ -69,8 +70,9 @@ static TRAE_PROCESS_PROBE_CACHE: LazyLock<
 const TRAE_PROCESS_PROBE_MIN_INTERVAL: Duration = Duration::from_millis(800);
 
 /// WorkBuddy 进程探测节流缓存（与 TRAE_PROCESS_PROBE_CACHE 同策略）。
-/// PowerShell（Get-CimInstance）单次 300ms~1s+，页面加载 / 关闭轮询会连发；
-/// 800ms 窗口内复用上次非空结果。空结果不缓存；send_close_signal 主动清空。
+/// sysinfo 主路径（毫秒级）+ PowerShell 空结果复核（300ms~1s+）；
+/// 800ms 窗口内复用上次结果。空结果仅在 PowerShell 复核确认后缓存；
+/// send_close_signal 主动清空。
 #[cfg(target_os = "windows")]
 static WORKBUDDY_PROCESS_PROBE_CACHE: LazyLock<Mutex<Option<(Instant, Vec<(u32, Option<String>)>)>>> =
     LazyLock::new(|| Mutex::new(None));
@@ -3074,6 +3076,17 @@ mod workbuddy_windows_detection_tests {
     };
     use std::os::windows::process::ExitStatusExt;
     use std::path::PathBuf;
+
+    #[test]
+    fn measure_sysinfo_full_scan_duration() {
+        let start = std::time::Instant::now();
+        let entries = super::collect_workbuddy_process_entries_from_sysinfo_fallback();
+        println!(
+            "sysinfo full scan: elapsed={:?} entries={}",
+            start.elapsed(),
+            entries.len()
+        );
+    }
 
     #[test]
     fn falls_back_to_multi_source_detection_for_nonstandard_install_path() {
@@ -8034,7 +8047,7 @@ pub fn collect_trae_process_entries_for_platform(
         let expected = expected_launch
             .as_deref()
             .expect("expected launch path must exist");
-        // 节流：800ms 内的重复探测复用上次非空结果，见
+        // 节流：800ms 内的重复探测复用上次结果，见
         // TRAE_PROCESS_PROBE_CACHE 注释。kill 动作（send_close_signal）会
         // 清空缓存，关闭流程 kill 后的验证探测仍是真实数据。
         let probe_key = (expected.to_string(), platform.provider_key().to_string());
@@ -8043,30 +8056,42 @@ pub fn collect_trae_process_entries_for_platform(
             .ok()
             .and_then(|cache| cache.get(&probe_key).cloned())
         {
-            if at.elapsed() < TRAE_PROCESS_PROBE_MIN_INTERVAL && !entries.is_empty() {
+            if at.elapsed() < TRAE_PROCESS_PROBE_MIN_INTERVAL {
                 return entries;
             }
         }
-        let entries = collect_named_electron_process_entries_from_powershell(
-            expected,
-            "Trae.exe",
-            platform.display_name(),
-        );
-        if !entries.is_empty() {
-            if let Ok(mut cache) = TRAE_PROCESS_PROBE_CACHE.lock() {
-                cache.insert(probe_key, (Instant::now(), entries.clone()));
-            }
-            return entries;
-        }
-        crate::modules::logger::log_warn(
-            "[Trae Probe] PowerShell returned empty; fallback to sysinfo probe",
-        );
-        return collect_named_electron_process_entries_from_sysinfo_fallback(
+        // sysinfo（毫秒级）为主路径：进程存在时直接返回；为空时再用
+        // PowerShell（单次 300ms~1s+）复核，防止 sysinfo 漏检被误判为未运行。
+        let probe_started = Instant::now();
+        let sysinfo_started = Instant::now();
+        let entries = collect_named_electron_process_entries_from_sysinfo_fallback(
             expected,
             "trae",
             "Trae.exe",
             platform.display_name(),
         );
+        let sysinfo_ms = sysinfo_started.elapsed().as_millis();
+        if !entries.is_empty() {
+            if let Ok(mut cache) = TRAE_PROCESS_PROBE_CACHE.lock() {
+                cache.insert(probe_key, (Instant::now(), entries.clone()));
+            }
+            log_trae_slow_probe(probe_started, sysinfo_ms, 0, "sysinfo", entries.len());
+            return entries;
+        }
+        let ps_started = Instant::now();
+        let entries = collect_named_electron_process_entries_from_powershell(
+            expected,
+            "Trae.exe",
+            platform.display_name(),
+        );
+        let ps_ms = ps_started.elapsed().as_millis();
+        // PowerShell 复核后的结果（含空）缓存 800ms：轮询循环里
+        // 连续的空探测不再重复支付 300ms~1s+ 的复核成本。
+        if let Ok(mut cache) = TRAE_PROCESS_PROBE_CACHE.lock() {
+            cache.insert(probe_key, (Instant::now(), entries.clone()));
+        }
+        log_trae_slow_probe(probe_started, sysinfo_ms, ps_ms, "ps-confirm", entries.len());
+        entries
     }
 
     #[cfg(target_os = "macos")]
@@ -8096,6 +8121,24 @@ pub fn collect_trae_process_entries_for_platform(
     }
 }
 
+/// 慢探测诊断：总耗时 ≥500ms 时记录各阶段耗时，用于定位切换慢的探测瓶颈。
+#[cfg(target_os = "windows")]
+fn log_trae_slow_probe(
+    probe_started: Instant,
+    sysinfo_ms: u128,
+    ps_ms: u128,
+    path: &str,
+    entry_count: usize,
+) {
+    let total_ms = probe_started.elapsed().as_millis();
+    if total_ms >= 500 {
+        crate::modules::logger::log_info(&format!(
+            "[Trae Probe] slow probe path={} total_ms={} sysinfo_ms={} ps_ms={} entries={}",
+            path, total_ms, sysinfo_ms, ps_ms, entry_count
+        ));
+    }
+}
+
 #[cfg(target_os = "windows")]
 fn resolve_workbuddy_probe_result(
     powershell: Result<Vec<(u32, Option<String>)>, String>,
@@ -8110,36 +8153,67 @@ fn resolve_workbuddy_probe_result(
 }
 
 #[cfg(target_os = "windows")]
-fn collect_workbuddy_process_entries_checked() -> Result<Vec<(u32, Option<String>)>, String> {
-    // 节流：800ms 内复用上次非空结果，见 WORKBUDDY_PROCESS_PROBE_CACHE 注释。
+pub(crate) fn collect_workbuddy_process_entries_checked() -> Result<Vec<(u32, Option<String>)>, String> {
+    let probe_started = Instant::now();
+    // 节流：800ms 内复用上次结果（含 PowerShell 复核确认后的空结果），
+    // 见 WORKBUDDY_PROCESS_PROBE_CACHE 注释。
     if let Some((at, entries)) = WORKBUDDY_PROCESS_PROBE_CACHE
         .lock()
         .ok()
         .and_then(|cache| cache.clone())
     {
-        if at.elapsed() < TRAE_PROCESS_PROBE_MIN_INTERVAL && !entries.is_empty() {
+        if at.elapsed() < TRAE_PROCESS_PROBE_MIN_INTERVAL {
             return Ok(entries);
         }
     }
+    // sysinfo（毫秒级）为主路径：进程存在时直接返回；为空时再用 PowerShell
+    // （单次 300ms~1s+）复核。复核失败沿用原错误语义（探测失败 ≠ 未运行）。
+    let sysinfo_started = Instant::now();
+    let sysinfo_entries = collect_workbuddy_process_entries_from_sysinfo_fallback();
+    let sysinfo_ms = sysinfo_started.elapsed().as_millis();
+    if !sysinfo_entries.is_empty() {
+        if let Ok(mut cache) = WORKBUDDY_PROCESS_PROBE_CACHE.lock() {
+            *cache = Some((Instant::now(), sysinfo_entries.clone()));
+        }
+        log_workbuddy_slow_probe(probe_started, sysinfo_ms, 0, "sysinfo", &sysinfo_entries);
+        return Ok(sysinfo_entries);
+    }
+    let ps_started = Instant::now();
     let powershell = collect_workbuddy_process_entries_from_powershell();
-    let fallback = if powershell
-        .as_ref()
-        .map(|entries| entries.is_empty())
-        .unwrap_or(true)
-    {
-        collect_workbuddy_process_entries_from_sysinfo_fallback()
-    } else {
-        Vec::new()
-    };
-    let result = resolve_workbuddy_probe_result(powershell, fallback);
+    let ps_ms = ps_started.elapsed().as_millis();
+    let result = resolve_workbuddy_probe_result(powershell, sysinfo_entries);
+    // PowerShell 复核后的结果（含空）缓存 800ms：轮询循环里连续的空探测
+    // 不再重复支付 300ms~1s+ 的复核成本。
     if let Ok(entries) = &result {
-        if !entries.is_empty() {
-            if let Ok(mut cache) = WORKBUDDY_PROCESS_PROBE_CACHE.lock() {
-                *cache = Some((Instant::now(), entries.clone()));
-            }
+        if let Ok(mut cache) = WORKBUDDY_PROCESS_PROBE_CACHE.lock() {
+            *cache = Some((Instant::now(), entries.clone()));
         }
     }
+    let result_entries = result.as_ref().map(|e| e.clone()).unwrap_or_default();
+    log_workbuddy_slow_probe(probe_started, sysinfo_ms, ps_ms, "ps-confirm", &result_entries);
     result
+}
+
+/// 慢探测诊断：总耗时 ≥500ms 时记录各阶段耗时，用于定位切换慢的探测瓶颈。
+#[cfg(target_os = "windows")]
+fn log_workbuddy_slow_probe(
+    probe_started: Instant,
+    sysinfo_ms: u128,
+    ps_ms: u128,
+    path: &str,
+    entries: &[(u32, Option<String>)],
+) {
+    let total_ms = probe_started.elapsed().as_millis();
+    if total_ms >= 500 {
+        crate::modules::logger::log_info(&format!(
+            "[WorkBuddy Probe] slow probe path={} total_ms={} sysinfo_ms={} ps_ms={} entries={}",
+            path,
+            total_ms,
+            sysinfo_ms,
+            ps_ms,
+            entries.len()
+        ));
+    }
 }
 
 pub fn collect_workbuddy_process_entries() -> Vec<(u32, Option<String>)> {
@@ -8527,7 +8601,7 @@ fn close_managed_instances_common<CollectEntries, SelectMainPids, CollectRemaini
     graceful_close: Option<fn(u32)>,
     graceful_wait_secs: Option<u64>,
     detail_logger: Option<fn(&[u32])>,
-) -> Result<(), String>
+) -> Result<bool, String>
 where
     CollectEntries: Fn() -> Vec<(u32, Option<String>)>,
     SelectMainPids: Fn(&[(u32, Option<String>)], &HashSet<String>) -> Vec<u32>,
@@ -8542,7 +8616,7 @@ where
         .collect();
     if target_dirs.is_empty() {
         crate::modules::logger::log_info(empty_targets_message);
-        return Ok(());
+        return Ok(false);
     }
     crate::modules::logger::log_info(&format!(
         "[{}] target_dirs={}, timeout_secs={}",
@@ -8563,7 +8637,7 @@ where
     pids.dedup();
     if pids.is_empty() {
         crate::modules::logger::log_info(not_running_message);
-        return Ok(());
+        return Ok(false);
     }
     crate::modules::logger::log_info(&format!(
         "[{}] matched_main_pids={}",
@@ -8588,7 +8662,7 @@ where
                     log_prefix,
                     summarize_pid_list_for_log(&pids)
                 ));
-                return Ok(());
+                return Ok(true);
             }
         }
     }
@@ -8656,7 +8730,7 @@ where
         ));
     }
 
-    Ok(())
+    Ok(true)
 }
 
 /// 关闭受管 Antigravity IDE 实例（按 user-data-dir 匹配，包含默认实例目录）
@@ -8705,6 +8779,7 @@ pub fn close_antigravity_instances(
         #[cfg(not(target_os = "windows"))]
         None,
     )
+    .map(|_| ())
 }
 
 pub fn close_antigravity_legacy_instances(
@@ -8751,6 +8826,7 @@ pub fn close_antigravity_legacy_instances(
         #[cfg(not(target_os = "windows"))]
         None,
     )
+    .map(|_| ())
 }
 
 fn close_user_data_dir_scoped_instances(
@@ -8792,6 +8868,7 @@ fn close_user_data_dir_scoped_instances(
         None,
         None,
     )
+    .map(|_| ())
 }
 
 pub fn close_codebuddy_instances(
@@ -9089,7 +9166,7 @@ pub fn close_trae_platform_instances(
         .map(|value| normalize_path_for_compare(&value))
         .filter(|value| !value.is_empty());
     let log_prefix = format!("{} Close", platform.display_name());
-    close_managed_instances_common(
+    let closed_any = close_managed_instances_common(
         &log_prefix,
         &format!("Closing {} instances...", platform.display_name()),
         &format!(
@@ -9123,6 +9200,10 @@ pub fn close_trae_platform_instances(
         None,
         None,
     )?;
+    if !closed_any {
+        // 目标实例未在运行：无需等待残留退出与落盘稳定期。
+        return Ok(());
+    }
     // Wait for the targeted profiles to fully disappear before inject/start.
     for dir in user_data_dirs {
         let trimmed = dir.trim();
@@ -9154,30 +9235,34 @@ pub fn close_workbuddy_instances(
         })
         .collect();
     #[cfg(target_os = "windows")]
-    collect_workbuddy_process_entries_checked()
-        .map_err(|error| format!("WorkBuddy 进程探测失败，已取消切换: {error}"))?;
-
-    let close_result = close_user_data_dir_scoped_instances(
-        "WorkBuddy Close",
-        "WorkBuddy",
-        "Unable to close managed WorkBuddy instances; please close them manually and retry",
-        &normalized,
-        timeout_secs,
-        true,
-        default_dir.clone(),
-        collect_workbuddy_process_entries,
-    );
-
-    #[cfg(target_os = "windows")]
     {
-        close_result?;
         let entries = collect_workbuddy_process_entries_checked()
-            .map_err(|error| format!("WorkBuddy 关闭后进程复查失败，已取消切换: {error}"))?;
+            .map_err(|error| format!("WorkBuddy 进程探测失败，已取消切换: {error}"))?;
         let target_dirs = normalized
             .iter()
             .map(|value| normalize_path_for_compare(value))
             .filter(|value| !value.is_empty())
             .collect::<HashSet<_>>();
+        // 未检测到目标实例：跳过关闭与关闭后复查（各省一次进程探测）。
+        if filter_entries_by_target_dirs(entries, &target_dirs, default_dir.as_deref()).is_empty()
+        {
+            crate::modules::logger::log_info("[WorkBuddy Close] 未检测到目标实例，无需关闭");
+            return Ok(());
+        }
+
+        close_user_data_dir_scoped_instances(
+            "WorkBuddy Close",
+            "WorkBuddy",
+            "Unable to close managed WorkBuddy instances; please close them manually and retry",
+            &normalized,
+            timeout_secs,
+            true,
+            default_dir.clone(),
+            collect_workbuddy_process_entries,
+        )?;
+
+        let entries = collect_workbuddy_process_entries_checked()
+            .map_err(|error| format!("WorkBuddy 关闭后进程复查失败，已取消切换: {error}"))?;
         let remaining =
             filter_entries_by_target_dirs(entries, &target_dirs, default_dir.as_deref());
         if !remaining.is_empty() {
@@ -9190,7 +9275,18 @@ pub fn close_workbuddy_instances(
     }
 
     #[cfg(not(target_os = "windows"))]
-    close_result
+    {
+        close_user_data_dir_scoped_instances(
+            "WorkBuddy Close",
+            "WorkBuddy",
+            "Unable to close managed WorkBuddy instances; please close them manually and retry",
+            &normalized,
+            timeout_secs,
+            true,
+            default_dir.clone(),
+            collect_workbuddy_process_entries,
+        )
+    }
 }
 
 fn request_antigravity_graceful_close(pid: u32) {
@@ -13959,6 +14055,7 @@ pub fn close_vscode(user_data_dirs: &[String], timeout_secs: u64) -> Result<(), 
         #[cfg(not(target_os = "windows"))]
         None,
     )
+    .map(|_| ())
 }
 
 fn request_vscode_graceful_close(pid: u32) {

@@ -11,15 +11,18 @@ Var ShortcutRepairRequired
   ; 静默结束运行中的进程后继续安装：
   ;  - qiehuan-yingyong.exe：当前机器标识（同产品名原地升级时的自锁定）。
   ;  - cockpit-tools.exe / trae-work-cn-switcher.exe：历史产品名副本。
-  nsExec::Exec 'taskkill /F /IM "${PRODUCTNAME}.exe" /T'
+  ; 注意：不能用 taskkill /T（进程树终止）——由本应用启动的
+  ; WorkBuddy / TRAE 客户端是本应用的子进程，/T 会把它们一并杀掉。
+  ; 按镜像名精确结束本应用自身即可释放文件锁。
+  nsExec::Exec 'taskkill /F /IM "${PRODUCTNAME}.exe"'
   Pop $R9
-  nsExec::Exec 'taskkill /F /IM qiehuan-yingyong.exe /T'
+  nsExec::Exec 'taskkill /F /IM qiehuan-yingyong.exe'
   Pop $R9
-  nsExec::Exec 'taskkill /F /IM qiehuan_yingyong.exe /T'
+  nsExec::Exec 'taskkill /F /IM qiehuan_yingyong.exe'
   Pop $R9
-  nsExec::Exec 'taskkill /F /IM cockpit-tools.exe /T'
+  nsExec::Exec 'taskkill /F /IM cockpit-tools.exe'
   Pop $R9
-  nsExec::Exec 'taskkill /F /IM trae-work-cn-switcher.exe /T'
+  nsExec::Exec 'taskkill /F /IM trae-work-cn-switcher.exe'
   Pop $R9
   Sleep 500
 

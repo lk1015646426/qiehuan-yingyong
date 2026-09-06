@@ -5,11 +5,10 @@ import test from 'node:test';
 const page = (name: string) => readFileSync(new URL(`../pages/${name}`, import.meta.url), 'utf8');
 const style = (name: string) => readFileSync(new URL(`../styles/pages/${name}`, import.meta.url), 'utf8');
 
-test('TRAE、WorkBuddy 和云端签到使用相同卡片结构区域', () => {
+test('TRAE 与 WorkBuddy 使用相同卡片结构区域', () => {
   const sources = [
     page('WorkCnSwitcherPage.tsx'),
     page('WorkBuddyPage.tsx'),
-    page('CheckinPanelPage.tsx'),
   ];
   for (const source of sources) {
     for (const className of [
@@ -29,11 +28,10 @@ test('本地 TRAE 与 WorkBuddy 卡片都展示 UID', () => {
   assert.match(page('WorkBuddyPage.tsx'), /UID/);
 });
 
-test('本地与云端账号卡片使用同一个紧凑尺寸契约', () => {
+test('本地 TRAE 与 WorkBuddy 卡片使用同一个紧凑尺寸契约', () => {
   const sources = [
     page('WorkCnSwitcherPage.tsx'),
     page('WorkBuddyPage.tsx'),
-    page('CheckinPanelPage.tsx'),
   ];
   for (const source of sources) {
     assert.match(source, /account-card--compact/);

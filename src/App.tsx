@@ -1,22 +1,20 @@
 // 切换应用 - 应用入口
 //
 // 侧边栏双面板布局（复用上游 pages/sidebar.css 的 .with-sidebar 体系）：
-// - TRAE：WorkCnSwitcherPage（账号快照管理 / 一键切换）
-// - 云端签到：CheckinPanelPage（token 倒计时 / 半自动刷新 / 触发与状态）
+// - TRAE：WorkCnSwitcherPage（账号快照管理 / 一键切换 / 云端签到）
+// - WorkBuddy：WorkBuddyPage（账号管理 / 签到 / 积分）
 // 页签为前端 state，不引入路由库。
 
 import './App.css';
 import { useEffect, useState } from 'react';
-import { CloudUpload } from 'lucide-react';
 import traeCnIcon from './assets/icons/trae-cn.png';
 import workBuddyIcon from './assets/icons/workbuddy.png';
 import { WorkCnSwitcherPage } from './pages/WorkCnSwitcherPage';
-import { CheckinPanelPage } from './pages/CheckinPanelPage';
 import { WorkBuddyPage } from './pages/WorkBuddyPage';
 import { useWorkCnStore } from './stores/useWorkCnStore';
 import { useWorkBuddyStore } from './stores/useWorkBuddyStore';
 
-type PageKey = 'switcher' | 'workbuddy' | 'checkin';
+type PageKey = 'switcher' | 'workbuddy';
 
 export default function App() {
   const [page, setPage] = useState<PageKey>('switcher');
@@ -68,24 +66,16 @@ export default function App() {
             <img src={traeCnIcon} alt="" width={17} height={17} />
             <span>TRAE</span>
           </button>
-          <button
-            type="button"
-            className={page === 'checkin' ? 'nav-item active' : 'nav-item'}
-            onClick={() => setPage('checkin')}
-          >
-            <CloudUpload size={17} />
-            <span>云端签到</span>
-          </button>
         </nav>
         <div className="sidebar-footer">
-          <div className="app-sidebar-gh" title={ghReady ? 'gh CLI 就绪' : 'gh CLI 未就绪（云端签到功能不可用）'}>
+          <div className="app-sidebar-gh" title={ghReady ? 'gh CLI 就绪' : 'gh CLI 未就绪（GitHub 同步与云端签到不可用）'}>
             <span className={ghReady ? 'app-sidebar-gh-dot app-sidebar-gh-dot--ok' : 'app-sidebar-gh-dot'} />
             <span>gh {githubCliStatus ? (ghReady ? '就绪' : '未就绪') : '检测中'}</span>
           </div>
         </div>
       </aside>
       <main className="main-wrapper">
-        {page === 'switcher' ? <WorkCnSwitcherPage /> : page === 'workbuddy' ? <WorkBuddyPage /> : <CheckinPanelPage />}
+        {page === 'switcher' ? <WorkCnSwitcherPage /> : <WorkBuddyPage />}
       </main>
     </div>
   );

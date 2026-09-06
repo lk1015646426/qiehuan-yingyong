@@ -8,12 +8,23 @@
 //! 不报告整体成功（开发指南 §8.5 自动测试要求）。
 
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use crate::models::trae::TraeAccount;
 use crate::models::work_cn::{
     WorkCnGitHubCliStatus, WorkCnGitHubConfig, WorkCnGitHubSlot, WorkCnGitHubSyncResult,
 };
+
+// Serialize every Work CN GitHub write. A switch, the session watcher, and a
+// manual sync can otherwise race and let an older snapshot overwrite a newer
+// token/device pair.
+static WORK_CN_GITHUB_SYNC_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+fn lock_work_cn_github_sync() -> MutexGuard<'static, ()> {
+    WORK_CN_GITHUB_SYNC_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Output of a single `gh` invocation.
 #[derive(Debug, Clone)]
@@ -624,6 +635,14 @@ pub(crate) fn sync_account_secrets_if_bound_with(
     runner: &dyn GitHubRunner,
     account: &TraeAccount,
 ) -> Result<WorkCnGitHubSyncResult, String> {
+    let _sync_guard = lock_work_cn_github_sync();
+    sync_account_secrets_if_bound_unlocked(runner, account)
+}
+
+fn sync_account_secrets_if_bound_unlocked(
+    runner: &dyn GitHubRunner,
+    account: &TraeAccount,
+) -> Result<WorkCnGitHubSyncResult, String> {
     let config = load_github_config();
     if !config.enabled {
         return Ok(skip_result(&account.id, "GitHub 同步未启用"));
@@ -638,7 +657,7 @@ pub(crate) fn sync_account_secrets_if_bound_with(
             "官方设备快照不完整，已跳过 GitHub 同步",
         ));
     }
-    sync_account_secrets(runner, account, slot, &config.repository)
+    sync_account_secrets_unlocked(runner, account, slot, &config.repository)
 }
 
 /// 生产入口（命令层、切换链路、watcher 均走这里）。
@@ -687,6 +706,16 @@ pub fn github_auth_status(runner: &dyn GitHubRunner) -> Result<(), String> {
 /// a secret-set failed). The first secret failing short-circuits before the
 /// second is attempted, so the overall result is never reported as success.
 pub fn sync_account_secrets(
+    runner: &dyn GitHubRunner,
+    account: &TraeAccount,
+    slot: &WorkCnGitHubSlot,
+    repository: &str,
+) -> Result<WorkCnGitHubSyncResult, String> {
+    let _sync_guard = lock_work_cn_github_sync();
+    sync_account_secrets_unlocked(runner, account, slot, repository)
+}
+
+fn sync_account_secrets_unlocked(
     runner: &dyn GitHubRunner,
     account: &TraeAccount,
     slot: &WorkCnGitHubSlot,

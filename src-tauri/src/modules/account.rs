@@ -72,7 +72,26 @@ fn copy_dir_contents(source: &Path, target: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// 旧数据目录迁移完成标记文件名。迁移检查需要遍历所有旧目录的完整
+/// 文件树（可能上千个文件），而 get_data_dir 在每次账号存储读写时都会
+/// 被调用——没有标记时每次调用都重复遍历，切换等操作会被拖慢数十秒。
+/// 标记文件 + 进程内缓存确保目录树每个进程生命周期最多扫描一次。
+const LEGACY_MIGRATION_MARKER: &str = ".legacy-migration-done";
+
+static LEGACY_MIGRATION_ONCE: std::sync::LazyLock<Mutex<()>> =
+    std::sync::LazyLock::new(|| Mutex::new(()));
+
 fn migrate_legacy_data_dirs(home: &Path, target: &Path) {
+    // 进程内缓存：本进程已确认迁移完成后不再扫描。
+    // 锁保证并发调用时只有一个线程执行扫描；标记文件保证重启后跳过。
+    let _once_guard = LEGACY_MIGRATION_ONCE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let marker = target.join(LEGACY_MIGRATION_MARKER);
+    if marker.is_file() {
+        return;
+    }
+    let mut migrated_any = false;
     for name in legacy_data_dir_names() {
         let source = home.join(name);
         if !source.exists() || source == target {
@@ -86,12 +105,32 @@ fn migrate_legacy_data_dirs(home: &Path, target: &Path) {
                 error
             );
         } else {
+            migrated_any = true;
             eprintln!(
                 "切换应用已兼容旧数据目录: source={}, target={}",
                 source.display(),
                 target.display()
             );
         }
+    }
+    if migrated_any {
+        crate::modules::logger::log_info(
+            "[Data Dir] 旧数据目录迁移完成，已写入标记文件，后续启动将跳过迁移扫描",
+        );
+    }
+    // 无论是否发生复制都写入标记：不存在旧目录时同样无需再次扫描。
+    let content = format!(
+        "legacy data dir migration checked at {}\n",
+        chrono::Utc::now().to_rfc3339()
+    );
+    if let Err(error) =
+        crate::modules::atomic_write::write_string_atomic(&marker, &content)
+    {
+        eprintln!(
+            "切换应用旧数据迁移标记写入失败（下次启动将重新扫描）: path={}, error={}",
+            marker.display(),
+            error
+        );
     }
 }
 

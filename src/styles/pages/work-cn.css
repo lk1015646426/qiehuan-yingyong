@@ -437,6 +437,83 @@
   flex-wrap: nowrap;
 }
 
+/* ---------- 指标行 Token 状态色（照抄 WorkBuddy 卡片指标行结构后补充） ---------- */
+
+.wc-token-strong--ok {
+  color: var(--text-primary);
+}
+
+.wc-token-strong--warn {
+  color: #d97706;
+}
+
+.wc-token-strong--danger {
+  color: var(--danger);
+}
+
+.wc-token-strong--unknown {
+  color: var(--text-secondary);
+}
+
+/* ---------- 云端签到任务区（自独立面板合并） ---------- */
+
+.wc-cloud-section {
+  margin-top: 4px;
+}
+
+.wc-cloud-toggle {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 0;
+  border: none;
+  background: none;
+  cursor: pointer;
+  text-align: left;
+}
+
+.wc-cloud-toggle .wc-section-title {
+  margin: 0;
+}
+
+.wc-cloud-summary {
+  margin-left: 10px;
+  font-size: 12px;
+  font-weight: 400;
+  opacity: 0.75;
+}
+
+.wc-cloud-summary--ok {
+  color: var(--success);
+  opacity: 1;
+}
+
+.wc-cloud-summary--error {
+  color: var(--danger);
+  opacity: 1;
+}
+
+.wc-cloud-chevron {
+  flex-shrink: 0;
+  transition: transform 0.15s ease;
+  opacity: 0.6;
+}
+
+.wc-cloud-chevron--open {
+  transform: rotate(180deg);
+}
+
+.wc-cloud-body {
+  margin-top: 10px;
+}
+
+.wc-cloud-actions {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+
 /* ---------- 对话框 ---------- */
 
 .wc-overlay {

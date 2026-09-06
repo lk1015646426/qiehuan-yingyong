@@ -110,6 +110,7 @@ pub enum WorkBuddyErrorCode {
     AccountNotFound,
     AuthFileNotFound,
     AuthFileInvalid,
+    AuthRefreshFailed,
     SnapshotIncomplete,
     ClientNotInstalled,
     ClientCloseFailed,
