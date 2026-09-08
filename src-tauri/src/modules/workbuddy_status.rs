@@ -26,9 +26,10 @@ fn parse_real_credits(payload: &Value) -> Option<f64> {
     let accounts = payload
         .pointer("/data/Response/Data/Accounts")?
         .as_array()?;
+    // 官方客户端把所有有效（Status==0）的积分包都计入总积分，包括个人体验版
+    // （CapacityType=4）等，因此这里不再按 CapacityType 过滤，只排除无效状态的包。
     let total = accounts
         .iter()
-        .filter(|package| integer(package.get("CapacityType")) == Some(1))
         .filter(|package| integer(package.get("Status")) == Some(0))
         .filter_map(|package| {
             number(package.get("CapacityRemainPrecise"))
@@ -242,16 +243,36 @@ mod tests {
     }
 
     #[test]
-    fn workbuddy_real_credits_exclude_trial_and_inactive_packages() {
+    fn workbuddy_real_credits_exclude_inactive_packages() {
         let payload = json!({
             "data": {"Response": {"Data": {"Accounts": [
-                {"CapacityType": 4, "Status": 0, "CapacityRemainPrecise": "500"},
                 {"CapacityType": 1, "Status": 1, "CapacityRemainPrecise": "900"},
                 {"CapacityType": 1, "Status": 0, "CapacityRemainPrecise": "293.49"}
             ]}}}
         });
 
         assert_eq!(parse_real_credits(&payload), Some(293.49));
+    }
+
+    // 真实样本（2026-09-07 抓取）：官方客户端把个人体验版（CapacityType=4）的
+    // 500 分也计入总积分（显示 800），与赠送包一样按 Status==0 判断有效性。
+    #[test]
+    fn workbuddy_real_credits_include_trial_packages() {
+        let payload = json!({
+            "data": {"Response": {"Data": {
+                "TotalCount": 4,
+                "TotalDosage": 800,
+                "Accounts": [
+                    {"CapacityType": 4, "Status": 0, "CapacityRemainPrecise": "500"},
+                    {"CapacityType": 1, "Status": 0, "CapacityRemainPrecise": "100"},
+                    {"CapacityType": 1, "Status": 0, "CapacityRemainPrecise": "100"},
+                    {"CapacityType": 1, "Status": 0, "CapacityRemainPrecise": "100"},
+                    {"CapacityType": 1, "Status": 1, "CapacityRemainPrecise": "900"}
+                ]
+            }}}
+        });
+
+        assert_eq!(parse_real_credits(&payload), Some(800.0));
     }
 
     #[test]

@@ -4,7 +4,7 @@ import { WorkBuddyAddAccountDialog } from '../components/workbuddy/WorkBuddyAddA
 import { WorkBuddySettingsDialog } from '../components/workbuddy/WorkBuddySettingsDialog';
 import { useWorkBuddyStore } from '../stores/useWorkBuddyStore';
 import type { WorkBuddyAccountView, WorkBuddyInstallation } from '../types/workbuddy';
-import { compactUid, githubSyncPresentation } from '../utils/accountCardPresentation';
+import { compactUid, credentialInvalidated, githubSyncPresentation } from '../utils/accountCardPresentation';
 
 function timeText(timestamp: number | null): string {
   if (!timestamp) return '未知';
@@ -31,6 +31,7 @@ function AccountCard({ account, active }: { account: WorkBuddyAccountView; activ
   const refreshAccountStatus = useWorkBuddyStore((state) => state.refreshAccountStatus);
   const [deleting, setDeleting] = useState(false);
   const [editing, setEditing] = useState(false);
+  const [confirmingSwitch, setConfirmingSwitch] = useState(false);
   const [name, setName] = useState(account.displayName);
   const busy = switchingId !== null || updatingId !== null || deletingId !== null || checkingInId !== null;
   const githubSync = githubSyncPresentation(account.lastGithubSyncState, account.lastGithubSyncError);
@@ -45,6 +46,17 @@ function AccountCard({ account, active }: { account: WorkBuddyAccountView; activ
   const statusErrors = [status?.creditsError, status?.activityError]
     .filter((value): value is string => Boolean(value))
     .filter((value, index, values) => values.indexOf(value) === index);
+  // 服务端已作废的凭证（可能在别处登录导致 token 轮换）：切换会在联网刷新一步
+  // 失败并回滚，提前用醒目标记 + 二次确认引导用户先重新登录导入。
+  const credentialInvalid = credentialInvalidated([status?.creditsError, status?.activityError]);
+  const requestSwitch = () => {
+    if (credentialInvalid && !confirmingSwitch) {
+      setConfirmingSwitch(true);
+      return;
+    }
+    setConfirmingSwitch(false);
+    void switchTo(account.id);
+  };
   return <article className={active ? 'wc-slot account-card account-card--compact wb-slot wb-slot--active' : 'wc-slot account-card account-card--compact wb-slot'}>
     {active ? <span className="wc-slot-active-badge">当前账号</span> : null}
     <div className="wc-slot-head account-card__head">
@@ -58,6 +70,7 @@ function AccountCard({ account, active }: { account: WorkBuddyAccountView; activ
       <div className="wc-slot-sub">令牌到期 {timeText(account.tokenExpiresAt)}</div>
     </div>
     <div className="wb-status-block">
+      {credentialInvalid ? <div className="wb-credential-invalid" role="alert">凭证已失效（可能在其他设备登录过），切换无法完成。请先在 WorkBuddy 客户端重新登录该账号，再导入更新。</div> : null}
       <div className="wb-status-line" aria-label="WorkBuddy 状态">
         <span>真实积分 <strong>{statusLoading && !status ? '查询中…' : status?.credits != null ? status.credits.toLocaleString('zh-CN', { maximumFractionDigits: 2 }) : '暂无数据'}</strong></span>
         <span>今日奖励 <strong>{status?.todayReward != null ? status.todayReward.toLocaleString('zh-CN', { maximumFractionDigits: 2 }) : '暂无数据'}</strong></span>
@@ -77,7 +90,11 @@ function AccountCard({ account, active }: { account: WorkBuddyAccountView; activ
       <button type="button" className="wc-btn" onClick={() => { setName(account.displayName); setEditing(false); }}>取消</button>
     </div> : null}
     <div className="wc-slot-actions account-card__actions">
-      <button type="button" className="wc-btn wc-btn-primary" disabled={busy} onClick={() => void switchTo(account.id)}>{switchingId === account.id ? '切换中…' : '切换并打开'}</button>
+      {confirmingSwitch ? <>
+        <span className="wb-switch-confirm-hint">凭证已失效，仍要切换？</span>
+        <button type="button" className="wc-btn wc-btn-danger" disabled={busy} onClick={requestSwitch}>{switchingId === account.id ? '切换中…' : '仍要切换'}</button>
+        <button type="button" className="wc-btn" disabled={busy} onClick={() => setConfirmingSwitch(false)}>取消</button>
+      </> : <button type="button" className="wc-btn wc-btn-primary" disabled={busy} onClick={requestSwitch}>{switchingId === account.id ? '切换中…' : '切换并打开'}</button>}
       <button type="button" className="wc-btn" disabled={busy || statusLoading} onClick={() => void refreshAccountStatus(account.id)}>{statusLoading ? '刷新中…' : '刷新积分'}</button>
       <button type="button" className="wc-btn" disabled={busy || !account.checkinEnabled} onClick={() => void triggerCheckin(account.id)}>{checkingInId === account.id ? '触发中…' : '立即签到'}</button>
       <button type="button" className="wc-btn" disabled={busy} onClick={() => setEditing((value) => !value)}>备注</button>

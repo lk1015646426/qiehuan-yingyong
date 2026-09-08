@@ -55,6 +55,9 @@
 .wc-page .wb-status-line span { white-space: nowrap; }
 .wc-page .wb-status-line strong { color: var(--text-primary); font-size: 13px; }
 .wc-page .wb-status-error { margin-top: 4px; color: #dc2626; font-size: 11px; line-height: 1.35; word-break: break-word; }
+/* 凭证失效横幅：服务端已作废的 token（可能在别处登录轮换），切换会失败 */
+.wc-page .wb-credential-invalid { margin-top: 6px; margin-bottom: 4px; padding: 5px 8px; border: 1px solid var(--danger); border-radius: var(--radius-sm); background: color-mix(in srgb, var(--danger) 10%, transparent); color: var(--danger); font-size: 11px; font-weight: 600; line-height: 1.45; word-break: break-word; }
+.wc-page .wb-switch-confirm-hint { flex: 0 0 auto; color: var(--danger); font-size: 12px; font-weight: 600; }
 .wc-page .wb-sync { flex: 0 0 auto; font-size: 12px; color: var(--text-secondary); }
 .wc-page .wb-sync--synced { color: #16a34a; }
 .wc-page .wb-sync--failed { color: #dc2626; }
