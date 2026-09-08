@@ -3424,7 +3424,7 @@ checksum = "b5a041e753da8b807c9255f28de81879c78c876392ff2469cde94799b2896b9d"
 
 [[package]]
 name = "qiehuan-yingyong"
-version = "0.1.10"
+version = "0.1.11"
 dependencies = [
  "aes",
  "aes-gcm",

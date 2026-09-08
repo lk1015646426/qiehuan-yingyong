@@ -19,10 +19,8 @@ export interface ZhipuAccountUpdate {
 }
 
 export interface ZhipuAccountStatus {
-  /** 当前积分余额。 */
-  currentScore: number | null;
-  /** 活动状态原始值（-2 = 无进行中活动）。 */
-  activityStatus: number | null;
+  /** 当前总积分（user/info 的 left_score，客户端显示口径）。 */
+  leftScore: number | null;
   updatedAt: number;
   scoreError: string | null;
 }

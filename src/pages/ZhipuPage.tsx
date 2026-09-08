@@ -50,8 +50,7 @@ function AccountCard({ account }: { account: ZhipuAccountView }) {
     </div>
     <div className="wb-status-block">
       <div className="wb-status-line" aria-label="智谱清言积分">
-        <span>当前积分 <strong>{statusLoading && !status ? '查询中…' : scoreText(status?.currentScore ?? null)}</strong></span>
-        <span>活动状态 <strong>{status?.activityStatus != null ? (status.activityStatus > 0 ? '进行中' : '无活动') : '暂无数据'}</strong></span>
+        <span>当前积分 <strong>{statusLoading && !status ? '查询中…' : scoreText(status?.leftScore ?? null)}</strong></span>
       </div>
       {status?.scoreError ? <div className="wb-status-error">{status.scoreError}</div> : null}
     </div>

@@ -152,7 +152,7 @@ export const useZhipuStore = create<ZhipuState>((set, get) => ({
     } catch (error) {
       set((state) => ({
         statusById: { ...state.statusById, [accountId]: {
-          currentScore: null, activityStatus: null,
+          leftScore: null,
           updatedAt: Math.floor(Date.now() / 1000),
           scoreError: messageOf(error),
         } },

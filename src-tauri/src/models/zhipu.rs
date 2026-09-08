@@ -27,14 +27,12 @@ pub struct ZhipuAccountUpdate {
     pub checkin_enabled: Option<bool>,
 }
 
-/// 只读积分状态：清言 member-api 的 score_activity_status。
+/// 只读积分状态：user/info 的 member_info.left_score（客户端同口径总积分）。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ZhipuAccountStatus {
-    /// 当前积分余额（current_score）。
-    pub current_score: Option<f64>,
-    /// 活动状态原始值（-2 = 无进行中活动；正数为活动进行中）。
-    pub activity_status: Option<i64>,
+    /// 当前总积分（left_score，客户端显示口径）。
+    pub left_score: Option<f64>,
     pub updated_at: i64,
     pub score_error: Option<String>,
 }
