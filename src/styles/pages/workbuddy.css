@@ -65,8 +65,23 @@
 .workbuddy-page .wb-settings-dialog .wc-input { margin-bottom: 12px; }
 
 @media (max-width: 520px) {
-  .workbuddy-page .wb-edit-name { flex-wrap: wrap; }
+  .workbuddy-page .wb-edit-name, .zhipu-page .wb-edit-name { flex-wrap: wrap; }
 }
+
+/* 智谱页手动导入折叠区（客户端导入为主入口时的备选） */
+.zhipu-page .zp-manual-toggle,
+.wc-dialog .zp-manual-toggle {
+  border: none;
+  background: transparent;
+  padding: 0;
+  margin-top: 10px;
+  font-size: 12px;
+  color: var(--primary);
+  cursor: pointer;
+}
+.wc-dialog .zp-manual-toggle:hover { text-decoration: underline; }
+.wc-dialog .zp-manual-import { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); }
+.wc-dialog .zp-manual-import .wc-input { margin-bottom: 10px; }
 
 .workbuddy-accounts-page .workbuddy-quota-item {
   gap: 8px;

@@ -38,6 +38,9 @@ pub mod workbuddy_github;
 pub mod workbuddy_session_watcher;
 pub mod workbuddy_settings;
 pub mod workbuddy_status;
+pub mod zhipu_account;
+pub mod zhipu_github;
+pub mod zhipu_status;
 
 // 重新导出常用函数
 pub use account::*;

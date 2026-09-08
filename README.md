@@ -35,6 +35,16 @@
 - 启用“参与自动签到”的账号会同步到一个 `WORKBUDDY_ACCOUNTS_JSON` GitHub Secret。旧的 `WB1_TOKEN`、`WB2_TOKEN` 在聚合 Secret 尚未部署时仍可作为云端回退。
 - 账号卡片会显示真实积分、今日奖励和连续签到天数；打开页面或点击“刷新积分 / 刷新全部积分”时，仅调用 WorkBuddy 的只读状态接口，不会执行签到。
 
+## 智谱清言多账号
+
+侧栏中的 **智谱** 页面支持管理智谱清言（chatglm.cn）多个账号的每日登录积分云端签到与积分监控。签到就是你打开清言客户端时提示的「签到 +200 积分」（每日登录奖励）。
+
+- 点击「导入当前账号」直接从本机智谱清言客户端读取登录态（`%APPDATA%\chatglm\Network\Cookies` 中的 `chatglm_token` / `chatglm_refresh_token`，明文列直读）；客户端不可用时可在对话框中展开手动粘贴 token。
+- 导入时在线验证登录态（认证失败拒绝保存，网络失败仍保存并提示稍后确认）；token 以 AES-256-GCM 加密保存在本机，界面只显示用户标识不显示 token。
+- 账号卡片显示当前积分与活动状态；查询只调用 `score_activity_status` 只读接口，本地绝不执行签到。
+- “立即签到”通过 `gh workflow run` 触发 daily-checkin 仓库的工作流（`account_filter=zhipu:<账号ID>`），云端调用 `daily_login_score` 完成领取（2026-09-08 抓包验证）。
+- **云端全自主续期**：access token 约 24 小时有效，但云端每次签到前会用 refresh token（约 180 天有效且不轮换，已逆向刷新接口签名算法）自动换新 access token——本地导入一次后 **180 天内无需任何维护**，到期前在工具里重新导入即可。
+
 ## 最近修复
 
 - 统一 Work CN 的平台别名和客户端路径识别，避免重启后账号消失或切换时找不到数据。
@@ -46,10 +56,11 @@
 
 ## 验证状态
 
-- `npm test`：46 项通过。
+- `npm test`：45 项通过。
 - `npm run typecheck`：通过。
 - `npm run build`：通过。
-- Rust 单元测试：255 项通过，3 项忽略。
+- Rust 单元测试：277 项通过，3 项忽略（其中智谱相关 19 项）。
+- 云端 daily-checkin 仓库：zhipu signer 自检通过；真实账号实测签到链路返回「今日已领取，当前积分 948」。
 
 以上结果对应当前修复快照；发布前仍应在目标 Windows 环境验证 Tauri 启动和安装包行为。
 

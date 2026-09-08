@@ -9,6 +9,10 @@
 ---
 ## [未发布] - 2026-08-24
 
+### 新增
+
+- **智谱清言账号云端自动签到（云端全自主续期）**：侧栏新增「智谱」页面，支持从本机清言桌面客户端 Cookie 一键导入登录态（`chatglm_token` / `chatglm_refresh_token`，含手动粘贴备选）、JWT 解析（uid/用户名/过期时间）、AES-256-GCM 加密保存、在线验证（认证失败拒绝导入）、只读积分查询（`score_activity_status`）、GitHub Secrets 聚合同步（`ZHIPU_ACCOUNTS_JSON`，与 WorkBuddy 同一签到仓库）与云端签到触发（`account_filter=zhipu:<账号ID>`）。本地绝不执行签到。云端 daily-checkin 仓库新增 `signers/zhipu.py`：直连 `daily_login_score` 领取每日登录积分，并逆向实现了 user-api 刷新接口的签名算法（X-Timestamp 校验位变换 / X-Nonce / X-Sign=MD5），每次签到前用 refresh token 自动换新 access token（约 180 天有效且不轮换）——本地导入一次即可长期免维护。真实账号端到端实测通过（自动续期 → 签到 → 积分 948）。
+
 ### 修复
 
 - **修复 Work CN 平台别名与客户端路径识别不一致**：统一 `trae_solo_cn` 与 `trae_cn` 的识别和路径处理，避免重启后账号消失或切换时找不到数据。
@@ -20,10 +24,11 @@
 
 ### 验证
 
-- `npm test`：46 项通过。
+- `npm test`：45 项通过。
 - `npm run typecheck`：通过。
 - `npm run build`：通过。
-- Rust 单元测试：255 项通过，3 项忽略。
+- Rust 单元测试：277 项通过，3 项忽略（智谱相关 19 项）。
+- 云端 daily-checkin 仓库：zhipu signer 聚合解析自检通过；真实账号实测签到链路返回「今日已领取，当前积分 948」。
 
 ### 说明
 

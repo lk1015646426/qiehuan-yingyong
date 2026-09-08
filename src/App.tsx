@@ -3,18 +3,21 @@
 // 侧边栏双面板布局（复用上游 pages/sidebar.css 的 .with-sidebar 体系）：
 // - TRAE：WorkCnSwitcherPage（账号快照管理 / 一键切换 / 云端签到）
 // - WorkBuddy：WorkBuddyPage（账号管理 / 签到 / 积分）
+// - 智谱：ZhipuPage（API Key 管理 / 余额 / 云端签到）
 // 页签为前端 state，不引入路由库。
 
 import './App.css';
 import { useEffect, useState } from 'react';
 import traeCnIcon from './assets/icons/trae-cn.png';
 import workBuddyIcon from './assets/icons/workbuddy.png';
+import zhipuIcon from './assets/icons/zhipu.svg';
 import { WorkCnSwitcherPage } from './pages/WorkCnSwitcherPage';
 import { WorkBuddyPage } from './pages/WorkBuddyPage';
+import { ZhipuPage } from './pages/ZhipuPage';
 import { useWorkCnStore } from './stores/useWorkCnStore';
 import { useWorkBuddyStore } from './stores/useWorkBuddyStore';
 
-type PageKey = 'switcher' | 'workbuddy';
+type PageKey = 'switcher' | 'workbuddy' | 'zhipu';
 
 export default function App() {
   const [page, setPage] = useState<PageKey>('switcher');
@@ -60,6 +63,14 @@ export default function App() {
           </button>
           <button
             type="button"
+            className={page === 'zhipu' ? 'nav-item active' : 'nav-item'}
+            onClick={() => setPage('zhipu')}
+          >
+            <img src={zhipuIcon} alt="" width={17} height={17} />
+            <span>智谱</span>
+          </button>
+          <button
+            type="button"
             className={page === 'switcher' ? 'nav-item active' : 'nav-item'}
             onClick={() => setPage('switcher')}
           >
@@ -75,7 +86,7 @@ export default function App() {
         </div>
       </aside>
       <main className="main-wrapper">
-        {page === 'switcher' ? <WorkCnSwitcherPage /> : <WorkBuddyPage />}
+        {page === 'switcher' ? <WorkCnSwitcherPage /> : page === 'workbuddy' ? <WorkBuddyPage /> : <ZhipuPage />}
       </main>
     </div>
   );

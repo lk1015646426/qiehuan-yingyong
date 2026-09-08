@@ -424,6 +424,15 @@ pub fn run() {
             commands::workbuddy::switch_workbuddy_account,
             commands::workbuddy::sync_workbuddy_github,
             commands::workbuddy::trigger_workbuddy_checkin,
+            // Zhipu Commands
+            commands::zhipu::list_zhipu_accounts,
+            commands::zhipu::import_current_zhipu_account,
+            commands::zhipu::import_zhipu_account,
+            commands::zhipu::update_zhipu_account,
+            commands::zhipu::delete_zhipu_account,
+            commands::zhipu::get_zhipu_account_status,
+            commands::zhipu::sync_zhipu_github,
+            commands::zhipu::trigger_zhipu_checkin,
             // Trae Instance Commands
             commands::trae_instance::trae_get_instance_defaults,
             commands::trae_instance::trae_list_instances,
