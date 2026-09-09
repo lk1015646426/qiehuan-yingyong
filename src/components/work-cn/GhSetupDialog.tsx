@@ -10,11 +10,15 @@ import { useEffect, useState } from 'react';
 import { useWorkCnStore } from '../../stores/useWorkCnStore';
 import { openExternalUrl } from '../../services/workCnService';
 import { accountSecretStem } from '../../utils/accountNaming';
-import type { WorkCnGitHubSlot } from '../../types/workCn';
+import { buildGhSetupConfig, ghSetupConfigReady, validateGhSetupConfig } from '../../utils/ghSetupConfig';
+import type { GhSetupMode } from '../../utils/ghSetupConfig';
 
 interface Props {
   open: boolean;
   onClose: () => void;
+  /** full（TRAE 页，含槽位绑定）/ repo-only（WorkBuddy / 智谱页，仅仓库配置，
+   *  保存时原样透传已有槽位，见 utils/ghSetupConfig 的红线说明）。 */
+  mode?: GhSetupMode;
 }
 
 // PAT 创建页：预勾选 repo（Secrets 读写必需）与 workflow（触发签到用）。
@@ -27,7 +31,7 @@ function formatBytes(n: number): string {
   return mb >= 1 ? `${mb.toFixed(1)} MB` : `${(n / 1024).toFixed(0)} KB`;
 }
 
-export function GhSetupDialog({ open, onClose }: Props) {
+export function GhSetupDialog({ open, onClose, mode = 'full' }: Props) {
   const accounts = useWorkCnStore((s) => s.accounts);
   const githubConfig = useWorkCnStore((s) => s.githubConfig);
   const githubCliStatus = useWorkCnStore((s) => s.githubCliStatus);
@@ -37,6 +41,7 @@ export function GhSetupDialog({ open, onClose }: Props) {
   const ghSetupError = useWorkCnStore((s) => s.ghSetupError);
   const setupGh = useWorkCnStore((s) => s.setupGh);
   const ghLogin = useWorkCnStore((s) => s.ghLogin);
+  const refreshGitHubCliStatus = useWorkCnStore((s) => s.refreshGitHubCliStatus);
 
   const [pat, setPat] = useState('');
   const [loggingIn, setLoggingIn] = useState(false);
@@ -48,11 +53,15 @@ export function GhSetupDialog({ open, onClose }: Props) {
   const [configError, setConfigError] = useState<string | null>(null);
 
   // 打开时只拉取最新配置；CLI 状态由页面挂载时检测（避免重复 spawn gh 进程），
-  // 安装/登录完成后 store 会自动刷新。
+  // 安装/登录完成后 store 会自动刷新。WB / 智谱页可能从未检测过 CLI 状态，
+  // 此时（githubCliStatus 为 null）兜底检测一次。
   useEffect(() => {
     if (!open) return;
     void loadGitHubConfig();
-  }, [open, loadGitHubConfig]);
+    if (useWorkCnStore.getState().githubCliStatus === null) {
+      void refreshGitHubCliStatus();
+    }
+  }, [open, loadGitHubConfig, refreshGitHubCliStatus]);
 
   useEffect(() => {
     if (!open) return;
@@ -68,15 +77,13 @@ export function GhSetupDialog({ open, onClose }: Props) {
     const allReady =
       githubCliStatus?.available &&
       githubCliStatus.authed &&
-      githubConfig.enabled &&
-      /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(githubConfig.repository) &&
-      githubConfig.slots.length > 0;
+      ghSetupConfigReady(mode, githubConfig);
     if (allReady) {
       setPat('');
       setLoginError(null);
       setConfigError(null);
     }
-  }, [open, githubCliStatus, githubConfig]);
+  }, [open, mode, githubCliStatus, githubConfig]);
 
   if (!open) {
     return null;
@@ -113,29 +120,22 @@ export function GhSetupDialog({ open, onClose }: Props) {
 
   const handleSaveConfig = async () => {
     setConfigError(null);
-    const slots: WorkCnGitHubSlot[] = [];
-    for (const account of accounts) {
-      const slot = slotNumbers.get(account.id);
-      if (slot !== undefined) {
-        slots.push({ slot, accountId: account.id, tokenSecret: '', deviceSecret: '' });
-      }
-    }
-    if (enabled && !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(repository.trim())) {
-      setConfigError('仓库需为 owner/repo 形式');
-      return;
-    }
-    if (enabled && slots.length === 0) {
-      setConfigError('启用同步时至少要绑定一个账号到槽位');
+    const config = buildGhSetupConfig({
+      mode,
+      enabled,
+      repository,
+      workflowFile: githubConfig.workflowFile || 'daily-checkin.yml',
+      existingConfig: githubConfig,
+      slotNumbers,
+    });
+    const validationError = validateGhSetupConfig(mode, config);
+    if (validationError) {
+      setConfigError(validationError);
       return;
     }
     setSavingConfig(true);
     try {
-      await saveGitHubConfig({
-        enabled,
-        repository: repository.trim(),
-        slots,
-        workflowFile: githubConfig.workflowFile || 'daily-checkin.yml',
-      });
+      await saveGitHubConfig(config);
     } catch (err) {
       setConfigError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -143,10 +143,7 @@ export function GhSetupDialog({ open, onClose }: Props) {
     }
   };
 
-  const configReady =
-    githubConfig.enabled &&
-    /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(githubConfig.repository) &&
-    githubConfig.slots.length > 0;
+  const configReady = ghSetupConfigReady(mode, githubConfig);
 
   const rowDone = (ok: boolean) =>
     ok ? 'gh-row gh-row--ok' : 'gh-row gh-row--todo';
@@ -264,7 +261,9 @@ export function GhSetupDialog({ open, onClose }: Props) {
         {/* 条件 3：同步配置 */}
         <div className={rowDone(configReady)}>
           <div className="gh-row-main">
-            <span className="gh-row-title">③ 同步配置（仓库 + 槽位绑定）</span>
+            <span className="gh-row-title">
+              {mode === 'full' ? '③ 同步配置（仓库 + 槽位绑定）' : '③ 同步配置（仓库）'}
+            </span>
             <span className="gh-row-state">{configReady ? '已配置' : '未配置'}</span>
           </div>
           {!configReady ? (
@@ -284,39 +283,45 @@ export function GhSetupDialog({ open, onClose }: Props) {
                 placeholder="GitHub 仓库（owner/repo）"
                 disabled={!enabled || savingConfig}
               />
-              {accounts.length === 0 ? (
-                <p className="wc-dialog-note">还没有已导入的账号，请先到「账号切换」页导入。</p>
+              {mode === 'full' ? (
+                accounts.length === 0 ? (
+                  <p className="wc-dialog-note">还没有已导入的账号，请先到「账号切换」页导入。</p>
+                ) : (
+                  accounts.map((account) => {
+                    const slot = slotNumbers.get(account.id);
+                    return (
+                      <div key={account.id} className="wc-slot-row">
+                        <label style={{ display: 'flex', alignItems: 'center', gap: 8, flex: 1, minWidth: 0 }}>
+                          <input
+                            type="checkbox"
+                            checked={slot !== undefined}
+                            disabled={!enabled || savingConfig}
+                            onChange={(e) =>
+                              setBoundIds((prev) => {
+                                const next = new Set(prev);
+                                if (e.target.checked) next.add(account.id);
+                                else next.delete(account.id);
+                                return next;
+                              })
+                            }
+                          />
+                          <span className="wc-slot-row-name">
+                            {account.tags?.[0] ?? account.nickname ?? account.email ?? account.userId ?? account.id}
+                          </span>
+                        </label>
+                        {slot !== undefined ? (
+                          <span className="wc-slot-row-slot">{accountSecretStem(account)}_TOKEN</span>
+                        ) : (
+                          <span className="wc-slot-row-slot wc-slot-row-slot--unbound">未绑定</span>
+                        )}
+                      </div>
+                    );
+                  })
+                )
               ) : (
-                accounts.map((account) => {
-                  const slot = slotNumbers.get(account.id);
-                  return (
-                    <div key={account.id} className="wc-slot-row">
-                      <label style={{ display: 'flex', alignItems: 'center', gap: 8, flex: 1, minWidth: 0 }}>
-                        <input
-                          type="checkbox"
-                          checked={slot !== undefined}
-                          disabled={!enabled || savingConfig}
-                          onChange={(e) =>
-                            setBoundIds((prev) => {
-                              const next = new Set(prev);
-                              if (e.target.checked) next.add(account.id);
-                              else next.delete(account.id);
-                              return next;
-                            })
-                          }
-                        />
-                        <span className="wc-slot-row-name">
-                          {account.tags?.[0] ?? account.nickname ?? account.email ?? account.userId ?? account.id}
-                        </span>
-                      </label>
-                      {slot !== undefined ? (
-                        <span className="wc-slot-row-slot">{accountSecretStem(account)}_TOKEN</span>
-                      ) : (
-                        <span className="wc-slot-row-slot wc-slot-row-slot--unbound">未绑定</span>
-                      )}
-                    </div>
-                  );
-                })
+                <p className="wc-dialog-note">
+                  只需仓库配置：保存不会改动 TRAE 页已绑定的账号槽位。
+                </p>
               )}
               <div className="gh-row-actions" style={{ marginTop: 8 }}>
                 <button

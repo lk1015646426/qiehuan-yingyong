@@ -13,6 +13,20 @@ import type {
 export const WORKBUDDY_CHANGED_EVENT = 'workbuddy:changed';
 export const WORKBUDDY_INSTALLATION_RUNNING_EVENT = 'workbuddy:installation-running';
 
+// 切号进度事件名与载荷（与 Rust WORKBUDDY_SWITCH_PROGRESS_EVENT 保持一致）。
+export const WORKBUDDY_SWITCH_PROGRESS_EVENT = 'workbuddy-switch-progress';
+
+export interface WorkBuddySwitchProgress {
+  accountId: string;
+  stage:
+    | 'validating'
+    | 'closing'
+    | 'refreshing'
+    | 'injecting'
+    | 'launching'
+    | 'syncing';
+}
+
 export function parseWorkBuddyCommandError(error: unknown): Error & { code?: string } {
   const raw = error instanceof Error
     ? error.message

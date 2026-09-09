@@ -14,8 +14,10 @@ import {
   openWorkCnLogFolder,
   saveWorkCnGitHubConfig,
   setupGhCli,
+  setWorkCnSlotCheckinEnabled,
   switchWorkCnAccount,
   syncWorkCnGitHubAccount,
+  updateWorkCnAccountLabel,
   WORK_CN_SWITCH_PROGRESS_EVENT,
 } from '../services/workCnService';
 import type { GhSetupProgress, WorkCnSwitchProgress } from '../services/workCnService';
@@ -67,6 +69,7 @@ interface WorkCnState {
   refreshGitHubCliStatus: () => Promise<void>;
   syncGitHub: (accountId: string) => Promise<void>;
   syncGitHubAll: () => Promise<void>;
+  setSlotCheckin: (accountId: string, enabled: boolean) => Promise<void>;
   loadSessionWatchStatus: () => Promise<void>;
   applySessionWatchStatus: (status: WorkCnSessionWatchStatus) => void;
   clearCredentials: () => Promise<void>;
@@ -76,6 +79,7 @@ interface WorkCnState {
   importCurrent: (label?: string | null) => Promise<void>;
   switchTo: (accountId: string) => Promise<void>;
   deleteAccount: (accountId: string) => Promise<void>;
+  renameAccount: (accountId: string, label: string | null) => Promise<void>;
   openLogs: () => Promise<void>;
   refreshCredits: (accountId: string, forceRefresh?: boolean) => Promise<void>;
   clearError: () => void;
@@ -242,6 +246,18 @@ export const useWorkCnStore = create<WorkCnState>((set, get) => ({
       set({ error: err instanceof Error ? err.message : String(err) });
     }
   },
+  // 更新备注（显示名）：成功后原地替换该账号，避免整列表重载闪烁。
+  async renameAccount(accountId, label) {
+    set({ error: null });
+    try {
+      const updated = await updateWorkCnAccountLabel(accountId, label);
+      set((state) => ({
+        accounts: state.accounts.map((a) => (a.id === accountId ? updated : a)),
+      }));
+    } catch (err) {
+      set({ error: err instanceof Error ? err.message : String(err) });
+    }
+  },
   async refreshCredits(accountId, forceRefresh = false) {
     if (get().refreshingCreditsIds[accountId]) return;
     set((state) => ({ refreshingCreditsIds: { ...state.refreshingCreditsIds, [accountId]: true } }));
@@ -350,10 +366,42 @@ export const useWorkCnStore = create<WorkCnState>((set, get) => ({
       }));
     }
   },
+  // 自动签到开关：关闭 → 后端删除槽位 Secrets（失败以告警展示）；
+  // 开启 → 保存后立即同步一次该账号，让 Secrets 尽快恢复。
+  async setSlotCheckin(accountId, enabled) {
+    set({ error: null });
+    try {
+      const update = await setWorkCnSlotCheckinEnabled(accountId, enabled);
+      await get().loadGitHubConfig();
+      const message = enabled
+        ? '自动签到已开启，正在同步凭证…'
+        : `自动签到已关闭，已删除槽位 Secrets（${update.deletedSecrets.length} 项）`;
+      set((state) => ({
+        githubSyncResultById: {
+          ...state.githubSyncResultById,
+          [accountId]: {
+            accountId,
+            synced: enabled,
+            skipped: !enabled,
+            skipReason: update.warning ?? message,
+            error: null,
+            syncedAt: Math.floor(Date.now() / 1000),
+          },
+        },
+      }));
+      if (update.warning) {
+        set({ error: update.warning });
+      }
+      if (enabled) {
+        void get().syncGitHub(accountId);
+      }
+    } catch (err) {
+      set({ error: err instanceof Error ? err.message : String(err) });
+    }
+  },
   // 一键同步全部：顺序同步所有已绑定槽位的账号（避免 gh CLI 并发竞争），
   // 单个失败不中断，最终逐卡展示结果。
-  async syncGitHubAll() {
-    const { accounts, githubConfig, syncingAllGithub } = get();
+  async syncGitHubAll() {    const { accounts, githubConfig, syncingAllGithub } = get();
     if (syncingAllGithub) return;
     if (!githubConfig.enabled) {
       set({ error: 'GitHub 同步未启用，请先在设置中启用并绑定槽位' });

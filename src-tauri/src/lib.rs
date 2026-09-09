@@ -399,9 +399,11 @@ pub fn run() {
             commands::work_cn::get_work_cn_session_watch_status,
             commands::work_cn::clear_work_cn_credentials,
             commands::work_cn::delete_work_cn_account,
+            commands::work_cn::update_work_cn_account_label,
             // Work CN GitHub Commands
             commands::work_cn_github::get_work_cn_github_config,
             commands::work_cn_github::save_work_cn_github_config,
+            commands::work_cn_github::set_work_cn_slot_checkin_enabled,
             commands::work_cn_github::github_cli_status,
             commands::work_cn_github::gh_cli_setup_download,
             commands::work_cn_github::gh_cli_login_with_token,

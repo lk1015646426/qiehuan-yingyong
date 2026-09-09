@@ -345,29 +345,25 @@
 }
 
 /* ---------- 快照完整度摘要（折叠 8 个技术徽章） ---------- */
-
+/* 三页头部徽标统一为纯文本：与 WorkBuddy / 智谱 wb-sync 系列保持同一观感，
+   只用配色区分 ok / missing，不再用胶囊背景 + 边框突出。 */
 .wc-snapshot-summary {
   display: inline-flex;
   align-items: center;
   gap: 6px;
   flex-shrink: 0;
-  padding: 2px 8px;
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 500;
-  border-radius: var(--radius-full);
   cursor: default;
+  color: var(--text-secondary);
 }
 
 .wc-snapshot-summary--ok {
   color: #15803d;
-  background: color-mix(in srgb, var(--success) 10%, transparent);
-  border: 1px solid color-mix(in srgb, var(--success) 30%, transparent);
 }
 
 .wc-snapshot-summary--missing {
   color: var(--warning-strong);
-  background: color-mix(in srgb, var(--warning) 10%, transparent);
-  border: 1px solid color-mix(in srgb, var(--warning) 35%, transparent);
 }
 
 [data-theme="dark"] .wc-snapshot-summary--ok {

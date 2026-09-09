@@ -3,11 +3,13 @@
 //! 所有命令均为 `async` 并经 `spawn_blocking` 执行：gh 子进程与网络请求
 //! 绝不在主线程跑（同步命令默认占用主线程，会冻结整个窗口）。
 
-use crate::models::work_cn::{WorkCnGitHubCliStatus, WorkCnGitHubConfig, WorkCnGitHubSyncResult};
+use crate::models::work_cn::{
+    WorkCnGitHubCliStatus, WorkCnGitHubConfig, WorkCnGitHubSyncResult, WorkCnSlotCheckinUpdate,
+};
 use crate::modules::trae_account::load_account;
 use crate::modules::work_cn_github::{
-    cli_status, load_github_config, save_github_config, sync_account_secrets_if_bound,
-    RealGitHubRunner,
+    cli_status, load_github_config, save_github_config, set_slot_checkin_enabled_for_account,
+    sync_account_secrets_if_bound, RealGitHubRunner,
 };
 
 /// Read the persisted GitHub Secrets sync configuration for the settings dialog.
@@ -20,6 +22,27 @@ pub fn get_work_cn_github_config() -> Result<WorkCnGitHubConfig, String> {
 #[tauri::command]
 pub fn save_work_cn_github_config(config: WorkCnGitHubConfig) -> Result<(), String> {
     save_github_config(&config)
+}
+
+/// 设置账号绑定槽位的自动签到开关（账号卡 toggle）。
+/// 关闭时从 GitHub 删除该槽位全部 Secrets（用户 2026-09-09 决策：删除而非
+/// 保留）；gh 不可用不回滚开关，删除失败以 warning 返回。
+#[tauri::command]
+pub async fn set_work_cn_slot_checkin_enabled(
+    account_id: String,
+    enabled: bool,
+) -> Result<WorkCnSlotCheckinUpdate, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let (deleted, warning) =
+            set_slot_checkin_enabled_for_account(&RealGitHubRunner, &account_id, enabled)?;
+        Ok(WorkCnSlotCheckinUpdate {
+            checkin_enabled: enabled,
+            deleted_secrets: deleted,
+            warning,
+        })
+    })
+    .await
+    .map_err(|e| format!("更新自动签到开关任务失败：{e}"))?
 }
 
 /// Report GitHub CLI availability / auth status (no network secrets touched).

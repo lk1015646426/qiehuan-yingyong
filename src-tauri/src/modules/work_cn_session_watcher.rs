@@ -535,6 +535,7 @@ mod tests {
             enabled: true,
             repository: "o/r".to_string(),
             slots: vec![WorkCnGitHubSlot {
+                checkin_enabled: true,
                 slot: 1,
                 account_id: account_id.to_string(),
                 token_secret: String::new(),

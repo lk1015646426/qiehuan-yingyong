@@ -13,7 +13,9 @@ import {
   getWorkBuddyAccountStatus,
   updateWorkBuddyAccount,
   WORKBUDDY_INSTALLATION_RUNNING_EVENT,
+  WORKBUDDY_SWITCH_PROGRESS_EVENT,
 } from '../services/workBuddyService';
+import type { WorkBuddySwitchProgress } from '../services/workBuddyService';
 import type { WorkBuddyAccountStatus, WorkBuddyAccountUpdate, WorkBuddyAccountView, WorkBuddyInstallation, WorkBuddySessionWatchStatus } from '../types/workbuddy';
 import { shouldLoadWorkBuddyAccounts } from '../utils/workBuddyLifecycle';
 
@@ -33,6 +35,9 @@ interface WorkBuddyState {
   loading: boolean;
   importing: boolean;
   switchingId: string | null;
+  // 当前切号所处的阶段（validating/closing/refreshing/injecting/launching/syncing），
+  // 由后端 workbuddy-switch-progress 事件驱动（与 TRAE 页 switchStage 对齐）。
+  switchStage: WorkBuddySwitchProgress['stage'] | null;
   updatingId: string | null;
   deletingId: string | null;
   syncing: boolean;
@@ -63,7 +68,7 @@ interface WorkBuddyState {
 export const useWorkBuddyStore = create<WorkBuddyState>((set, get) => ({
   accounts: [], accountsLoaded: false, installation: null, installationLoaded: false,
   installationLoading: false, monitorStarted: false, loading: false, importing: false,
-  switchingId: null, updatingId: null, deletingId: null,
+  switchingId: null, switchStage: null, updatingId: null, deletingId: null,
   syncing: false, checkingInId: null, statusById: {}, statusLoadingById: {}, sessionWatchStatus: null, error: null, notice: null,
 
   async loadAccounts() {
@@ -165,20 +170,33 @@ export const useWorkBuddyStore = create<WorkBuddyState>((set, get) => ({
     } catch (error) { set({ deletingId: null, error: messageOf(error) }); }
   },
   async switchTo(accountId) {
-    set({ switchingId: accountId, error: null, notice: null });
+    set({ switchingId: accountId, switchStage: null, error: null, notice: null });
+    // 先注册进度监听再发起调用，确保第一阶段事件不丢失（与 TRAE 页对齐）。
+    let unlisten: (() => void) | undefined;
     try {
+      unlisten = await listen<WorkBuddySwitchProgress>(
+        WORKBUDDY_SWITCH_PROGRESS_EVENT,
+        (event) => {
+          if (event.payload.accountId === accountId) {
+            set({ switchStage: event.payload.stage });
+          }
+        },
+      );
       const result = await switchWorkBuddyAccount(accountId);
       await get().loadAccounts();
       set({
         switchingId: null,
+        switchStage: null,
         notice: result.githubSyncPending
           ? '已切换并打开 WorkBuddy，GitHub 自动签到待同步'
           : '已切换并打开 WorkBuddy，GitHub 自动签到已同步',
       });
       void get().refreshInstallation();
     } catch (error) {
-      set({ switchingId: null, error: messageOf(error) });
+      set({ switchingId: null, switchStage: null, error: messageOf(error) });
       await Promise.allSettled([get().loadAccounts(), get().refreshInstallation()]);
+    } finally {
+      unlisten?.();
     }
   },
   async syncGitHub() {

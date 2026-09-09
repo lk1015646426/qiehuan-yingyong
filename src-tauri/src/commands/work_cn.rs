@@ -253,3 +253,21 @@ pub async fn delete_work_cn_account(account_id: String) -> Result<(), String> {
     .await
     .map_err(|e| format!("删除账号任务失败：{e}"))?
 }
+
+/// 更新 Work CN 账号的备注（显示名）。备注存为账号 tags（与导入时的
+/// label 同一存储位），卡片标题优先取 tags[0]；传空/null 清除备注，
+/// 标题回退 昵称 → 邮箱 → UID。有意不更新 `last_used`，避免改名影响
+/// 「最近使用」兜底的当前账号判定。
+#[tauri::command]
+pub async fn update_work_cn_account_label(
+    account_id: String,
+    label: Option<String>,
+) -> Result<WorkCnAccountView, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let account = trae_account::update_work_cn_account_label(&account_id, label)?;
+        let validation = trae_account::validate_work_cn_account_snapshot(&account);
+        Ok(trae_account::build_work_cn_account_view(&account, validation))
+    })
+    .await
+    .map_err(|e| format!("更新备注任务失败：{e}"))?
+}

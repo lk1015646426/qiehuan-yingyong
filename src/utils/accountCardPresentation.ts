@@ -41,3 +41,47 @@ export function credentialInvalidated(
     .toLowerCase();
   return CREDENTIAL_INVALID_MARKERS.some((marker) => haystack.includes(marker));
 }
+
+// Token 剩余天数预警（TRAE / WorkBuddy / 智谱 三页共用）。
+// 阈值与云端 auto 刷新逻辑对齐：客户端剩 1/3 寿命时刷新；
+// 剩余 ≤5 天预警、≤1 天（含已过期）危险。expiresAt 为秒级时间戳。
+export type TokenTone = 'ok' | 'warn' | 'danger' | 'unknown';
+
+const TOKEN_WARN_DAYS = 5;
+const TOKEN_DANGER_DAYS = 1;
+
+export function tokenDaysLeft(expiresAt: number | null): { tone: TokenTone; days: number | null } {
+  if (!expiresAt) {
+    return { tone: 'unknown', days: null };
+  }
+  const msLeft = expiresAt * 1000 - Date.now();
+  if (msLeft <= 0) {
+    return { tone: 'danger', days: 0 };
+  }
+  const days = Math.ceil(msLeft / 86_400_000);
+  if (days <= TOKEN_DANGER_DAYS) {
+    return { tone: 'danger', days };
+  }
+  if (days <= TOKEN_WARN_DAYS) {
+    return { tone: 'warn', days };
+  }
+  return { tone: 'ok', days };
+}
+
+export function tokenDaysLabel(days: number | null): string {
+  if (days == null) return '未知';
+  return days <= 0 ? '已过期' : `${days} 天`;
+}
+
+// 「令牌到期」展示格式（三页共用）：只显示日期。完整时间戳太占空间且会被
+// 截断，日期精度对凭证预警已足够（秒级时间戳入参）。
+export function formatTokenExpiryDate(ts: number | null): string {
+  if (!ts) {
+    return '未知';
+  }
+  return new Date(ts * 1000).toLocaleDateString('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  });
+}

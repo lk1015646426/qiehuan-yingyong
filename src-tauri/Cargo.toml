@@ -1,6 +1,6 @@
 [package]
 name = "qiehuan-yingyong"
-version = "0.1.12"
+version = "0.1.13"
 description = "切换应用"
 authors = ["jlcodes", "lk"]
 license = "CC-BY-NC-SA-4.0"

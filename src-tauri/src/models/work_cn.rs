@@ -121,6 +121,17 @@ pub struct WorkCnGitHubSlot {
     pub token_secret: String,
     /// Secret name for the device id. Empty → auto `{账号槽位名}_DEVICE_ID`.
     pub device_secret: String,
+    /// 该槽位是否参与云端自动签到（账号卡上的「自动签到」开关）。
+    /// 关闭时：同步跳过该槽位，且关闭动作会从 GitHub 删除其 Secrets
+    /// （用户 2026-09-09 决策：删除而非保留旧值）。
+    /// 旧版 github.json 无此字段时默认 true，保持向后兼容。
+    #[serde(default = "default_slot_checkin_enabled")]
+    pub checkin_enabled: bool,
+}
+
+/// `WorkCnGitHubSlot::checkin_enabled` 的 serde 缺省值（旧配置文件兼容）。
+fn default_slot_checkin_enabled() -> bool {
+    true
 }
 
 /// Persisted GitHub Secrets sync configuration (saved to `github.json`, never holds a PAT).
@@ -153,8 +164,19 @@ impl Default for WorkCnGitHubConfig {
     }
 }
 
-/// One run of the daily check-in workflow (gh run list --json)。
-/// `conclusion` 在运行未结束时为 None。
+/// 自动签到开关更新结果（账号卡 toggle）：关闭时附带已删除的 Secrets 名
+/// 与非致命告警（gh 删除失败但开关已保存）。
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkCnSlotCheckinUpdate {
+    pub checkin_enabled: bool,
+    /// 关闭时从 GitHub 删除（含本就不存在）的 secret 名。
+    pub deleted_secrets: Vec<String>,
+    /// 非致命告警（如 gh 不可用导致删除失败，开关已保存）。
+    pub warning: Option<String>,
+}
+
+/// One run of the daily check-in workflow (gh run list --json)。/// `conclusion` 在运行未结束时为 None。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CheckinWorkflowRun {

@@ -69,6 +69,10 @@ export function WorkCnSettingsDialog({ open, onClose }: Props) {
           accountId: account.id,
           tokenSecret: '',
           deviceSecret: '',
+          // 保留已保存的自动签到开关：设置弹窗重建槽位列表，不读旧值会把
+          // 用户关闭过的开关悄悄重置为开启。
+          checkinEnabled:
+            githubConfig.slots.find((s) => s.accountId === account.id)?.checkinEnabled ?? true,
         });
       }
     }

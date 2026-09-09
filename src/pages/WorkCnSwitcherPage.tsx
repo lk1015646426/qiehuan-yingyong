@@ -5,24 +5,24 @@
 // - 快照完整度折叠为一行摘要（悬浮 title 展示缺失项明细）
 // - 积分区带 已用/总量 进度条
 // - 当前活跃账号（后台会话监测 accountId）高亮描边 + 角标
-// - 云端签到（自原独立面板合并）：token 倒计时 / 刷新凭证流 / 本地签到
-//   （诊断/补签）/ 可折叠的云端任务区（触发验证 + 运行记录）
+// - 云端签到：可折叠任务区（运行记录 + 触发验证）已抽为共享组件
+//   CloudCheckinPanel，WorkBuddy / 智谱页复用同一签到仓库的面板
 
 import { useEffect, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
-import { ChevronDown } from 'lucide-react';
 import traeCnIcon from '../assets/icons/trae-cn.png';
-import { getWorkCnInstallation, openExternalUrl, WORK_CN_SESSION_WATCH_EVENT } from '../services/workCnService';
+import { getWorkCnInstallation, WORK_CN_SESSION_WATCH_EVENT } from '../services/workCnService';
 import { useWorkCnStore } from '../stores/useWorkCnStore';
 import { useCheckinStore } from '../stores/useCheckinStore';
 import { localCheckinOutcomeLabel } from '../utils/checkinPresentation';
+import { CloudCheckinPanel } from '../components/checkin/CloudCheckinPanel';
 import { WorkCnAddAccountDialog } from '../components/work-cn/WorkCnAddAccountDialog';
 import { WorkCnSettingsDialog } from '../components/work-cn/WorkCnSettingsDialog';
 import { WorkCnStatusBanner } from '../components/work-cn/WorkCnStatusBanner';
 import { GhSetupDialog } from '../components/work-cn/GhSetupDialog';
 import type { WorkCnInstallation, WorkCnAccountView, WorkCnCreditsSummary, WorkCnGitHubSyncResult, WorkCnSessionWatchStatus } from '../types/workCn';
-import type { CheckinWorkflowRun, RefreshFlowState } from '../types/checkin';
-import { compactUid } from '../utils/accountCardPresentation';
+import type { RefreshFlowState } from '../types/checkin';
+import { compactUid, formatTokenExpiryDate, tokenDaysLabel, tokenDaysLeft } from '../utils/accountCardPresentation';
 
 // 快照字段中文名（与后端 WorkCnSnapshotValidation 对应），用于摘要明细。
 const SNAPSHOT_FIELDS: Array<[keyof WorkCnAccountView, string]> = [
@@ -96,77 +96,10 @@ function formatCreditsValue(value: number): string {
 }
 
 // —— 云端签到（自独立面板合并）—————————————————————————
-// token 剩余天数预警阈值（与 auto 刷新逻辑对齐：客户端剩 1/3 寿命时刷新）。
-const WARN_DAYS = 5;
-const DANGER_DAYS = 1;
+// token 剩余天数预警（tokenDaysLeft/tokenDaysLabel 为三页共享实现，
+// 阈值与 auto 刷新逻辑对齐：客户端剩 1/3 寿命时刷新）。
 
-type TokenTone = 'ok' | 'warn' | 'danger' | 'unknown';
-
-function tokenDaysLeft(account: WorkCnAccountView): { tone: TokenTone; days: number | null } {
-  if (!account.tokenExpiresAt) {
-    return { tone: 'unknown', days: null };
-  }
-  const msLeft = account.tokenExpiresAt * 1000 - Date.now();
-  if (msLeft <= 0) {
-    return { tone: 'danger', days: 0 };
-  }
-  const days = Math.ceil(msLeft / 86_400_000);
-  if (days <= DANGER_DAYS) {
-    return { tone: 'danger', days };
-  }
-  if (days <= WARN_DAYS) {
-    return { tone: 'warn', days };
-  }
-  return { tone: 'ok', days };
-}
-
-function formatTokenExpires(ts: number | null): string {
-  if (!ts) {
-    return '未知';
-  }
-  return new Date(ts * 1000).toLocaleDateString('zh-CN', {
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  });
-}
-
-function formatRelative(iso: string): string {
-  const then = new Date(iso).getTime();
-  if (Number.isNaN(then)) {
-    return iso;
-  }
-  const diff = Date.now() - then;
-  const minutes = Math.floor(diff / 60_000);
-  if (minutes < 1) {
-    return '刚刚';
-  }
-  if (minutes < 60) {
-    return `${minutes} 分钟前`;
-  }
-  const hours = Math.floor(minutes / 60);
-  if (hours < 24) {
-    return `${hours} 小时前`;
-  }
-  const days = Math.floor(hours / 24);
-  if (days < 30) {
-    return `${days} 天前`;
-  }
-  return new Date(then).toLocaleDateString('zh-CN');
-}
-
-function runTone(run: CheckinWorkflowRun): 'ok' | 'error' | 'running' | 'unknown' {
-  if (run.status !== 'completed') {
-    return 'running';
-  }
-  if (run.conclusion === 'success') {
-    return 'ok';
-  }
-  if (run.conclusion === 'failure' || run.conclusion === 'cancelled') {
-    return 'error';
-  }
-  return 'unknown';
-}
+// 切号各阶段文案（stage 与后端 WORK_CN_SWITCH_STAGE_* 常量一致）。
 
 // 切号各阶段文案（stage 与后端 WORK_CN_SWITCH_STAGE_* 常量一致）。
 // 切换全程最长约 50 秒（关闭 20s + 验证 30s），无阶段提示时用户只能干等。
@@ -234,9 +167,11 @@ function AccountCard({
   githubEnabled,
   githubSync,
   active,
+  slotCheckinEnabled,
   onSwitch,
   onRefreshCredits,
   onDelete,
+  onToggleCheckin,
 }: {
   account: WorkCnAccountView;
   credits: WorkCnCreditsSummary | null;
@@ -248,9 +183,12 @@ function AccountCard({
   githubEnabled: boolean;
   githubSync: WorkCnGitHubSyncResult | null;
   active: boolean;
+  /** 绑定槽位的自动签到开关；null 表示该账号未绑定槽位（无云端签到）。 */
+  slotCheckinEnabled: boolean | null;
   onSwitch: () => void;
   onRefreshCredits: () => void;
   onDelete: () => void;
+  onToggleCheckin: (enabled: boolean) => void;
 }) {
   const [confirmingDelete, setConfirmingDelete] = useState(false);
   // 云端签到相关状态（自独立面板合并）：
@@ -261,14 +199,23 @@ function AccountCard({
   const title = account.tags?.length
     ? account.tags[0]
     : account.nickname ?? account.email ?? account.userId ?? account.id;
+  // 备注（显示名）编辑：保存走 store.renameAccount，成功后 tags[0] 即新标题。
+  const renameAccount = useWorkCnStore((s) => s.renameAccount);
+  const [editing, setEditing] = useState(false);
+  const [name, setName] = useState(title);
+  const saveName = async () => {
+    const value = name.trim();
+    if (!value) return;
+    await renameAccount(account.id, value);
+    setEditing(false);
+  };
   const canSwitch = account.validForSwitch && !switching;
-  const { tone: tokenTone, days: tokenDays } = tokenDaysLeft(account);
+  const { tone: tokenTone, days: tokenDays } = tokenDaysLeft(account.tokenExpiresAt);
   const flow = refreshFlow?.accountId === account.id ? refreshFlow : null;
   const flowRunning = !!flow && flow.phase !== 'done' && flow.phase !== 'failed';
   const localChecking = localCheckinState?.loading ?? false;
   const localResult = localCheckinState?.result ?? null;
-  const tokenLabel =
-    tokenDays == null ? '未知' : tokenDays <= 0 ? '已过期' : `${tokenDays} 天`;
+  const tokenLabel = tokenDaysLabel(tokenDays);
 
   // 指标行数值（照抄 WorkBuddy 卡片的 wb-status-line 结构）。
   const creditsLabel = credits?.unlimited
@@ -294,16 +241,18 @@ function AccountCard({
 
   return (
     <div className={active ? 'wc-slot account-card account-card--compact wc-slot--active' : 'wc-slot account-card account-card--compact'}>
-      {active ? <span className="wc-slot-active-badge">使用中</span> : null}
+      {active ? <span className="wc-slot-active-badge">当前账号</span> : null}
       <div className="wc-slot-head account-card__head">
-        <div className="wc-slot-title" title={title}>{title}</div>
+        <div className="wb-account-title">
+          <div className="wc-slot-title" title={title}>{title}</div>
+        </div>
         <SnapshotSummary account={account} />
       </div>
       <div className="wc-slot-sub account-card__identity" title={account.userId ?? undefined}>
         {account.email ?? '未提供邮箱'} · UID {compactUid(account.userId)}
       </div>
       <div className="account-card__metrics">
-        <div className="wc-slot-sub">令牌到期 {formatTokenExpires(account.tokenExpiresAt)}</div>
+        <div className="wc-slot-sub">令牌到期 {formatTokenExpiryDate(account.tokenExpiresAt)}</div>
       </div>
       <div className="wb-status-block">
         <div className="wb-status-line">
@@ -317,7 +266,21 @@ function AccountCard({
         ) : null}
         {creditsError ? <div className="wb-status-error">{creditsError}</div> : null}
       </div>
-      <div className="account-card__status">
+      <div className="account-card__status account-card__status--toggle">
+        {slotCheckinEnabled != null ? (
+          <label
+            className="wb-checkin-toggle"
+            title="关闭后：云端 Actions 不再为该账号签到，该槽位的 GitHub Secrets 会被删除；重新开启后立即恢复同步"
+          >
+            <input
+              type="checkbox"
+              checked={slotCheckinEnabled}
+              disabled={switching || deleting}
+              onChange={(event) => onToggleCheckin(event.target.checked)}
+            />
+            <span>{slotCheckinEnabled ? '云端自动签到已开启' : '云端自动签到已关闭'}</span>
+          </label>
+        ) : null}
         <div
           className={`wc-github-line${githubTone}`}
           title={[githubLine, ...account.warnings].join('；')}
@@ -334,6 +297,11 @@ function AccountCard({
           </div>
         ) : null}
       </div>
+      {editing ? <div className="wb-edit-name">
+        <input className="wc-input" value={name} maxLength={80} onChange={(event) => setName(event.target.value)} />
+        <button type="button" className="wc-btn" onClick={() => void saveName()}>保存</button>
+        <button type="button" className="wc-btn" onClick={() => { setName(title); setEditing(false); }}>取消</button>
+      </div> : null}
       <div className="wc-slot-actions account-card__actions">
         <button
           type="button"
@@ -374,6 +342,15 @@ function AccountCard({
           title="从本机直接调用 TRAE 签到 API（诊断/补签）：与云端 Actions 形成对照，用于定位『操作太过频繁』的来源"
         >
           {localChecking ? '签到中…' : '本地签到'}
+        </button>
+        <button
+          type="button"
+          className="wc-btn"
+          disabled={switching}
+          onClick={() => setEditing((value) => !value)}
+          title="修改账号备注（显示名），不影响 GitHub 槽位绑定"
+        >
+          备注
         </button>
         {confirmingDelete ? (
           <>
@@ -450,6 +427,7 @@ export function WorkCnSwitcherPage() {
   const refreshCredits = useWorkCnStore((s) => s.refreshCredits);
   const githubConfig = useWorkCnStore((s) => s.githubConfig);
   const githubSyncResultById = useWorkCnStore((s) => s.githubSyncResultById);
+  const setSlotCheckin = useWorkCnStore((s) => s.setSlotCheckin);
   const loadGitHubConfig = useWorkCnStore((s) => s.loadGitHubConfig);
   const syncGitHubAll = useWorkCnStore((s) => s.syncGitHubAll);
   const syncingAllGithub = useWorkCnStore((s) => s.syncingAllGithub);
@@ -460,15 +438,9 @@ export function WorkCnSwitcherPage() {
   const applySessionWatchStatus = useWorkCnStore((s) => s.applySessionWatchStatus);
   const [settingsOpen, setSettingsOpen] = useState(false);
 
-  // 云端签到任务（自独立面板合并）：运行记录 + 手动触发验证。
-  const runs = useCheckinStore((s) => s.runs);
-  const runsLoading = useCheckinStore((s) => s.runsLoading);
-  const runsError = useCheckinStore((s) => s.runsError);
-  const loadRuns = useCheckinStore((s) => s.loadRuns);
-  const triggering = useCheckinStore((s) => s.triggering);
-  const triggerMessage = useCheckinStore((s) => s.triggerMessage);
-  const triggerRun = useCheckinStore((s) => s.triggerRun);
-  const [cloudOpen, setCloudOpen] = useState(false);
+  // 云端签到面板（共享组件，自独立面板合并后再次抽离）：
+  // 运行记录 + 手动触发验证。日常签到由 GitHub Actions 北京时间 04:00 自动执行。
+  // 触发条件沿用本页逻辑：gh CLI 可用且 GitHub 同步已启用。
   const [setupOpen, setSetupOpen] = useState(false);
 
   useEffect(() => {
@@ -522,13 +494,6 @@ export function WorkCnSwitcherPage() {
     };
   }, [loadSessionWatchStatus, applySessionWatchStatus]);
 
-  // 展开云端任务区时加载运行记录（低频诊断功能，默认收起）。
-  useEffect(() => {
-    if (cloudOpen) {
-      void loadRuns();
-    }
-  }, [cloudOpen, loadRuns]);
-
   const ghReady = !!githubCliStatus?.available && !!githubCliStatus.authed;
   const configReady =
     githubConfig.enabled &&
@@ -555,7 +520,7 @@ export function WorkCnSwitcherPage() {
       : null);
 
   return (
-    <div className="wc-page">
+    <div className="wc-page work-cn-page">
       <header className="wc-header">
         <h1 className="wc-title">
           <img className="wc-title-icon" src={traeCnIcon} alt="TRAE" />
@@ -627,7 +592,7 @@ export function WorkCnSwitcherPage() {
           账号槽位（{accounts.length}，数量不限）
           {storeLoading ? ' · 加载中…' : ''}
         </h2>
-        <div className="wc-slots">
+        <div className="wc-slots wb-slots">
           {accounts.map((account) => (
             <AccountCard
               key={account.id}
@@ -641,9 +606,13 @@ export function WorkCnSwitcherPage() {
               githubEnabled={githubConfig.enabled}
               githubSync={githubSyncResultById[account.id] ?? null}
               active={account.id === activeAccountId}
+              slotCheckinEnabled={
+                githubConfig.slots.find((slot) => slot.accountId === account.id)?.checkinEnabled ?? null
+              }
               onSwitch={() => void switchTo(account.id)}
               onRefreshCredits={() => void refreshCredits(account.id, true)}
               onDelete={() => void deleteAccount(account.id)}
+              onToggleCheckin={(enabled) => void setSlotCheckin(account.id, enabled)}
             />
           ))}
           <div className="wc-slot wc-slot--empty">
@@ -653,119 +622,9 @@ export function WorkCnSwitcherPage() {
         </div>
       </section>
 
-      {/* 云端签到任务（自独立面板合并）：低频诊断区，默认收起。
+      {/* 云端签到任务（共享组件）：低频诊断区，默认收起。
           日常签到由 GitHub Actions 北京时间 04:00 自动执行。 */}
-      <section className="wc-cloud-section">
-        <button
-          type="button"
-          className="wc-cloud-toggle"
-          onClick={() => setCloudOpen((value) => !value)}
-          aria-expanded={cloudOpen}
-        >
-          <h2 className="wc-section-title">
-            云端签到任务
-            {runs[0] ? (
-              <span
-                className={
-                  runTone(runs[0]) === 'ok'
-                    ? 'wc-cloud-summary wc-cloud-summary--ok'
-                    : runTone(runs[0]) === 'error'
-                      ? 'wc-cloud-summary wc-cloud-summary--error'
-                      : 'wc-cloud-summary'
-                }
-              >
-                最近：{runTone(runs[0]) === 'ok' ? '成功' : runTone(runs[0]) === 'error' ? '失败' : '运行中'}
-                {' · '}
-                {formatRelative(runs[0].createdAt)}
-              </span>
-            ) : (
-              <span className="wc-cloud-summary">每天 04:00 自动执行</span>
-            )}
-          </h2>
-          <ChevronDown size={16} className={cloudOpen ? 'wc-cloud-chevron wc-cloud-chevron--open' : 'wc-cloud-chevron'} />
-        </button>
-        {cloudOpen ? (
-          <div className="wc-cloud-body">
-            <div className="wc-cloud-actions">
-              <button
-                type="button"
-                className="wc-btn"
-                onClick={() => void loadRuns()}
-                disabled={runsLoading}
-              >
-                {runsLoading ? '查询中…' : '刷新运行记录'}
-              </button>
-              <button
-                type="button"
-                className="wc-btn wc-btn-primary"
-                onClick={() => void triggerRun()}
-                disabled={triggering || !ghReady || !githubConfig.enabled}
-                title="手动触发云端签到（用于凭证修复后的验证/补签，日常由 Actions 凌晨 4 点自动执行）"
-              >
-                {triggering ? '触发中…' : '验证云端任务'}
-              </button>
-            </div>
-            {triggerMessage ? (
-              <div
-                className={
-                  triggerMessage.includes('失败') || triggerMessage.includes('中止')
-                    ? 'ck-banner ck-banner--error'
-                    : 'ck-banner ck-banner--running'
-                }
-              >
-                {triggerMessage}
-              </div>
-            ) : null}
-            <div className="ck-runs">
-              {runsError ? <div className="ck-runs-error">{runsError}</div> : null}
-              {!runsError && runs.length === 0 && !runsLoading ? (
-                <div className="ck-runs-empty">暂无运行记录（每天北京时间 04:00 自动执行）</div>
-              ) : null}
-              {runs.map((run) => {
-                const tone = runTone(run);
-                const dotClass =
-                  tone === 'ok'
-                    ? 'ck-run-dot ck-run-dot--ok'
-                    : tone === 'error'
-                      ? 'ck-run-dot ck-run-dot--error'
-                      : tone === 'running'
-                        ? 'ck-run-dot ck-run-dot--running'
-                        : 'ck-run-dot';
-                const label =
-                  tone === 'ok'
-                    ? '成功'
-                    : tone === 'error'
-                      ? `失败（${run.conclusion}）`
-                      : tone === 'running'
-                        ? '运行中'
-                        : run.conclusion ?? run.status;
-                return (
-                  <div
-                    key={run.databaseId}
-                    className="ck-run-row"
-                    role="link"
-                    tabIndex={0}
-                    onClick={() => void openExternalUrl(run.url)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' || e.key === ' ') {
-                        e.preventDefault();
-                        void openExternalUrl(run.url);
-                      }
-                    }}
-                  >
-                    <span className={dotClass} />
-                    <span className="ck-run-title">{run.displayTitle || 'Daily Checkin'}</span>
-                    <span className="ck-run-meta">{label}</span>
-                    <span className="ck-run-meta">
-                      {run.event === 'workflow_dispatch' ? '手动' : '定时'} · {formatRelative(run.createdAt)}
-                    </span>
-                  </div>
-                );
-              })}
-            </div>
-          </div>
-        ) : null}
-      </section>
+      <CloudCheckinPanel canTrigger={ghReady && githubConfig.enabled} />
 
       <WorkCnAddAccountDialog open={dialogOpen} onClose={() => setDialogOpen(false)} />
       <WorkCnSettingsDialog open={settingsOpen} onClose={() => setSettingsOpen(false)} />

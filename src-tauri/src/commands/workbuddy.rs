@@ -147,7 +147,22 @@ pub async fn delete_workbuddy_account(account_id: String) -> Result<bool, String
 }
 
 #[tauri::command]
-pub async fn switch_workbuddy_account(account_id: String) -> Result<WorkBuddySwitchResult, String> {
+pub async fn switch_workbuddy_account(
+    app: tauri::AppHandle,
+    account_id: String,
+) -> Result<WorkBuddySwitchResult, String> {
+    use tauri::Emitter;
+
+    let progress_account_id = account_id.clone();
+    let on_progress = move |stage: &str| {
+        let _ = app.emit(
+            WORKBUDDY_SWITCH_PROGRESS_EVENT,
+            WorkBuddySwitchProgress {
+                account_id: progress_account_id.clone(),
+                stage: stage.to_string(),
+            },
+        );
+    };
     // 目标账号可能已在 WorkBuddy 后台轮换过 access token；需先用 refresh token
     // 获取最新快照，避免把旧凭证重新写回官方客户端。token 刷新（网络请求）
     // 与客户端关闭（本地进程操作）互不依赖，因此并行执行：刷新任务在
@@ -159,7 +174,7 @@ pub async fn switch_workbuddy_account(account_id: String) -> Result<WorkBuddySwi
         let _ = refresh_tx.send(result);
     });
     tauri::async_runtime::spawn_blocking(move || {
-        switch_workbuddy_account_blocking(&account_id, refresh_rx)
+        switch_workbuddy_account_blocking(&account_id, refresh_rx, on_progress)
     })
     .await
     .map_err(|error| format!("切换 WorkBuddy 账号任务失败: {error}"))?
@@ -173,13 +188,27 @@ pub async fn switch_workbuddy_account(account_id: String) -> Result<WorkBuddySwi
     })
 }
 
+/// 前端订阅的切号进度事件名（与 workBuddyService.ts 常量保持一致）。
+pub const WORKBUDDY_SWITCH_PROGRESS_EVENT: &str = "workbuddy-switch-progress";
+
+/// 切号进度事件载荷。stage 取值：validating / closing / refreshing /
+/// injecting / launching / syncing。
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkBuddySwitchProgress {
+    account_id: String,
+    stage: String,
+}
+
 fn switch_workbuddy_account_blocking(
     account_id: &str,
     refresh_rx: std::sync::mpsc::Receiver<Result<String, String>>,
+    on_progress: impl Fn(&str),
 ) -> Result<WorkBuddySwitchResult, WorkBuddyCommandError> {
     let _switch_guard = try_lock_workbuddy_switch()?;
     let transaction_id = uuid::Uuid::new_v4().to_string();
 
+    on_progress("validating");
     let snapshot = workbuddy_account::snapshot_json(account_id).map_err(|_| {
         WorkBuddyCommandError::new(
             WorkBuddyErrorCode::AccountNotFound,
@@ -232,6 +261,7 @@ fn switch_workbuddy_account_blocking(
     #[cfg(not(target_os = "windows"))]
     let was_running = !process::collect_workbuddy_process_entries().is_empty();
     let close_started = std::time::Instant::now();
+    on_progress("closing");
     process::close_workbuddy_instances(std::slice::from_ref(&user_data_dir), 20).map_err(
         |error| {
             WorkBuddyCommandError::new(
@@ -266,6 +296,7 @@ fn switch_workbuddy_account_blocking(
     // 汇合点：客户端已关闭且当前账号快照已保存，等待并行执行的目标账号
     // token 刷新结果。刷新失败则回滚认证文件；切换前客户端在运行的话，
     // 尽力把它拉回原账号，避免用户停在"客户端被关闭"的状态。
+    on_progress("refreshing");
     let refresh_result = refresh_rx.recv().map_err(|_| {
         WorkBuddyCommandError::new(
             WorkBuddyErrorCode::AuthRefreshFailed,
@@ -295,6 +326,7 @@ fn switch_workbuddy_account_blocking(
     }
     log_workbuddy_auth_checkpoint(&transaction_id, "after_target_refresh", &auth_path);
 
+    on_progress("injecting");
     if let Err(error) = workbuddy_account::write_account_to_default_client(account_id) {
         restore_previous_workbuddy_auth(&auth_path, previous_auth.as_deref(), previous_auth_exists);
         return Err(WorkBuddyCommandError::new(
@@ -305,6 +337,7 @@ fn switch_workbuddy_account_blocking(
     }
     log_workbuddy_auth_checkpoint(&transaction_id, "after_target_write", &auth_path);
 
+    on_progress("launching");
     let pid = match process::start_workbuddy_default_with_args_with_new_window(&[], true) {
         Ok(pid) => pid,
         Err(error) => {
@@ -328,6 +361,7 @@ fn switch_workbuddy_account_blocking(
         ));
     }
     queue_workbuddy_github_sync("switch");
+    on_progress("syncing");
     if let Err(error) = process::activate_workbuddy_window_for_pid(pid) {
         // 进程和认证状态已经成功切换；窗口激活失败不应再向前端报告“切换失败”，
         // 否则用户会误以为旧账号仍在使用。记录警告后交由用户手动切到已启动窗口。

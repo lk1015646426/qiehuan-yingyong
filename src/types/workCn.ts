@@ -106,6 +106,15 @@ export interface WorkCnGitHubSlot {
   accountId: string;
   tokenSecret: string;
   deviceSecret: string;
+  /** 该槽位是否参与云端自动签到；关闭时同步跳过且槽位 Secrets 被删除。 */
+  checkinEnabled: boolean;
+}
+
+/** 自动签到开关更新结果：关闭时附带已删除的 Secrets 名与非致命告警。 */
+export interface WorkCnSlotCheckinUpdate {
+  checkinEnabled: boolean;
+  deletedSecrets: string[];
+  warning: string | null;
 }
 
 // Persisted GitHub Secrets sync config (never holds a PAT).

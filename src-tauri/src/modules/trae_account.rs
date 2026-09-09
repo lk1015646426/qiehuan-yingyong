@@ -1472,6 +1472,27 @@ pub fn update_account_tags(account_id: &str, tags: Vec<String>) -> Result<TraeAc
     Ok(updated)
 }
 
+/// 更新 Work CN 账号的备注（显示名）：存为 tags，与导入时的 label 同一存储位
+/// （卡片标题优先取 tags[0]，清空即回退 昵称 → 邮箱 → UID）。
+/// 与 `update_account_tags` 的差异：**不更新 `last_used`**——改名不应影响
+/// 「最近使用」兜底的当前账号判定（会话监测不可用时角标会跳错）。
+pub fn update_work_cn_account_label(
+    account_id: &str,
+    label: Option<String>,
+) -> Result<TraeAccount, String> {
+    let mut account = load_account(account_id).ok_or_else(|| "账号不存在".to_string())?;
+    if !is_work_cn_account_kind(resolve_account_platform_kind(&account)) {
+        return Err("该账号不是 TRAE Work CN 账号".to_string());
+    }
+    let normalized = label
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty());
+    account.tags = normalized.map(|l| vec![l]);
+    let updated = account.clone();
+    upsert_account_record(account)?;
+    Ok(updated)
+}
+
 fn storage_object_value(root: &Value, key: &str) -> Option<Value> {
     root.as_object()
         .and_then(|obj| parse_value_or_json_string(obj.get(key)))

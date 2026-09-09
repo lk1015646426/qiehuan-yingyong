@@ -1,14 +1,12 @@
 import { useEffect, useState } from 'react';
 import zhipuIcon from '../assets/icons/zhipu.svg';
+import { CloudCheckinPanel } from '../components/checkin/CloudCheckinPanel';
+import { GhSetupDialog } from '../components/work-cn/GhSetupDialog';
+import { getWorkCnGitHubConfig } from '../services/workCnService';
 import { ZhipuAddAccountDialog } from '../components/zhipu/ZhipuAddAccountDialog';
 import { useZhipuStore } from '../stores/useZhipuStore';
 import type { ZhipuAccountView } from '../types/zhipu';
-import { githubSyncPresentation } from '../utils/accountCardPresentation';
-
-function timeText(timestamp: number | null): string {
-  if (!timestamp) return '未知';
-  return new Date(timestamp * 1000).toLocaleString('zh-CN', { hour12: false });
-}
+import { githubSyncPresentation, tokenDaysLabel, tokenDaysLeft, formatTokenExpiryDate } from '../utils/accountCardPresentation';
 
 function scoreText(value: number | null): string {
   return value != null ? value.toLocaleString('zh-CN', { maximumFractionDigits: 0 }) : '暂无数据';
@@ -29,6 +27,8 @@ function AccountCard({ account }: { account: ZhipuAccountView }) {
   const [name, setName] = useState(account.displayName);
   const busy = updatingId !== null || deletingId !== null || checkingInId !== null;
   const githubSync = githubSyncPresentation(account.lastGithubSyncState, account.lastGithubSyncError);
+  // Token 剩余天数预警（与 TRAE / WorkBuddy 页同一实现）：≤5 天预警、≤1 天危险。
+  const { tone: tokenTone, days: tokenDays } = tokenDaysLeft(account.tokenExpiresAt);
   const saveName = async () => {
     const value = name.trim();
     if (!value) return;
@@ -46,11 +46,14 @@ function AccountCard({ account }: { account: ZhipuAccountView }) {
     </div>
     <div className="wc-slot-sub account-card__identity" title={account.userLabel}>{account.userLabel || `ID ${account.id.slice(3, 9)}`}</div>
     <div className="account-card__metrics">
-      <div className="wc-slot-sub">令牌到期 {timeText(account.tokenExpiresAt)}</div>
+      <div className="wc-slot-sub">令牌到期 {formatTokenExpiryDate(account.tokenExpiresAt)}</div>
     </div>
     <div className="wb-status-block">
       <div className="wb-status-line" aria-label="智谱清言积分">
         <span>当前积分 <strong>{statusLoading && !status ? '查询中…' : scoreText(status?.leftScore ?? null)}</strong></span>
+        <span title={tokenDays != null && tokenDays <= 0 ? 'Token 已过期，云端签到将失败，请重新导入账号' : undefined}>
+          Token 剩余 <strong className={`wc-token-strong wc-token-strong--${tokenTone}`}>{tokenDaysLabel(tokenDays)}</strong>
+        </span>
       </div>
       {status?.scoreError ? <div className="wb-status-error">{status.scoreError}</div> : null}
     </div>
@@ -79,6 +82,31 @@ function AccountCard({ account }: { account: ZhipuAccountView }) {
 
 export function ZhipuPage() {
   const [dialogOpen, setDialogOpen] = useState(false);
+  const [setupOpen, setSetupOpen] = useState(false);
+  // 同步前置检查（与 TRAE 页 handleSyncAll 对齐）：github.json 未启用或未填
+  // 仓库时打开引导弹窗（repo-only 模式，不碰 TRAE 槽位），而不是直接报错。
+  const syncConfigReady = async (): Promise<boolean> => {
+    try {
+      const config = await getWorkCnGitHubConfig();
+      return config.enabled && /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(config.repository);
+    } catch {
+      return false;
+    }
+  };
+  const handleSync = async () => {
+    if (!(await syncConfigReady())) {
+      setSetupOpen(true);
+      return;
+    }
+    void syncGitHub();
+  };
+  // 引导弹窗关闭后若配置已就绪，直接继续同步，用户不用多点一次。
+  const handleSetupClosed = async () => {
+    setSetupOpen(false);
+    if (await syncConfigReady()) {
+      void syncGitHub();
+    }
+  };
   const accounts = useZhipuStore((state) => state.accounts);
   const loading = useZhipuStore((state) => state.loading);
   const syncing = useZhipuStore((state) => state.syncing);
@@ -97,7 +125,7 @@ export function ZhipuPage() {
       <h1 className="wc-title"><img className="wc-title-icon" src={zhipuIcon} alt="智谱" />智谱清言账号管理</h1>
       <div className="wc-header-actions">
         <button type="button" className="wc-btn wc-btn-primary" onClick={() => setDialogOpen(true)}>导入当前账号</button>
-        <button type="button" className="wc-btn" disabled={syncing || !accounts.length} onClick={() => void syncGitHub()}>{syncing ? '同步智谱中…' : '同步智谱'}</button>
+        <button type="button" className="wc-btn" disabled={syncing || !accounts.length} onClick={() => void handleSync()}>{syncing ? '同步智谱中…' : '同步智谱'}</button>
         <button type="button" className="wc-btn" disabled={!accounts.length || Object.values(statusLoadingById).some(Boolean)} onClick={() => void refreshAllStatuses()}>刷新全部积分</button>
       </div>
     </header>
@@ -113,6 +141,12 @@ export function ZhipuPage() {
         {!accounts.length && !loading ? <div className="wc-slot wc-slot--empty"><span className="wc-slot-empty-icon">＋</span><span className="wc-slot-empty-hint">在智谱清言客户端完成登录后，导入当前账号</span></div> : null}
       </div>
     </section>
+    {/* 云端签到任务（共享面板）：签到由同一仓库的 GitHub Actions 完成（见上方说明横幅），
+        可查看运行记录并手动触发验证；触发条件由后端校验。 */}
+    <CloudCheckinPanel />
     <ZhipuAddAccountDialog open={dialogOpen} onClose={() => setDialogOpen(false)} />
+    {/* GitHub 上传引导（repo-only 模式）：同步前置条件缺失时打开，
+        只配置仓库，保存不影响 TRAE 页已绑定的槽位。 */}
+    <GhSetupDialog open={setupOpen} onClose={() => void handleSetupClosed()} mode="repo-only" />
   </div>;
 }

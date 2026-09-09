@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { compactUid, credentialInvalidated, githubSyncPresentation } from './accountCardPresentation.ts';
+import { compactUid, credentialInvalidated, githubSyncPresentation, tokenDaysLabel, tokenDaysLeft } from './accountCardPresentation.ts';
 
 test('UID 中间省略但短 UID 保持完整', () => {
   assert.equal(compactUid('541b69abcdef84a5'), '541b69…84a5');
@@ -49,4 +49,31 @@ test('网络类刷新失败不误判为凭证失效', () => {
   assert.equal(credentialInvalidated(['签到状态查询返回 HTTP 502']), false);
   assert.equal(credentialInvalidated([null, undefined, '']), false);
   assert.equal(credentialInvalidated([]), false);
+});
+
+test('Token 剩余天数按阈值分级（三页共用预警逻辑）', () => {
+  const DAY = 86_400;
+  const now = Math.floor(Date.now() / 1000);
+  // 无到期时间 → unknown
+  assert.deepEqual(tokenDaysLeft(null), { tone: 'unknown', days: null });
+  // 已过期 → danger / 0
+  assert.deepEqual(tokenDaysLeft(now - 10), { tone: 'danger', days: 0 });
+  // 剩 1 天内 → danger
+  const danger = tokenDaysLeft(now + DAY / 2);
+  assert.equal(danger.tone, 'danger');
+  assert.equal(danger.days, 1);
+  // 剩 2~5 天 → warn
+  const warn = tokenDaysLeft(now + 3 * DAY);
+  assert.equal(warn.tone, 'warn');
+  assert.equal(warn.days, 3);
+  // 剩 6 天以上 → ok
+  const ok = tokenDaysLeft(now + 30 * DAY);
+  assert.equal(ok.tone, 'ok');
+  assert.equal(ok.days, 30);
+});
+
+test('Token 剩余天数文案', () => {
+  assert.equal(tokenDaysLabel(null), '未知');
+  assert.equal(tokenDaysLabel(0), '已过期');
+  assert.equal(tokenDaysLabel(3), '3 天');
 });

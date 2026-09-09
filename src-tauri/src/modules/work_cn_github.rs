@@ -404,11 +404,14 @@ impl GitHubRunner for FakeGitHubRunner {
             });
         }
         if first == "secret" {
+            let is_delete = args.get(1).copied() == Some("delete");
             return Ok(GitHubRunOutput {
                 status_success: self.secret_set_ok,
                 stdout: String::new(),
                 stderr: if self.secret_set_ok {
                     String::new()
+                } else if is_delete {
+                    "gh: secret delete failed".to_string()
                 } else {
                     "gh: secret set failed".to_string()
                 },
@@ -651,6 +654,10 @@ fn sync_account_secrets_if_bound_unlocked(
     let Some(slot) = find_slot_for_account(&config, &account.id) else {
         return Ok(skip_result(&account.id, "该账号未绑定 GitHub 槽位"));
     };
+    // 自动签到开关关闭的槽位不参与同步（关闭动作本身会删除其 Secrets）。
+    if !slot.checkin_enabled {
+        return Ok(skip_result(&account.id, "自动签到未开启，已跳过该槽位"));
+    }
     if crate::modules::trae_account::validate_work_cn_account_for_switch(account).is_err() {
         return Ok(skip_result(
             &account.id,
@@ -745,6 +752,11 @@ fn sync_account_secrets_with_context(
     let now = chrono::Utc::now().timestamp();
     let synced_at = now;
 
+    // 0) 自动签到开关关闭的槽位一律跳过（watcher / 直调路径也必须遵守）。
+    if !slot.checkin_enabled {
+        return Ok(skip_result(&account.id, "自动签到未开启，已跳过该槽位"));
+    }
+
     // 1) token must carry a valid, unexpired exp
     let exp = parse_jwt_exp(&account.access_token)
         .ok_or_else(|| "无法解析 access token 的 exp，跳过同步".to_string())?;
@@ -812,9 +824,85 @@ fn sync_account_secrets_with_context(
     })
 }
 
+/// 删除一个槽位的全部 GitHub Secrets（自动签到关闭时执行；用户 2026-09-09
+/// 决策：删除而非保留，云端 workflow 不得继续用旧凭证签到）。
+/// secret 本就不存在（HTTP 404 / Not Found）视为已删除；gh 未安装/未登录
+/// 或其他删除失败返回 Err。返回已删除（含本就不存在）的 secret 名。
+pub fn delete_slot_secrets_with(
+    runner: &dyn GitHubRunner,
+    account: &TraeAccount,
+    slot: &WorkCnGitHubSlot,
+    repository: &str,
+) -> Result<Vec<String>, String> {
+    github_auth_status(runner).map_err(|e| format!("删除 Secrets 中止：{e}"))?;
+    let names = resolved_secret_names(account, slot)?;
+    let mut deleted = Vec::new();
+    for name in names {
+        let output = runner
+            .run(
+                &["secret", "delete", name.as_str(), "--repo", repository],
+                None,
+            )
+            .map_err(|e| format!("删除 {name} 失败：{e}"))?;
+        if output.status_success {
+            deleted.push(name.clone());
+        } else {
+            let stderr = output.stderr.to_ascii_lowercase();
+            // secret 本就不存在时 gh 返回 404，视为删除成功（幂等）。
+            if stderr.contains("404") || stderr.contains("not found") {
+                deleted.push(name.clone());
+            } else {
+                return Err(format!("删除 {name} 失败：{}", output.stderr));
+            }
+        }
+    }
+    Ok(deleted)
+}
+
+/// 设置某账号绑定槽位的自动签到开关（账号卡「自动签到」toggle）。
+/// - 开启：仅更新 github.json，随后的 Secrets 同步由前端立即触发。
+/// - 关闭：先删除该槽位全部 GitHub Secrets（用户 2026-09-09 决策：删除而非
+///   保留），再保存配置；gh 不可用时**不回滚开关**（本地意图优先），删除
+///   失败以 warning 返回由 UI 提示。
+/// 返回 (已删除的 secret 名, 非致命告警)。
+pub fn set_slot_checkin_enabled_for_account(
+    runner: &dyn GitHubRunner,
+    account_id: &str,
+    enabled: bool,
+) -> Result<(Vec<String>, Option<String>), String> {
+    let mut config = load_github_config();
+    if !config.enabled {
+        return Err("GitHub 同步未启用，请先在设置中启用并填写仓库".to_string());
+    }
+    let Some(slot) = find_slot_for_account(&config, account_id) else {
+        return Err("该账号未绑定 GitHub 槽位，请先在设置中完成绑定".to_string());
+    };
+    if slot.checkin_enabled == enabled {
+        return Ok((Vec::new(), None));
+    }
+    let mut deleted = Vec::new();
+    let mut warning = None;
+    if !enabled {
+        let repository = config.repository.trim().to_string();
+        let slot_clone = slot.clone();
+        let account = crate::modules::trae_account::load_account(account_id)
+            .ok_or_else(|| "账号不存在".to_string())?;
+        match delete_slot_secrets_with(runner, &account, &slot_clone, &repository) {
+            Ok(names) => deleted = names,
+            Err(e) => warning = Some(format!("开关已保存，但删除 GitHub Secrets 失败：{e}")),
+        }
+    }
+    for s in &mut config.slots {
+        if s.account_id == account_id {
+            s.checkin_enabled = enabled;
+        }
+    }
+    save_github_config(&config)?;
+    Ok((deleted, warning))
+}
+
 /// Path to the persisted `github.json` (next to the account store, never a token).
-pub fn github_config_path() -> Result<PathBuf, String> {
-    let dir = crate::modules::account::get_data_dir()?;
+pub fn github_config_path() -> Result<PathBuf, String> {    let dir = crate::modules::account::get_data_dir()?;
     Ok(dir.join("github.json"))
 }
 
@@ -998,12 +1086,14 @@ mod tests {
             repository: "o/r".to_string(),
             slots: vec![
                 WorkCnGitHubSlot {
+                    checkin_enabled: true,
                     slot: 1,
                     account_id: "a".to_string(),
                     token_secret: String::new(),
                     device_secret: String::new(),
                 },
                 WorkCnGitHubSlot {
+                    checkin_enabled: true,
                     slot: 1,
                     account_id: "b".to_string(),
                     token_secret: String::new(),
@@ -1018,6 +1108,7 @@ mod tests {
             enabled: true,
             repository: "o/r".to_string(),
             slots: vec![WorkCnGitHubSlot {
+                checkin_enabled: true,
                 slot: 5,
                 account_id: "a".to_string(),
                 token_secret: String::new(),
@@ -1032,6 +1123,7 @@ mod tests {
             enabled: true,
             repository: "o/r".to_string(),
             slots: vec![WorkCnGitHubSlot {
+                checkin_enabled: true,
                 slot: 0,
                 account_id: "a".to_string(),
                 token_secret: String::new(),
@@ -1045,6 +1137,7 @@ mod tests {
             enabled: true,
             repository: "o/r".to_string(),
             slots: vec![WorkCnGitHubSlot {
+                checkin_enabled: true,
                 slot: 1,
                 account_id: "a".to_string(),
                 token_secret: "bad-name".to_string(),
@@ -1061,6 +1154,7 @@ mod tests {
             enabled: true,
             repository: "o/r".to_string(),
             slots: vec![WorkCnGitHubSlot {
+                checkin_enabled: true,
                 slot: 1,
                 account_id: "a".to_string(),
                 token_secret: "FIRST_TOKEN".to_string(),
@@ -1080,6 +1174,7 @@ mod tests {
         let token = jwt_with_exp(chrono::Utc::now().timestamp() + 3600);
         let account = make_account("acc1", &token, Some("1132918838145530"));
         let slot = WorkCnGitHubSlot {
+            checkin_enabled: true,
             slot: 1,
             account_id: "acc1".to_string(),
             token_secret: String::new(),
@@ -1138,6 +1233,7 @@ mod tests {
         let mut account = make_account("acc1", "token", Some("1132918838145530"));
         account.tags = Some(vec!["backup-1".to_string()]);
         let slot = WorkCnGitHubSlot {
+            checkin_enabled: true,
             slot: 1,
             account_id: account.id.clone(),
             token_secret: "CUSTOM_TOKEN".to_string(),
@@ -1245,12 +1341,14 @@ mod tests {
             repository: "o/r".to_string(),
             slots: vec![
                 WorkCnGitHubSlot {
+                    checkin_enabled: true,
                     slot: 1,
                     account_id: "a1".to_string(),
                     token_secret: "SAME_NAME".to_string(),
                     device_secret: "D1".to_string(),
                 },
                 WorkCnGitHubSlot {
+                    checkin_enabled: true,
                     slot: 2,
                     account_id: "a2".to_string(),
                     token_secret: "SAME_NAME".to_string(),
@@ -1277,6 +1375,7 @@ mod tests {
         let token = jwt_with_exp(chrono::Utc::now().timestamp() + 3600);
         let account = make_account("acc1", &token, Some("1132918838145530"));
         let slot = WorkCnGitHubSlot {
+            checkin_enabled: true,
             slot: 1,
             account_id: "acc1".to_string(),
             token_secret: String::new(),
@@ -1290,11 +1389,98 @@ mod tests {
     }
 
     #[test]
+    fn work_cn_github_disabled_slot_skips_sync_without_touching_secrets() {
+        let runner = FakeGitHubRunner::new();
+        let token = jwt_with_exp(chrono::Utc::now().timestamp() + 3600);
+        let account = make_account("acc1", &token, Some("1132918838145530"));
+        let slot = WorkCnGitHubSlot {
+            checkin_enabled: false,
+            slot: 1,
+            account_id: "acc1".to_string(),
+            token_secret: String::new(),
+            device_secret: String::new(),
+        };
+        let result = sync_account_secrets(&runner, &account, &slot, "o/r").unwrap();
+        assert!(result.skipped, "关闭自动签到的槽位必须跳过同步");
+        assert!(
+            result
+                .skip_reason
+                .as_deref()
+                .unwrap()
+                .contains("自动签到未开启"),
+            "跳过原因应说明自动签到未开启，实际：{:?}",
+            result.skip_reason
+        );
+        assert!(
+            !runner
+                .recorded_calls()
+                .iter()
+                .any(|c| c.args.first().map(String::as_str) == Some("secret")),
+            "关闭的槽位不得产生任何 secret set 调用"
+        );
+    }
+
+    #[test]
+    fn work_cn_github_delete_slot_secrets_removes_all_four() {
+        let runner = FakeGitHubRunner::new();
+        let token = jwt_with_exp(chrono::Utc::now().timestamp() + 3600);
+        let account = make_account("acc1", &token, Some("1132918838145530"));
+        let slot = WorkCnGitHubSlot {
+            checkin_enabled: true,
+            slot: 1,
+            account_id: "acc1".to_string(),
+            token_secret: String::new(),
+            device_secret: String::new(),
+        };
+        let deleted = delete_slot_secrets_with(&runner, &account, &slot, "o/r").unwrap();
+        assert_eq!(deleted.len(), 4, "应删除全部 4 个 secret");
+        let calls = runner.recorded_calls();
+        let delete_calls: Vec<&FakeCall> = calls
+            .iter()
+            .filter(|c| {
+                c.args.first().map(String::as_str) == Some("secret")
+                    && c.args.get(1).map(String::as_str) == Some("delete")
+            })
+            .collect();
+        assert_eq!(delete_calls.len(), 4, "必须逐个删除 4 个 secret");
+        for call in &delete_calls {
+            assert!(
+                call.args.iter().any(|a| a == "o/r"),
+                "删除必须指定仓库：{:?}",
+                call.args
+            );
+            assert_eq!(call.stdin, None, "删除不涉及 stdin 凭证");
+        }
+    }
+
+    #[test]
+    fn work_cn_github_delete_slot_secrets_hard_fails_on_gh_error() {
+        let runner = FakeGitHubRunner {
+            secret_set_ok: false,
+            ..FakeGitHubRunner::new()
+        };
+        let token = jwt_with_exp(chrono::Utc::now().timestamp() + 3600);
+        let account = make_account("acc1", &token, Some("1132918838145530"));
+        let slot = WorkCnGitHubSlot {
+            checkin_enabled: true,
+            slot: 1,
+            account_id: "acc1".to_string(),
+            token_secret: String::new(),
+            device_secret: String::new(),
+        };
+        assert!(
+            delete_slot_secrets_with(&runner, &account, &slot, "o/r").is_err(),
+            "gh 删除失败必须返回 Err（交由上层以 warning 提示）"
+        );
+    }
+
+    #[test]
     fn work_cn_github_expired_token_is_skipped_not_error() {
         let runner = FakeGitHubRunner::new();
         let token = jwt_with_exp(chrono::Utc::now().timestamp() - 3600); // already expired
         let account = make_account("acc1", &token, Some("1132918838145530"));
         let slot = WorkCnGitHubSlot {
+            checkin_enabled: true,
             slot: 1,
             account_id: "acc1".to_string(),
             token_secret: String::new(),
@@ -1314,6 +1500,7 @@ mod tests {
         let token = jwt_with_exp(chrono::Utc::now().timestamp() + 3600);
         let account = make_account("acc1", &token, None);
         let slot = WorkCnGitHubSlot {
+            checkin_enabled: true,
             slot: 1,
             account_id: "acc1".to_string(),
             token_secret: String::new(),
@@ -1337,6 +1524,7 @@ mod tests {
         let token = jwt_with_exp(chrono::Utc::now().timestamp() + 3600);
         let account = make_account("acc1", &token, Some("1132918838145530"));
         let slot = WorkCnGitHubSlot {
+            checkin_enabled: true,
             slot: 1,
             account_id: "acc1".to_string(),
             token_secret: String::new(),
@@ -1435,6 +1623,7 @@ mod tests {
             enabled: true,
             repository: "o/r".to_string(),
             slots: vec![WorkCnGitHubSlot {
+                checkin_enabled: true,
                 slot: 1,
                 account_id: "acc1".to_string(),
                 token_secret: String::new(),
@@ -1481,6 +1670,7 @@ mod tests {
             enabled: true,
             repository: "o/r".to_string(),
             slots: vec![WorkCnGitHubSlot {
+                checkin_enabled: true,
                 slot: 1,
                 account_id: "acc1".to_string(),
                 token_secret: String::new(),
@@ -1528,6 +1718,7 @@ mod tests {
             enabled: true,
             repository: "o/r".to_string(),
             slots: vec![WorkCnGitHubSlot {
+                checkin_enabled: true,
                 slot: 1,
                 account_id: "acc1".to_string(),
                 token_secret: String::new(),

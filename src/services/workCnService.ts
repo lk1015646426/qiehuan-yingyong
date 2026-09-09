@@ -9,6 +9,7 @@ import type {
   WorkCnCommandError,
   WorkCnGitHubConfig,
   WorkCnGitHubCliStatus,
+  WorkCnSlotCheckinUpdate,
   WorkCnGitHubSyncResult,
   WorkCnSessionWatchStatus,
 } from '../types/workCn';
@@ -115,6 +116,15 @@ export function saveWorkCnGitHubConfig(config: WorkCnGitHubConfig): Promise<void
   return invoke<void>('save_work_cn_github_config', { config });
 }
 
+// 设置账号绑定槽位的自动签到开关。关闭时后端会从 GitHub 删除该槽位全部
+// Secrets（删除失败以 warning 返回，不回滚开关）。
+export function setWorkCnSlotCheckinEnabled(
+  accountId: string,
+  enabled: boolean,
+): Promise<WorkCnSlotCheckinUpdate> {
+  return invoke<WorkCnSlotCheckinUpdate>('set_work_cn_slot_checkin_enabled', { accountId, enabled });
+}
+
 // Report GitHub CLI availability / auth status (no secrets touched).
 export function getWorkCnGitHubCliStatus(): Promise<WorkCnGitHubCliStatus> {
   return invoke<WorkCnGitHubCliStatus>('github_cli_status');
@@ -168,6 +178,15 @@ export function clearWorkCnCredentials(): Promise<void> {
 // 删除单个已导入的 Work CN 账号槽位（解绑 GitHub 槽位；不触碰客户端与远端 Secrets）。
 export function deleteWorkCnAccount(accountId: string): Promise<void> {
   return invoke<void>('delete_work_cn_account', { accountId });
+}
+
+// 更新账号备注（显示名）：存为 tags（与导入 label 同一位），传空清除。
+// 返回更新后的脱敏账号视图，标题优先级：备注 → 昵称 → 邮箱 → UID。
+export function updateWorkCnAccountLabel(
+  accountId: string,
+  label: string | null,
+): Promise<WorkCnAccountView> {
+  return invoke<WorkCnAccountView>('update_work_cn_account_label', { accountId, label });
 }
 
 // 在系统文件管理器中打开应用日志目录。
