@@ -7,6 +7,15 @@ All notable changes to Cockpit Tools will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
+## [0.1.17] - 2026-10-29
+
+### Fixed and delivered
+- Accept unspecified WorkBuddy account types while preserving known metadata and identity/enterprise checks.
+- Use the Windows normal shutdown command and add sanitized switch-stage diagnostics.
+- Include locally validated credential recovery, concurrent-write protection, account pool, credit summary, activity settings and merged TRAE compatibility changes.
+- Focus the interface on TRAE and WorkBuddy; remove the former Zhipu entry.
+- Publish a Windows x64 EXE installer verified by an in-place installation and user-confirmed switching, with SHA-256 checksums.
+
 ## [1.3.16] - 2026-08-02
 
 ### Added

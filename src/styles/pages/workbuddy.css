@@ -1,6 +1,24 @@
 .workbuddy-page .wb-slots {
-  grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(min(100%, 340px), 1fr));
 }
+
+.workbuddy-page .wb-credits-total { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 12px; margin-bottom: 18px; }
+.workbuddy-page .wb-credits-total-value { display: block; margin-top: 5px; font-size: 25px; font-variant-numeric: tabular-nums; }
+.workbuddy-page .wb-pool-muted { color: var(--text-secondary); font-size: 12px; line-height: 1.65; }
+.workbuddy-page .wb-pool-model-manager { margin: 14px 0; }
+.workbuddy-page .wb-pool-model-manager + .wc-slot-actions { flex-wrap: wrap; }
+.workbuddy-page .wb-pool-model-manager summary { cursor: pointer; font-weight: 600; padding: 8px 0; }
+.workbuddy-page .wb-pool-model-heading { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin: 8px 0; }
+.workbuddy-page .wb-pool-model-list { padding: 0; list-style: none; margin: 8px 0 12px; }
+.workbuddy-page .wb-pool-model-list li { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 0; border-bottom: 1px solid var(--border); }
+.workbuddy-page .wb-pool-model-list li > div { min-width: 0; }
+.workbuddy-page .wb-pool-model-list strong { display: block; overflow-wrap: anywhere; font-size: 13px; }
+.workbuddy-page .wb-pool-model-list small { display: block; color: var(--text-secondary); overflow-wrap: anywhere; margin-top: 3px; }
+.workbuddy-page .wb-pool-model-list--catalog { max-height: 300px; overflow-y: auto; padding-right: 6px; }
+.workbuddy-page .wb-pool-search { display: grid; gap: 7px; font-size: 13px; margin-top: 16px; }
+.workbuddy-page .wb-pool-model-manager .wc-btn:focus-visible, .workbuddy-page .wb-pool-model-manager summary:focus-visible { outline: 2px solid var(--primary); outline-offset: 3px; }
+
+.workbuddy-page .wb-slot .wc-slot-actions { flex-wrap: wrap; }
 
 .workbuddy-page .wb-slot--active {
   border-color: var(--primary);
@@ -65,23 +83,8 @@
 .workbuddy-page .wb-settings-dialog .wc-input { margin-bottom: 12px; }
 
 @media (max-width: 520px) {
-  .workbuddy-page .wb-edit-name, .zhipu-page .wb-edit-name { flex-wrap: wrap; }
+  .workbuddy-page .wb-edit-name { flex-wrap: wrap; }
 }
-
-/* 智谱页手动导入折叠区（客户端导入为主入口时的备选） */
-.zhipu-page .zp-manual-toggle,
-.wc-dialog .zp-manual-toggle {
-  border: none;
-  background: transparent;
-  padding: 0;
-  margin-top: 10px;
-  font-size: 12px;
-  color: var(--primary);
-  cursor: pointer;
-}
-.wc-dialog .zp-manual-toggle:hover { text-decoration: underline; }
-.wc-dialog .zp-manual-import { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--border); }
-.wc-dialog .zp-manual-import .wc-input { margin-bottom: 10px; }
 
 .workbuddy-accounts-page .workbuddy-quota-item {
   gap: 8px;

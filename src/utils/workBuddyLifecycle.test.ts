@@ -10,14 +10,18 @@ test('账号只在尚未加载且当前没有加载时请求', () => {
   assert.equal(shouldLoadWorkBuddyAccounts(false, true), false);
 });
 
-test('WorkBuddy 监测由页面显式启动且页面没有定时全量轮询', () => {
+test('WorkBuddy 监测由页面显式启动，定时刷新只查询余额', () => {
   const lib = readFileSync(new URL('../../src-tauri/src/lib.rs', import.meta.url), 'utf8');
   const commands = readFileSync(new URL('../../src-tauri/src/commands/workbuddy.rs', import.meta.url), 'utf8');
   const page = readFileSync(new URL('../pages/WorkBuddyPage.tsx', import.meta.url), 'utf8');
 
   assert.equal(lib.includes('workbuddy_session_watcher::ensure_started();'), false);
   assert.equal(commands.includes('start_workbuddy_session_watcher'), true);
-  assert.equal(page.includes('setInterval'), false);
+  const refreshEffect = page.slice(page.indexOf('const refreshIfStale ='), page.indexOf('}, [refreshAllStatuses])'));
+  assert.ok(refreshEffect.length > 0);
+  assert.match(refreshEffect, /refreshAllStatuses\(\)/);
+  assert.match(refreshEffect, /document\.visibilityState/);
+  assert.doesNotMatch(refreshEffect, /triggerCheckin|switchAccount|importAccount|syncGitHub/);
 });
 
 test('WorkBuddy 用户操作不应同步阻塞 GitHub CLI', () => {
@@ -46,7 +50,7 @@ test('WorkBuddy 真实积分、今日奖励和连续签到状态应支持只读�
   assert.match(models, /WorkBuddyAccountStatus/);
   assert.match(service, /getWorkBuddyAccountStatus/);
   assert.match(store, /statusById|refreshAccountStatus|refreshAllStatuses/);
-  assert.match(page, /真实积分/);
+  assert.match(page, /可用积分/);
   assert.match(page, /今日奖励/);
   assert.match(page, /连续签到/);
   assert.match(page, /刷新全部积分/);

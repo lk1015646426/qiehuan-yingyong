@@ -3,7 +3,7 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, ORIGIN, REFERER, USER
 use serde_json::{json, Value};
 use std::time::Instant;
 
-const RESOURCE_URL: &str = "https://copilot.tencent.com/v2/billing/meter/get-user-resource";
+const RESOURCE_URL: &str = "https://copilot.tencent.com/billing/meter/get-user-resource-summary";
 const ACTIVITY_URL: &str = "https://copilot.tencent.com/v2/billing/meter/checkin-activity-status";
 
 fn number(value: Option<&Value>) -> Option<f64> {
@@ -22,21 +22,24 @@ fn integer(value: Option<&Value>) -> Option<i64> {
     }
 }
 
-fn parse_real_credits(payload: &Value) -> Option<f64> {
-    let accounts = payload
-        .pointer("/data/Response/Data/Accounts")?
-        .as_array()?;
-    // 官方客户端把所有有效（Status==0）的积分包都计入总积分，包括个人体验版
-    // （CapacityType=4）等，因此这里不再按 CapacityType 过滤，只排除无效状态的包。
-    let total = accounts
-        .iter()
-        .filter(|package| integer(package.get("Status")) == Some(0))
-        .filter_map(|package| {
-            number(package.get("CapacityRemainPrecise"))
-                .or_else(|| number(package.get("CapacityRemain")))
-        })
-        .sum::<f64>();
-    Some((total * 100.0).round() / 100.0)
+fn parse_available_credits(payload: &Value) -> Option<f64> {
+    // 2026-10-18 与真实账号汇总核对：采用官方 Packages 的当前周期剩余量，
+    // 不按旧资源包类型排除 500 基础积分，也不把 CreditGroups 再累计一次。
+    // 契约参考 L0NE-6/WorkBuddy-Daily queryCredits；缺失/错误与真实零余额分开。
+    if payload.get("code").and_then(Value::as_i64) != Some(0) {
+        return None;
+    }
+    let packages = payload.pointer("/data/Packages")?.as_array()?;
+    let mut total = 0.0;
+    for package in packages {
+        let remain = number(package.get("CycleRemainCapacity"))?;
+        if !remain.is_finite() {
+            return None;
+        }
+        total += remain.max(0.0);
+    }
+    let rounded = (total * 100.0).round() / 100.0;
+    rounded.is_finite().then_some(rounded)
 }
 
 fn parse_activity(payload: &Value) -> (Option<f64>, Option<i64>) {
@@ -117,9 +120,7 @@ async fn query_json(
         started.elapsed().as_millis()
     ));
     if status == reqwest::StatusCode::UNAUTHORIZED {
-        return Err(format!(
-            "{label}认证已失效，请重新登录 WorkBuddy 后更新账号"
-        ));
+        return Err(format!("{label}保存的登录凭证被拒绝，请核对或手动恢复认证"));
     }
     if !status.is_success() {
         return Err(format!("{label}返回 HTTP {}", status.as_u16()));
@@ -172,43 +173,15 @@ fn assemble_status(
 }
 
 pub async fn query_account_status(account_id: &str) -> Result<WorkBuddyAccountStatus, String> {
-    let client = crate::utils::http::create_domestic_client(30, "copilot.tencent.com");
+    let client = tauri::async_runtime::spawn_blocking(|| {
+        crate::utils::http::create_domestic_client(30, "copilot.tencent.com")
+    })
+    .await
+    .map_err(|_| "余额查询初始化失败".to_string())?;
     let token = crate::modules::workbuddy_account::access_token(account_id)?;
-    let (mut credits_payload, mut activity_payload) = query_both(&client, &token).await;
-    if credits_payload
-        .as_ref()
-        .err()
-        .is_some_and(|error| is_auth_error(error))
-        || activity_payload
-            .as_ref()
-            .err()
-            .is_some_and(|error| is_auth_error(error))
-    {
-        match crate::modules::workbuddy_account::refresh_account_auth(account_id).await {
-            Ok(new_token) => {
-                (credits_payload, activity_payload) = query_both(&client, &new_token).await;
-            }
-            Err(error) => {
-                let refresh_error = format!("认证刷新失败：{error}");
-                if credits_payload
-                    .as_ref()
-                    .err()
-                    .is_some_and(|value| is_auth_error(value))
-                {
-                    credits_payload = Err(format!("积分查询{refresh_error}"));
-                }
-                if activity_payload
-                    .as_ref()
-                    .err()
-                    .is_some_and(|value| is_auth_error(value))
-                {
-                    activity_payload = Err(format!("签到状态查询{refresh_error}"));
-                }
-            }
-        }
-    }
+    let (credits_payload, activity_payload) = query_both(&client, &token).await;
     let credits = credits_payload.and_then(|payload| {
-        parse_real_credits(&payload).ok_or_else(|| "积分查询返回结构不完整".to_string())
+        parse_available_credits(&payload).ok_or_else(|| "积分汇总未返回有效余额".to_string())
     });
     let activity = activity_payload.and_then(|payload| {
         let parsed = parse_activity(&payload);
@@ -228,14 +201,14 @@ pub async fn query_account_status(account_id: &str) -> Result<WorkBuddyAccountSt
 #[cfg(test)]
 mod tests {
     use super::{
-        assemble_status, network_error_message, parse_activity, parse_real_credits, ACTIVITY_URL,
-        RESOURCE_URL,
+        assemble_status, network_error_message, parse_activity, parse_available_credits,
+        ACTIVITY_URL, RESOURCE_URL,
     };
     use serde_json::json;
 
     #[test]
     fn workbuddy_status_uses_only_read_only_endpoints() {
-        assert!(RESOURCE_URL.ends_with("get-user-resource"));
+        assert!(RESOURCE_URL.ends_with("get-user-resource-summary"));
         assert!(ACTIVITY_URL.ends_with("checkin-activity-status"));
         let write_endpoint = concat!("daily", "-checkin");
         assert!(!RESOURCE_URL.contains(write_endpoint));
@@ -243,48 +216,40 @@ mod tests {
     }
 
     #[test]
-    fn workbuddy_real_credits_exclude_inactive_packages() {
-        let payload = json!({
-            "data": {"Response": {"Data": {"Accounts": [
-                {"CapacityType": 1, "Status": 1, "CapacityRemainPrecise": "900"},
-                {"CapacityType": 1, "Status": 0, "CapacityRemainPrecise": "293.49"}
-            ]}}}
-        });
-
-        assert_eq!(parse_real_credits(&payload), Some(293.49));
-    }
-
-    // 真实样本（2026-09-07 抓取）：官方客户端把个人体验版（CapacityType=4）的
-    // 500 分也计入总积分（显示 800），与赠送包一样按 Status==0 判断有效性。
-    #[test]
-    fn workbuddy_real_credits_include_trial_packages() {
-        let payload = json!({
-            "data": {"Response": {"Data": {
-                "TotalCount": 4,
-                "TotalDosage": 800,
-                "Accounts": [
-                    {"CapacityType": 4, "Status": 0, "CapacityRemainPrecise": "500"},
-                    {"CapacityType": 1, "Status": 0, "CapacityRemainPrecise": "100"},
-                    {"CapacityType": 1, "Status": 0, "CapacityRemainPrecise": "100"},
-                    {"CapacityType": 1, "Status": 0, "CapacityRemainPrecise": "100"},
-                    {"CapacityType": 1, "Status": 1, "CapacityRemainPrecise": "900"}
-                ]
-            }}}
-        });
-
-        assert_eq!(parse_real_credits(&payload), Some(800.0));
+    fn workbuddy_summary_includes_base_rewards_and_addons_without_double_counting() {
+        let payload = json!({"code":0,"data":{"Packages":[
+            {"CycleRemainCapacity":"2932.12000031","CycleTotalCapacity":"3400"},
+            {"CycleRemainCapacity":"500"},{"CycleRemainCapacity":1000}],
+            "TotalCredits":"4432.12000031","CreditGroups":[{"CycleRemainCapacity":"4432.12000031"}]}});
+        assert_eq!(parse_available_credits(&payload), Some(4432.12));
     }
 
     #[test]
-    fn workbuddy_real_credits_fall_back_to_numeric_remaining_value() {
-        let payload = json!({
-            "data": {"Response": {"Data": {"Accounts": [
-                {"CapacityType": 1, "Status": 0, "CapacityRemain": 100},
-                {"CapacityType": 1, "Status": 0, "CapacityRemainPrecise": "2.96"}
-            ]}}}
-        });
+    fn workbuddy_summary_zero_is_not_a_missing_or_failed_query() {
+        assert_eq!(
+            parse_available_credits(&json!({"code":0,"data":{"Packages":[]}})),
+            Some(0.0)
+        );
+        assert_eq!(
+            parse_available_credits(&json!({"code":0,"data":{"Packages":[
+            {"CycleRemainCapacity":"0","CycleTotalCapacity":500}]}})),
+            Some(0.0)
+        );
+        assert_eq!(parse_available_credits(&json!({})), None);
+        assert_eq!(parse_available_credits(&json!({"code":0,"data":{}})), None);
+        assert_eq!(
+            parse_available_credits(&json!({"code":401,"data":{"Packages":[]}})),
+            None
+        );
+    }
 
-        assert_eq!(parse_real_credits(&payload), Some(102.96));
+    #[test]
+    fn workbuddy_summary_rejects_invalid_values_instead_of_silently_omitting_packages() {
+        for value in [json!(true), json!(null), json!("NaN"), json!("unknown")] {
+            let payload = json!({"code":0,"data":{"Packages":[{"CycleRemainCapacity":100},
+                {"CycleRemainCapacity":value}]}});
+            assert_eq!(parse_available_credits(&payload), None);
+        }
     }
 
     #[test]

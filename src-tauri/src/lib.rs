@@ -273,6 +273,7 @@ pub fn run() {
             });
 
             modules::work_cn_session_watcher::ensure_started(app.handle().clone());
+            tauri::async_runtime::spawn(modules::workbuddy_pool::restore_workbuddy_pool());
 
             #[cfg(target_os = "macos")]
             apply_macos_activation_policy(&app.handle());
@@ -413,7 +414,15 @@ pub fn run() {
             commands::work_cn_checkin::list_checkin_workflow_runs,
             commands::work_cn_checkin::local_checkin_work_cn,
             // WorkBuddy Commands
+            modules::workbuddy_activities::get_workbuddy_activity_settings,
+            modules::workbuddy_activities::save_workbuddy_activity_settings,
+            modules::workbuddy_activities::get_workbuddy_activity_overview,
             commands::workbuddy::get_workbuddy_installation,
+            modules::workbuddy_pool::get_workbuddy_pool_status,
+            modules::workbuddy_pool::get_workbuddy_pool_models,
+            modules::workbuddy_pool::save_workbuddy_pool_models,
+            modules::workbuddy_pool::start_workbuddy_pool,
+            modules::workbuddy_pool::stop_workbuddy_pool,
             commands::workbuddy::get_workbuddy_settings,
             commands::workbuddy::save_workbuddy_settings,
             commands::workbuddy::get_workbuddy_session_watch_status,
@@ -421,20 +430,12 @@ pub fn run() {
             commands::workbuddy::import_current_workbuddy_account,
             commands::workbuddy::list_workbuddy_accounts,
             commands::workbuddy::get_workbuddy_account_status,
+            commands::workbuddy::recover_workbuddy_auth,
             commands::workbuddy::update_workbuddy_account,
             commands::workbuddy::delete_workbuddy_account,
             commands::workbuddy::switch_workbuddy_account,
             commands::workbuddy::sync_workbuddy_github,
             commands::workbuddy::trigger_workbuddy_checkin,
-            // Zhipu Commands
-            commands::zhipu::list_zhipu_accounts,
-            commands::zhipu::import_current_zhipu_account,
-            commands::zhipu::import_zhipu_account,
-            commands::zhipu::update_zhipu_account,
-            commands::zhipu::delete_zhipu_account,
-            commands::zhipu::get_zhipu_account_status,
-            commands::zhipu::sync_zhipu_github,
-            commands::zhipu::trigger_zhipu_checkin,
             // Trae Instance Commands
             commands::trae_instance::trae_get_instance_defaults,
             commands::trae_instance::trae_list_instances,

@@ -48,3 +48,8 @@ target/
 docs/plugin-architecture-proposal.md
 .aitasks
 .qoder/
+
+# Local diagnostics and Python runtime caches
+.workbuddy/
+__pycache__/
+*.py[cod]

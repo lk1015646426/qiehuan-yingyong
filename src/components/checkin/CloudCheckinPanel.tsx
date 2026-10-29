@@ -1,4 +1,4 @@
-// 共享云端签到面板：TRAE / WorkBuddy / 智谱 三页复用。
+// 共享云端签到面板：TRAE / WorkBuddy 两页复用。
 //
 // 数据与触发走仓库级命令（list_checkin_workflow_runs / trigger_checkin_workflow），
 // 仓库与 workflow 由共享的 github.json 决定（三页同步到同一签到仓库），

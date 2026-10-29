@@ -345,7 +345,7 @@
 }
 
 /* ---------- 快照完整度摘要（折叠 8 个技术徽章） ---------- */
-/* 三页头部徽标统一为纯文本：与 WorkBuddy / 智谱 wb-sync 系列保持同一观感，
+/* 两页头部徽标统一为纯文本：与 WorkBuddy wb-sync 系列保持同一观感，
    只用配色区分 ok / missing，不再用胶囊背景 + 边框突出。 */
 .wc-snapshot-summary {
   display: inline-flex;

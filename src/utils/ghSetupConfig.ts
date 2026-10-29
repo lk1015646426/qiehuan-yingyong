@@ -2,8 +2,8 @@
 //
 // - full（TRAE 页）：按勾选的「账号 → 槽位号」重建槽位列表，并保留每个账号
 //   已保存的自动签到开关（checkinEnabled，2026-09-09 新增）。
-// - repo-only（WorkBuddy / 智谱页）：只改 启用/仓库/workflow 文件。
-//   红线：槽位列表原样透传，绝不清空 TRAE 页已绑定的槽位——WB/智谱走聚合
+// - repo-only（WorkBuddy 页）：只改 启用/仓库/workflow 文件。
+//   红线：槽位列表原样透传，绝不清空 TRAE 页已绑定的槽位——WB 走聚合
 //   Secret，没有槽位概念，不能因在这里保存仓库配置就把 TRAE 的绑定抹掉。
 import type { WorkCnGitHubConfig, WorkCnGitHubSlot } from '../types/workCn';
 

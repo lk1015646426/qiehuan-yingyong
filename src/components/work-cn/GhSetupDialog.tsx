@@ -16,7 +16,7 @@ import type { GhSetupMode } from '../../utils/ghSetupConfig';
 interface Props {
   open: boolean;
   onClose: () => void;
-  /** full（TRAE 页，含槽位绑定）/ repo-only（WorkBuddy / 智谱页，仅仓库配置，
+  /** full（TRAE 页，含槽位绑定）/ repo-only（WorkBuddy 页，仅仓库配置，
    *  保存时原样透传已有槽位，见 utils/ghSetupConfig 的红线说明）。 */
   mode?: GhSetupMode;
 }
@@ -53,7 +53,7 @@ export function GhSetupDialog({ open, onClose, mode = 'full' }: Props) {
   const [configError, setConfigError] = useState<string | null>(null);
 
   // 打开时只拉取最新配置；CLI 状态由页面挂载时检测（避免重复 spawn gh 进程），
-  // 安装/登录完成后 store 会自动刷新。WB / 智谱页可能从未检测过 CLI 状态，
+  // 安装/登录完成后 store 会自动刷新。WB 页可能从未检测过 CLI 状态，
   // 此时（githubCliStatus 为 null）兜底检测一次。
   useEffect(() => {
     if (!open) return;

@@ -10,6 +10,8 @@ pub struct WorkBuddyAccountView {
     pub masked_phone: Option<String>,
     pub checkin_enabled: bool,
     pub token_expires_at: Option<i64>,
+    #[serde(default)]
+    pub credential_revision: String,
     pub created_at: i64,
     pub updated_at: i64,
     pub last_used_at: Option<i64>,

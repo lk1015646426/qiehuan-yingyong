@@ -1,0 +1,23 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { createRequire } from 'node:module';
+import { build } from 'esbuild';
+const require=createRequire(import.meta.url);
+test('WorkBuddy：无变化不联网，导入后的旧状态响应被丢弃',async()=>{
+ const root=path.resolve(import.meta.dirname,'../..');
+ const text=fs.readFileSync(path.join(root,'src/stores/useWorkBuddyStore.ts'),'utf8');
+ const names=text.match(/import \{([^}]+)\} from '\.\.\/services\/workBuddyService';/)[1].split(',').map(s=>s.trim()).filter(Boolean);
+ const source=names.map(n=>n.startsWith('WORKBUDDY_')?`export const ${n}='${n}';`:`export const ${n}=(...a)=>globalThis.__workbuddyTest.${n}(...a);`).join('\n');
+ const dest=path.join(root,'.tmp/workbuddy-store-regression.cjs');
+ await build({entryPoints:[path.join(root,'src/stores/useWorkBuddyStore.ts')],outfile:dest,bundle:true,platform:'node',format:'cjs',plugins:[{name:'fixture',setup(b){b.onResolve({filter:/services\/workBuddyService$/},()=>({path:'service',namespace:'fixture'}));b.onResolve({filter:/@tauri-apps\/api\/event/},()=>({path:'events',namespace:'fixture'}));b.onLoad({filter:/.*/,namespace:'fixture'},a=>({contents:a.path==='service'?source:`export async function listen(n,cb){globalThis.__workbuddyTest.listeners[n]=cb;return()=>delete globalThis.__workbuddyTest.listeners[n]}`,loader:'js'}));}}]});
+ let lists=0,queries=0,revision='before';let resolveOld;
+ const status={credits:42,creditsError:null,activityError:null,todayReward:null,streakDays:null,updatedAt:1};
+ globalThis.__workbuddyTest={listeners:{},listWorkBuddyAccounts:async()=>{lists++;return[{id:'a',credentialRevision:revision}]},getWorkBuddyAccountStatus:async()=>{queries++;return status},importCurrentWorkBuddyAccount:async()=>{revision='after';return{id:'a',credentialRevision:revision}},getWorkBuddyInstallation:async()=>({installed:true})};
+ const {useWorkBuddyStore:s}=require(dest);const tick=()=>new Promise(r=>setImmediate(r));
+ s.setState({accounts:[{id:'a',credentialRevision:'before'}],accountsLoaded:true});await s.getState().subscribeToBackgroundEvents();globalThis.__workbuddyTest.listeners['workbuddy:session-watch']({payload:{outcome:'UNCHANGED',tokenChanged:false}});await tick();assert.equal(lists,0);assert.equal(queries,0);
+ globalThis.__workbuddyTest.getWorkBuddyAccountStatus=()=>new Promise(r=>{resolveOld=r});const pending=s.getState().refreshAccountStatus('a');await tick();
+ globalThis.__workbuddyTest.getWorkBuddyAccountStatus=async()=>status;assert.equal(await s.getState().importCurrent('updated'),true);assert.equal(s.getState().statusById.a.credits,42);
+ resolveOld({...status,credits:null,creditsError:'old rejected credential'});await pending;assert.equal(s.getState().statusById.a.credits,42);assert.equal(s.getState().statusById.a.creditsError,null);
+});

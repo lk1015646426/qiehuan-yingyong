@@ -31,7 +31,7 @@ fn key_path() -> Result<PathBuf, String> {
     Ok(crate::modules::account::get_data_dir()?.join(KEY_FILE))
 }
 
-fn read_or_create_key() -> Result<[u8; 32], String> {
+fn read_key(create: bool) -> Result<[u8; 32], String> {
     let path = key_path()?;
     if path.exists() {
         let raw =
@@ -47,6 +47,9 @@ fn read_or_create_key() -> Result<[u8; 32], String> {
         return Ok(key);
     }
 
+    if !create {
+        return Err("账号加密密钥缺失，已停止读取；请恢复原密钥，勿创建替代密钥".to_string());
+    }
     let mut key = [0u8; 32];
     rand::thread_rng().fill_bytes(&mut key);
     let encoded = general_purpose::STANDARD.encode(key);
@@ -60,8 +63,8 @@ fn read_or_create_key() -> Result<[u8; 32], String> {
     Ok(key)
 }
 
-fn cipher() -> Result<Aes256Gcm, String> {
-    Aes256Gcm::new_from_slice(&read_or_create_key()?)
+fn cipher(create: bool) -> Result<Aes256Gcm, String> {
+    Aes256Gcm::new_from_slice(&read_key(create)?)
         .map_err(|e| format!("初始化账号详情加密失败: {}", e))
 }
 
@@ -70,7 +73,7 @@ pub fn serialize_account_file<T: Serialize>(kind: &str, account: &T) -> Result<S
         serde_json::to_vec(account).map_err(|e| format!("序列化账号详情失败: {}", e))?;
     let mut nonce_bytes = [0u8; 12];
     rand::thread_rng().fill_bytes(&mut nonce_bytes);
-    let ciphertext = cipher()?
+    let ciphertext = cipher(true)?
         .encrypt(Nonce::from_slice(&nonce_bytes), plaintext.as_ref())
         .map_err(|e| format!("加密账号详情失败: {:?}", e))?;
     let envelope = SecureAccountEnvelope {
@@ -91,6 +94,14 @@ pub fn deserialize_account_file<T: DeserializeOwned>(
     path: &Path,
     content: &str,
 ) -> Result<(T, bool), String> {
+    deserialize_account_file_impl(path,content,true)
+}
+
+pub fn deserialize_account_file_read_only<T: DeserializeOwned>(path:&Path,content:&str)->Result<(T,bool),String>{
+    deserialize_account_file_impl(path,content,false)
+}
+fn deserialize_account_file_impl<T:DeserializeOwned>(path:&Path,content:&str,allow_restore:bool)->Result<(T,bool),String>{
+
     if let Ok(envelope) = serde_json::from_str::<SecureAccountEnvelope>(content) {
         if envelope.version != VERSION {
             return Err("账号详情加密版本不受支持".to_string());
@@ -104,7 +115,7 @@ pub fn deserialize_account_file<T: DeserializeOwned>(
         let ciphertext = general_purpose::STANDARD
             .decode(envelope.ciphertext.trim())
             .map_err(|e| format!("解析账号详情密文失败: {}", e))?;
-        let plaintext = cipher()?
+        let plaintext = cipher(false)?
             .decrypt(Nonce::from_slice(&nonce), ciphertext.as_ref())
             .map_err(|e| format!("解密账号详情失败: {:?}", e))?;
         let value = serde_json::from_slice::<T>(&plaintext)
@@ -114,8 +125,11 @@ pub fn deserialize_account_file<T: DeserializeOwned>(
         return Ok((value, needs_rotation));
     }
 
-    let value = crate::modules::atomic_write::parse_json_with_auto_restore::<T>(path, content)
-        .map_err(|e| format!("解析账号详情失败: {}", e))?;
+    let value = if allow_restore {
+        crate::modules::atomic_write::parse_json_with_auto_restore::<T>(path,content)
+    }else{
+        serde_json::from_str::<T>(content).map_err(|e|e.to_string())
+    }.map_err(|e|format!("解析账号详情失败，未自动回滚认证凭证：{e}"))?;
     Ok((value, true))
 }
 
@@ -133,6 +147,27 @@ mod tests {
         secret: String,
     }
 
+    #[test]
+    fn read_only_parse_never_restores_an_older_account_backup(){
+        let dir=std::env::temp_dir().join(format!("readonly-backup-{}",uuid::Uuid::new_v4()));fs::create_dir_all(&dir).unwrap();let file=dir.join("account.json");fs::write(&file,b"broken-current").unwrap();fs::write(dir.join("account.json.bak"),b"{\"token\":\"older-token\"}").unwrap();
+        assert!(deserialize_account_file_read_only::<serde_json::Value>(&file,"broken-current").is_err());assert_eq!(fs::read(&file).unwrap(),b"broken-current");let _=fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn encrypted_read_does_not_create_replacement_key() {
+        let _env = crate::modules::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("secure-read-key-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("COCKPIT_TOOLS_TEST_DATA_DIR", &dir);
+        let raw = r#"{"version":1,"kind":"workbuddy","algorithm":"AES-256-GCM","key_id":"local-secure-account-storage-v1","nonce":"AAAAAAAAAAAAAAAA","ciphertext":"AAAAAAAAAAAAAAAAAAAAAA==","encrypted_at":0}"#;
+        assert!(
+            deserialize_account_file::<serde_json::Value>(&dir.join("account.json"), raw).is_err()
+        );
+        assert!(!dir.join(KEY_FILE).exists());
+        std::env::remove_var("COCKPIT_TOOLS_TEST_DATA_DIR");
+        let _ = fs::remove_dir_all(dir);
+    }
     #[test]
     fn roundtrip_encrypt_decrypt_and_legacy_plaintext() {
         let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());

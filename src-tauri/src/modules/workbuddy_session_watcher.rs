@@ -19,6 +19,8 @@ pub fn ensure_started() {
         return;
     }
     crate::modules::logger::log_info("[WorkBuddySessionWatcher] 后台认证监测已启动");
+    // 静默刷新与会话监测同生命周期：监测负责活跃账号，静默刷新保活其余账号。
+    crate::modules::workbuddy_silent_refresh::ensure_started();
     tauri::async_runtime::spawn(async {
         tokio::time::sleep(STARTUP_DELAY).await;
         loop {
@@ -115,6 +117,14 @@ pub fn watch_once() -> WorkBuddySessionWatchStatus {
         last_check_at: now(),
         ..WorkBuddySessionWatchStatus::default()
     };
+    let _auth = match crate::modules::workbuddy_account::try_begin_auth_transaction() {
+        Ok(guard) => guard,
+        Err(_) => {
+            status.outcome = WorkBuddySessionWatchOutcome::Unchanged;
+            status.message = "认证事务处理中，稍后继续监测".into();
+            return status;
+        }
+    };
     let path = match crate::modules::workbuddy_account::default_auth_file_path() {
         Ok(path) => path,
         Err(_) => return failed_status("无法定位 WorkBuddy 认证文件路径".to_string()),
@@ -172,7 +182,9 @@ pub fn watch_once() -> WorkBuddySessionWatchStatus {
         return status;
     }
     let previous_token = crate::modules::workbuddy_account::access_token(&account_id).ok();
-    if let Err(error) = crate::modules::workbuddy_account::import_snapshot_json(&raw, None) {
+    if let Err(error) =
+        crate::modules::workbuddy_account::import_snapshot_json_in_transaction(&raw, None)
+    {
         return failed_status(format!("更新本地加密快照失败: {error}"));
     }
     if let Ok(mut value) = LAST_MTIME.lock() {

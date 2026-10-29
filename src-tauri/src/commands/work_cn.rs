@@ -16,7 +16,7 @@ use crate::modules::{logger, process, trae_account};
 /// User-visible product name. The internal platform identifier stays
 /// `trae_solo_cn` / `TraePlatformKind::TraeSoloCn`; only the display layer is
 /// renamed (development guide §0 rule 5 / §9.4).
-const WORK_CN_DISPLAY_NAME: &str = "TRAE Work CN";
+const WORK_CN_DISPLAY_NAME: &str = "TRAE";
 
 /// Detect the local TRAE Work CN installation without touching any login
 /// secrets. Safe to call on every page load. 多路径文件探测 + 版本 JSON 解析
@@ -29,7 +29,7 @@ pub async fn get_work_cn_installation() -> Result<WorkCnInstallation, String> {
 }
 
 fn detect_installation() -> Result<WorkCnInstallation, String> {
-    let platform = trae_account::TraePlatformKind::TraeSoloCn;
+    let platform = trae_account::resolve_work_cn_client_platform();
 
     let executable_path = process::resolve_trae_launch_path_for_platform(platform).ok();
     let version = executable_path

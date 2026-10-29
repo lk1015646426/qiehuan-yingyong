@@ -2265,6 +2265,78 @@ pub fn detect_trae_product_version_for_exe(exe_path: &Path) -> Option<String> {
     version
 }
 
+fn is_unified_trae_cn_product(product: &Value) -> bool {
+    if product.get("applicationName").and_then(Value::as_str) != Some("trae-cn") {
+        return false;
+    }
+    let parts = product.get("appVersion").and_then(Value::as_str).unwrap_or("")
+        .split('.').take(3).map(str::parse::<u32>).collect::<Result<Vec<_>, _>>();
+    matches!(parts, Ok(ref v) if v.len() == 3 && (v[0], v[1], v[2]) >= (3, 4, 1))
+}
+
+/// 官方 3.4.1 起 Work 与 Code 合并；安装身份、数据目录及启动平台一起选择。
+pub(crate) fn is_unified_trae_cn_executable(exe: &Path) -> bool {
+    exe.parent().is_some_and(|base| {
+        build_trae_product_file_candidates(base).iter()
+            .filter_map(|path| parse_json_file(path))
+            .any(|product| is_unified_trae_cn_product(&product))
+    })
+}
+
+pub(crate) fn resolve_work_cn_client_platform() -> TraePlatformKind {
+    if work_cn_switch_storage_path_override().is_some() {
+        return TraePlatformKind::TraeSoloCn;
+    }
+    if let Ok(exe) = crate::modules::process::resolve_trae_launch_path_for_platform(TraePlatformKind::TraeCn) {
+        if is_unified_trae_cn_executable(&exe) {
+            return TraePlatformKind::TraeCn;
+        }
+    }
+    TraePlatformKind::TraeSoloCn
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn trae_platform_for_executable(exe: &Path) -> Option<TraePlatformKind> {
+    let base = exe.parent()?;
+    for product in build_trae_product_file_candidates(base).iter().filter_map(|path| parse_json_file(path)) {
+        match product.get("applicationName").and_then(Value::as_str) {
+            Some("trae-cn") => return Some(TraePlatformKind::TraeCn),
+            Some("trae") => return Some(TraePlatformKind::Trae),
+            Some("trae-solo-cn" | "trae-work-cn") => return Some(TraePlatformKind::TraeSoloCn),
+            Some("trae-solo" | "trae-work") => return Some(TraePlatformKind::TraeSolo),
+            _ => {},
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod unified_client_tests {
+    use super::*;
+    #[test]
+    fn merged_client_requires_cn_identity_and_official_merge_version() {
+        assert!(is_unified_trae_cn_product(&serde_json::json!({"applicationName":"trae-cn", "appVersion":"3.4.3"})));
+        assert!(!is_unified_trae_cn_product(&serde_json::json!({"applicationName":"trae-cn", "appVersion":"3.3.50"})));
+        assert!(!is_unified_trae_cn_product(&serde_json::json!({"applicationName":"trae", "appVersion":"3.4.3"})));
+        assert!(!is_unified_trae_cn_product(&serde_json::json!({"applicationName":"trae-cn", "version":"1.107.1"})));
+    }
+
+    #[test]
+    #[ignore = "Read-only inspection of the installed official TRAE client; run explicitly"]
+    fn installed_unified_trae_cn_readonly_probe() {
+        let platform = resolve_work_cn_client_platform();
+        let exe = crate::modules::process::resolve_trae_launch_path_for_platform(platform).unwrap();
+        let storage = get_default_trae_storage_path_for_platform(platform).unwrap();
+        let login = read_local_trae_auth_for_platform(platform).unwrap();
+        println!("{}", serde_json::json!({"platform":platform.provider_key(), "exe":exe,
+            "version":detect_trae_product_version_for_exe(&exe), "storage":storage,
+            "has_login":login.is_some()}));
+        assert_eq!(platform, TraePlatformKind::TraeCn);
+        assert!(exe.is_file());
+        assert!(storage.to_string_lossy().contains("Trae CN"));
+    }
+}
+
 fn detect_trae_product_version_uncached(exe_path: &Path) -> Option<String> {
     let base = if exe_path.is_dir() {
         exe_path.to_path_buf()
@@ -2276,7 +2348,7 @@ fn detect_trae_product_version_uncached(exe_path: &Path) -> Option<String> {
         let Some(json) = parse_json_file(&candidate) else {
             continue;
         };
-        if let Some(version) = json.get("version").and_then(Value::as_str) {
+        if let Some(version) = json.get("appVersion").or_else(|| json.get("version")).and_then(Value::as_str) {
             let version = version.trim();
             if !version.is_empty() {
                 return Some(version.to_string());
@@ -4233,14 +4305,21 @@ pub fn validate_work_cn_account_snapshot(
 /// stores the optional `label` as a tag (never overwriting email).
 /// 账号数量不设上限：新增账号按导入顺序自动排入下一个槽位。
 pub(crate) fn import_work_cn_account_from_payload(
-    mut payload: TraeImportPayload,
+    payload: TraeImportPayload,
     label: Option<String>,
 ) -> Result<TraeAccount, String> {
     // Work CN 专用导入链路：TRAE SOLO CN 客户端的 storage.json 自报
     // `platformId="trae_cn"` / CN 版 authClientId（实测 ono9krqynydwx5），
     // 按 payload 原始特征解析会得到 TraeCn，导致账号被 list_work_cn_accounts
     // 过滤掉（表现为“重启后槽位为空”）。这里强制规范化为 TraeSoloCn。
-    let platform = TraePlatformKind::TraeSoloCn;
+    import_work_cn_account_from_payload_for_platform(payload, label, TraePlatformKind::TraeSoloCn)
+}
+
+fn import_work_cn_account_from_payload_for_platform(
+    mut payload: TraeImportPayload,
+    label: Option<String>,
+    platform: TraePlatformKind,
+) -> Result<TraeAccount, String> {
     attach_platform_metadata_to_payload(&mut payload, platform);
     let mut account = upsert_account(payload)?;
     if let Some(label) = label.filter(|l| !l.trim().is_empty()) {
@@ -4255,7 +4334,7 @@ pub(crate) fn import_work_cn_account_from_payload(
 pub fn import_current_work_cn_account(
     label: Option<String>,
 ) -> Result<crate::models::work_cn::WorkCnAccountView, String> {
-    let platform = TraePlatformKind::TraeSoloCn;
+    let platform = resolve_work_cn_client_platform();
     let storage_path = get_default_trae_storage_path_for_platform(platform)?;
     if !storage_path.exists() {
         return Err("未检测到已登录的 TRAE Work CN 账号，请先在官方客户端登录后再导入".to_string());
@@ -4265,7 +4344,7 @@ pub fn import_current_work_cn_account(
     let snapshot = extract_local_work_cn_device_snapshot(&storage_root);
     merge_work_cn_device_snapshot_into_payload(&mut payload, snapshot);
 
-    let account = import_work_cn_account_from_payload(payload, label)?;
+    let account = import_work_cn_account_from_payload_for_platform(payload, label, platform)?;
     let validation = validate_work_cn_account_snapshot(&account);
     Ok(build_work_cn_account_view(&account, validation))
 }
@@ -4375,7 +4454,7 @@ pub(crate) fn resolve_current_work_cn_storage_path() -> Result<PathBuf, String> 
     if let Some(path) = work_cn_switch_storage_path_override() {
         return Ok(path);
     }
-    get_default_trae_storage_path_for_platform(TraePlatformKind::TraeSoloCn)
+    get_default_trae_storage_path_for_platform(resolve_work_cn_client_platform())
 }
 
 fn work_cn_switch_skip_process() -> bool {
@@ -4492,7 +4571,7 @@ pub fn validate_work_cn_account_for_switch(
 /// 不阻止切换，但会提示用户先导入。
 pub fn sync_current_work_cn_session_from_local() -> Result<Option<TraeAccount>, WorkCnCommandError>
 {
-    let platform = TraePlatformKind::TraeSoloCn;
+    let platform = resolve_work_cn_client_platform();
     let payload = match read_local_trae_auth_for_platform(platform) {
         Ok(Some(found)) => found,
         Ok(None) => return Ok(None),
@@ -4588,12 +4667,12 @@ fn work_cn_light_path_verify_timeout(was_running: bool) -> Duration {
 }
 
 /// 回滚后若切换前客户端正在运行，重新启动旧账号。
-async fn restart_previous_after_rollback() {
+async fn restart_previous_after_rollback(platform: TraePlatformKind) {
     if work_cn_switch_skip_process() {
         return;
     }
     if let Err(error) = crate::commands::trae_instance::trae_start_instance(
-        Some("trae_solo_cn".to_string()),
+        Some(platform.provider_key().to_string()),
         "__default__".to_string(),
     )
     .await
@@ -4718,7 +4797,7 @@ pub async fn switch_work_cn_account_with_progress(
     account_id: String,
     on_progress: impl Fn(&str) + Send + Sync,
 ) -> Result<WorkCnSwitchResult, WorkCnCommandError> {
-    let platform = TraePlatformKind::TraeSoloCn;
+    let platform = resolve_work_cn_client_platform();
 
     // 步骤 1：全局切号锁，禁止并发。
     let _guard = match WORK_CN_SWITCH_LOCK.try_lock() {
@@ -4768,7 +4847,7 @@ pub async fn switch_work_cn_account_with_progress(
             false
         } else {
             match crate::commands::trae_instance::trae_start_instance(
-                Some("trae_solo_cn".to_string()),
+                Some(platform.provider_key().to_string()),
                 "__default__".to_string(),
             )
             .await
@@ -4802,7 +4881,7 @@ pub async fn switch_work_cn_account_with_progress(
     // 步骤 5：正常关闭官方客户端（不默认强杀）。最长等待 20 秒。
     on_progress(WORK_CN_SWITCH_STAGE_CLOSING);
     if !work_cn_switch_skip_process() {
-        if let Err(error) = crate::modules::process::close_trae_platform_default("trae_solo_cn", 20)
+        if let Err(error) = crate::modules::process::close_trae_platform_default(platform.provider_key(), 20)
         {
             return Err(
                 WorkCnCommandError::new(WorkCnErrorCode::ClientCloseFailed, error)
@@ -4843,7 +4922,7 @@ pub async fn switch_work_cn_account_with_progress(
         false
     } else {
         match crate::commands::trae_instance::trae_start_instance_after_switch(
-            Some("trae_solo_cn".to_string()),
+            Some(platform.provider_key().to_string()),
             "__default__".to_string(),
         )
         .await
@@ -4853,7 +4932,7 @@ pub async fn switch_work_cn_account_with_progress(
                 rollback_storage_bytes(&storage_path, previous_bytes.as_deref());
                 rollback_bind(platform, previous_bind.as_deref());
                 if was_running {
-                    restart_previous_after_rollback().await;
+                    restart_previous_after_rollback(platform).await;
                 }
                 return Err(WorkCnCommandError::new(
                     WorkCnErrorCode::LaunchFailed,
@@ -4871,7 +4950,7 @@ pub async fn switch_work_cn_account_with_progress(
         rollback_storage_bytes(&storage_path, previous_bytes.as_deref());
         rollback_bind(platform, previous_bind.as_deref());
         if was_running {
-            restart_previous_after_rollback().await;
+            restart_previous_after_rollback(platform).await;
         }
         return Err(error);
     }

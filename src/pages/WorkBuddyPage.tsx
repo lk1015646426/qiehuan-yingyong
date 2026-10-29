@@ -5,7 +5,10 @@ import { GhSetupDialog } from '../components/work-cn/GhSetupDialog';
 import { getWorkCnGitHubConfig } from '../services/workCnService';
 import { WorkBuddyAddAccountDialog } from '../components/workbuddy/WorkBuddyAddAccountDialog';
 import { WorkBuddySettingsDialog } from '../components/workbuddy/WorkBuddySettingsDialog';
+import { WorkBuddyPoolPanel } from '../components/workbuddy/WorkBuddyPoolPanel';
+import { WorkBuddyActivitiesPanel } from '../components/workbuddy/WorkBuddyActivitiesPanel';
 import { useWorkBuddyStore } from '../stores/useWorkBuddyStore';
+import { WorkBuddyCreditsSummary } from '../components/workbuddy/WorkBuddyCreditsSummary';
 import type { WorkBuddyAccountView, WorkBuddyInstallation } from '../types/workbuddy';
 import { compactUid, credentialInvalidated, formatTokenExpiryDate, githubSyncPresentation, tokenDaysLabel, tokenDaysLeft } from '../utils/accountCardPresentation';
 
@@ -38,13 +41,14 @@ function AccountCard({ account, active }: { account: WorkBuddyAccountView; activ
   const status = useWorkBuddyStore((state) => state.statusById[account.id]);
   const statusLoading = useWorkBuddyStore((state) => Boolean(state.statusLoadingById[account.id]));
   const refreshAccountStatus = useWorkBuddyStore((state) => state.refreshAccountStatus);
+  const recoverCredentials = useWorkBuddyStore((state) => state.recoverCredentials);
   const [deleting, setDeleting] = useState(false);
   const [editing, setEditing] = useState(false);
   const [confirmingSwitch, setConfirmingSwitch] = useState(false);
   const [name, setName] = useState(account.displayName);
   const busy = switchingId !== null || updatingId !== null || deletingId !== null || checkingInId !== null;
   const githubSync = githubSyncPresentation(account.lastGithubSyncState, account.lastGithubSyncError);
-  // Token 剩余天数预警（与 TRAE / 智谱 页同一实现）：≤5 天预警、≤1 天危险。
+  // Token 剩余天数预警（与 TRAE 页同一实现）：≤5 天预警、≤1 天危险。
   const { tone: tokenTone, days: tokenDays } = tokenDaysLeft(account.tokenExpiresAt);
   const saveName = async () => {
     const value = name.trim();
@@ -57,8 +61,7 @@ function AccountCard({ account, active }: { account: WorkBuddyAccountView; activ
   const statusErrors = [status?.creditsError, status?.activityError]
     .filter((value): value is string => Boolean(value))
     .filter((value, index, values) => values.indexOf(value) === index);
-  // 服务端已作废的凭证（可能在别处登录导致 token 轮换）：切换会在联网刷新一步
-  // 失败并回滚，提前用醒目标记 + 二次确认引导用户先重新登录导入。
+  // 查询被拒绝不等于已确认异地登录或封号；认证恢复由显式操作触发。
   const credentialInvalid = credentialInvalidated([status?.creditsError, status?.activityError]);
   const requestSwitch = () => {
     if (credentialInvalid && !confirmingSwitch) {
@@ -81,15 +84,16 @@ function AccountCard({ account, active }: { account: WorkBuddyAccountView; activ
       <div className="wc-slot-sub">令牌到期 {formatTokenExpiryDate(account.tokenExpiresAt)}</div>
     </div>
     <div className="wb-status-block">
-      {credentialInvalid ? <div className="wb-credential-invalid" role="alert">凭证已失效（可能在其他设备登录过），切换无法完成。请先在 WorkBuddy 客户端重新登录该账号，再导入更新。</div> : null}
+      {credentialInvalid ? <div className="wb-credential-invalid" role="alert">保存的登录凭证被拒绝，原因尚未确认。可手动恢复认证；当前账号由官方客户端管理时，请核对登录后重新导入。</div> : null}
       <div className="wb-status-line" aria-label="WorkBuddy 状态">
-        <span>真实积分 <strong>{statusLoading && !status ? '查询中…' : status?.credits != null ? status.credits.toLocaleString('zh-CN', { maximumFractionDigits: 2 }) : '暂无数据'}</strong></span>
+        <span>可用积分 <strong>{statusLoading && !status ? '查询中…' : status?.credits != null ? status.credits.toLocaleString('zh-CN', { maximumFractionDigits: 2 }) : '未查询到'}</strong>{statusLoading && status ? '（刷新中）' : ''}</span>
         <span>今日奖励 <strong>{status?.todayReward != null ? status.todayReward.toLocaleString('zh-CN', { maximumFractionDigits: 2 }) : '暂无数据'}</strong></span>
         <span>连续签到 <strong>{status?.streakDays != null ? `${status.streakDays} 天` : '暂无数据'}</strong></span>
         <span title={tokenDays != null && tokenDays <= 0 ? 'Token 已过期，云端签到将失败，请在客户端重新登录后导入' : undefined}>
           Token 剩余 <strong className={`wc-token-strong wc-token-strong--${tokenTone}`}>{tokenDaysLabel(tokenDays)}</strong>
         </span>
       </div>
+      {status?.credits != null ? <div className="wc-slot-sub">积分查询于 {new Date(status.updatedAt * 1000).toLocaleTimeString('zh-CN', { hour12: false })} · 页面打开时每分钟更新</div> : null}
       {switchingId === account.id ? (
         <div className="wc-slot-sub">{SWITCH_STAGE_LABELS[switchStage ?? ''] ?? '正在准备'}…</div>
       ) : null}
@@ -108,11 +112,12 @@ function AccountCard({ account, active }: { account: WorkBuddyAccountView; activ
     </div> : null}
     <div className="wc-slot-actions account-card__actions">
       {confirmingSwitch ? <>
-        <span className="wb-switch-confirm-hint">凭证已失效，仍要切换？</span>
+        <span className="wb-switch-confirm-hint">凭证需要核对，仍要尝试切换？</span>
         <button type="button" className="wc-btn wc-btn-danger" disabled={busy} onClick={requestSwitch}>{switchingId === account.id ? '切换中…' : '仍要切换'}</button>
         <button type="button" className="wc-btn" disabled={busy} onClick={() => setConfirmingSwitch(false)}>取消</button>
       </> : <button type="button" className="wc-btn wc-btn-primary" disabled={busy} onClick={requestSwitch}>{switchingId === account.id ? '切换中…' : '切换并打开'}</button>}
       <button type="button" className="wc-btn" disabled={busy || statusLoading} onClick={() => void refreshAccountStatus(account.id)}>{statusLoading ? '刷新中…' : '刷新积分'}</button>
+      <button type="button" className="wc-btn" disabled={busy} onClick={() => void recoverCredentials(account.id)}>{updatingId === account.id ? '处理中…' : '恢复认证'}</button>
       <button type="button" className="wc-btn" disabled={busy || !account.checkinEnabled} onClick={() => void triggerCheckin(account.id)}>{checkingInId === account.id ? '触发中…' : '立即签到'}</button>
       <button type="button" className="wc-btn" disabled={busy} onClick={() => setEditing((value) => !value)}>备注</button>
       {deleting ? <>
@@ -165,6 +170,7 @@ export function WorkBuddyPage() {
   const syncGitHub = useWorkBuddyStore((state) => state.syncGitHub);
   const refreshAllStatuses = useWorkBuddyStore((state) => state.refreshAllStatuses);
   const statusLoadingById = useWorkBuddyStore((state) => state.statusLoadingById);
+  const statusById = useWorkBuddyStore((state) => state.statusById);
   const clearFeedback = useWorkBuddyStore((state) => state.clearFeedback);
   const sessionWatchStatus = useWorkBuddyStore((state) => state.sessionWatchStatus);
   const loadSessionWatchStatus = useWorkBuddyStore((state) => state.loadSessionWatchStatus);
@@ -174,7 +180,26 @@ export function WorkBuddyPage() {
     void ensureMonitoringStarted();
     void loadSessionWatchStatus();
   }, [ensureAccountsLoaded, ensureInstallationLoaded, ensureMonitoringStarted, loadSessionWatchStatus]);
+  useEffect(() => {
+    const refreshIfStale = () => {
+      if (document.visibilityState !== 'visible') return;
+      const state = useWorkBuddyStore.getState();
+      const now = Math.floor(Date.now() / 1000);
+      if (state.accounts.some(account => !state.statusById[account.id]
+        || now - state.statusById[account.id].updatedAt >= 60)) void refreshAllStatuses();
+    };
+    const timer = window.setInterval(refreshIfStale, 60_000);
+    window.addEventListener('focus', refreshIfStale);
+    document.addEventListener('visibilitychange', refreshIfStale);
+    refreshIfStale();
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener('focus', refreshIfStale);
+      document.removeEventListener('visibilitychange', refreshIfStale);
+    };
+  }, [refreshAllStatuses, accounts]);
   const activeAccountId = installation?.currentAccountId ?? null;
+  const updatingCredits = Object.values(statusLoadingById).some(Boolean);
   return <div className="wc-page workbuddy-page">
     <header className="wc-header">
       <h1 className="wc-title"><img className="wc-title-icon" src={workBuddyIcon} alt="WorkBuddy" />WorkBuddy 账号管理</h1>
@@ -192,6 +217,7 @@ export function WorkBuddyPage() {
     </section>
     {sessionWatchStatus?.message ? <section className={`wc-status${sessionWatchStatus.outcome === 'FAILED' || sessionWatchStatus.githubError ? ' wc-status--error' : sessionWatchStatus.outcome === 'TOKEN_UPDATED' ? ' wc-status--ok' : ''}`}><span className="wc-status-dot" /><div>{sessionWatchStatus.message}</div></section> : null}
     {error || notice ? <section className={`wc-status ${error ? 'wc-status--error' : 'wc-status--ok'}`}><div style={{ flex: 1 }}>{error ?? notice}</div><button type="button" className="wc-btn" onClick={clearFeedback}>知道了</button></section> : null}
+    <WorkBuddyCreditsSummary accountIds={accounts.map(account => account.id)} statuses={statusById} loading={updatingCredits} />
     <section>
       <h2 className="wc-section-title">已保存账号（{accounts.length}{loading ? ' · 加载中…' : ''}）</h2>
       <div className="wc-slots wb-slots">
@@ -199,8 +225,10 @@ export function WorkBuddyPage() {
         {!accounts.length && !loading ? <div className="wc-slot wc-slot--empty"><span className="wc-slot-empty-icon">＋</span><span className="wc-slot-empty-hint">先登录官方 WorkBuddy 客户端，再导入当前账号</span></div> : null}
       </div>
     </section>
-    {/* 云端签到任务（共享面板）：与 TRAE / 智谱 同一签到仓库，可查看运行记录并手动触发验证。
+    {/* 云端签到任务（共享面板）：与 TRAE 同一签到仓库，可查看运行记录并手动触发验证。
         触发条件由后端校验（github.json 未配置时返回友好提示）。 */}
+    <WorkBuddyActivitiesPanel />
+    <WorkBuddyPoolPanel />
     <CloudCheckinPanel />
     <WorkBuddyAddAccountDialog open={dialogOpen} onClose={() => setDialogOpen(false)} />
     <WorkBuddySettingsDialog open={settingsOpen} onClose={() => setSettingsOpen(false)} onSaved={refreshInstallation} />

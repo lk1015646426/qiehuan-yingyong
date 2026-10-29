@@ -6,7 +6,7 @@
 // - 积分区带 已用/总量 进度条
 // - 当前活跃账号（后台会话监测 accountId）高亮描边 + 角标
 // - 云端签到：可折叠任务区（运行记录 + 触发验证）已抽为共享组件
-//   CloudCheckinPanel，WorkBuddy / 智谱页复用同一签到仓库的面板
+//   CloudCheckinPanel，WorkBuddy 页复用同一签到仓库的面板
 
 import { useEffect, useState } from 'react';
 import { listen } from '@tauri-apps/api/event';
@@ -42,7 +42,7 @@ function renderInstallationStatus(
   error: string | null,
 ): { tone: string; line: string; detail?: string } {
   if (loading) {
-    return { tone: '', line: '客户端检测：正在检测 TRAE Work CN 安装…' };
+    return { tone: '', line: '客户端检测：正在检测 TRAE 安装…' };
   }
   if (error) {
     return {
@@ -58,7 +58,7 @@ function renderInstallationStatus(
       : undefined;
     return {
       tone: 'wc-status--error',
-      line: '未检测到 TRAE Work CN，请在设置中选择 EXE 路径',
+      line: '未检测到 TRAE，请先打开官方客户端后重新检测，或在设置中选择 EXE 路径',
       detail,
     };
   }
@@ -67,7 +67,7 @@ function renderInstallationStatus(
   const legacyNote = installation.legacyPath ? '（兼容旧数据目录）' : '';
   return {
     tone: 'wc-status--ok',
-    line: `已检测到 TRAE Work CN${versionText}`,
+    line: `已检测到 ${installation.displayName ?? 'TRAE'}${versionText}`,
     detail: [installation.executablePath, dataDirText ? `数据目录：${dataDirText}${legacyNote}` : '']
       .filter(Boolean)
       .join('\n'),
@@ -524,7 +524,7 @@ export function WorkCnSwitcherPage() {
       <header className="wc-header">
         <h1 className="wc-title">
           <img className="wc-title-icon" src={traeCnIcon} alt="TRAE" />
-          切换应用 · TRAE Work CN
+          切换应用 · TRAE
         </h1>
         <div className="wc-header-actions">
           <button
@@ -532,7 +532,7 @@ export function WorkCnSwitcherPage() {
             className="wc-btn wc-btn-primary"
             onClick={() => setDialogOpen(true)}
             disabled={!installation?.installed}
-            title={installation?.installed ? '' : '请先安装并登录 TRAE Work CN'}
+            title={installation?.installed ? '' : '请先安装并登录 TRAE'}
           >
             导入当前账号
           </button>

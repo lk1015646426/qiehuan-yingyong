@@ -11,6 +11,7 @@ import {
   syncWorkBuddyGitHub,
   triggerWorkBuddyCheckin,
   getWorkBuddyAccountStatus,
+  recoverWorkBuddyAuth,
   updateWorkBuddyAccount,
   WORKBUDDY_INSTALLATION_RUNNING_EVENT,
   WORKBUDDY_SWITCH_PROGRESS_EVENT,
@@ -47,7 +48,8 @@ interface WorkBuddyState {
   sessionWatchStatus: WorkBuddySessionWatchStatus | null;
   error: string | null;
   notice: string | null;
-  loadAccounts: () => Promise<void>;
+  loadAccounts: (refreshStatuses?: boolean) => Promise<void>;
+  recoverCredentials: (accountId: string) => Promise<void>;
   ensureAccountsLoaded: () => Promise<void>;
   refreshInstallation: () => Promise<void>;
   ensureInstallationLoaded: () => Promise<void>;
@@ -65,21 +67,50 @@ interface WorkBuddyState {
   subscribeToBackgroundEvents: () => Promise<() => void>;
 }
 
+let accountsRequest = 0;
+const statusGeneration: Record<string, number> = {};
+function invalidateStatus(id: string) { statusGeneration[id] = (statusGeneration[id] ?? 0) + 1; }
+
 export const useWorkBuddyStore = create<WorkBuddyState>((set, get) => ({
   accounts: [], accountsLoaded: false, installation: null, installationLoaded: false,
   installationLoading: false, monitorStarted: false, loading: false, importing: false,
   switchingId: null, switchStage: null, updatingId: null, deletingId: null,
   syncing: false, checkingInId: null, statusById: {}, statusLoadingById: {}, sessionWatchStatus: null, error: null, notice: null,
 
-  async loadAccounts() {
+  async loadAccounts(refreshStatuses = true) {
+    const generation = ++accountsRequest;
     set({ loading: true });
     try {
       const accounts = await listWorkBuddyAccounts();
-      set({ accounts, accountsLoaded: true, error: null, loading: false });
-      await get().refreshAllStatuses();
-    } catch (error) {
-      set({ error: messageOf(error), loading: false });
-    }
+      if (generation !== accountsRequest) return;
+      const previous = get().accounts;
+      const statusById = { ...get().statusById };
+      const statusLoadingById = { ...get().statusLoadingById };
+      for (const account of accounts) {
+        const old = previous.find(value => value.id === account.id);
+        if (!old || old.credentialRevision !== account.credentialRevision) {
+          invalidateStatus(account.id); delete statusById[account.id]; statusLoadingById[account.id] = false;
+        }
+      }
+      for (const account of previous) if (!accounts.some(value => value.id === account.id)) {
+        invalidateStatus(account.id); delete statusById[account.id]; delete statusLoadingById[account.id];
+      }
+      set({ accounts, accountsLoaded: true, statusById, statusLoadingById, error: null, loading: false });
+      if (refreshStatuses) await get().refreshAllStatuses();
+    } catch (error) { if (generation === accountsRequest) set({ error: messageOf(error), loading: false }); }
+  },
+  async recoverCredentials(accountId) {
+    if (get().updatingId !== null || get().switchingId !== null) return;
+    set({ updatingId: accountId, error: null, notice: '正在恢复所选账号的认证，不会批量刷新其他账号…' });
+    try {
+      await recoverWorkBuddyAuth(accountId);
+      invalidateStatus(accountId);
+      set(state => ({ statusLoadingById: { ...state.statusLoadingById, [accountId]: false } }));
+      await get().loadAccounts(false);
+      await get().refreshAccountStatus(accountId);
+      set({ notice: '认证恢复已完成，请以最新余额查询结果为准。' });
+    } catch (error) { set({ error: messageOf(error) }); }
+    finally { set({ updatingId: null }); }
   },
   async ensureAccountsLoaded() {
     const state = get();
@@ -116,6 +147,8 @@ export const useWorkBuddyStore = create<WorkBuddyState>((set, get) => ({
     set({ importing: true, error: null });
     try {
       await importCurrentWorkBuddyAccount(displayName);
+      for (const account of get().accounts) invalidateStatus(account.id);
+      set({ statusLoadingById: {} });
       await get().loadAccounts();
       set({ importing: false, notice: '已导入当前 WorkBuddy 账号' });
       void get().refreshInstallation();
@@ -159,6 +192,7 @@ export const useWorkBuddyStore = create<WorkBuddyState>((set, get) => ({
     set({ deletingId: accountId, error: null });
     try {
       const cleanupPending = await deleteWorkBuddyAccount(accountId);
+      invalidateStatus(accountId);
       set((state) => ({
         accounts: state.accounts.filter((item) => item.id !== accountId),
         deletingId: null,
@@ -217,14 +251,17 @@ export const useWorkBuddyStore = create<WorkBuddyState>((set, get) => ({
   },
   async refreshAccountStatus(accountId) {
     if (get().statusLoadingById[accountId]) return;
+    const generation = statusGeneration[accountId] ?? 0;
     set((state) => ({ statusLoadingById: { ...state.statusLoadingById, [accountId]: true } }));
     try {
       const status = await getWorkBuddyAccountStatus(accountId);
+      if (generation !== (statusGeneration[accountId] ?? 0) || !get().accounts.some(a => a.id === accountId)) return;
       set((state) => ({
         statusById: { ...state.statusById, [accountId]: status },
         statusLoadingById: { ...state.statusLoadingById, [accountId]: false },
       }));
     } catch (error) {
+      if (generation !== (statusGeneration[accountId] ?? 0)) return;
       set((state) => ({
         statusById: { ...state.statusById, [accountId]: {
           credits: null, todayReward: null, streakDays: null, updatedAt: Math.floor(Date.now() / 1000),
@@ -245,7 +282,9 @@ export const useWorkBuddyStore = create<WorkBuddyState>((set, get) => ({
   async subscribeToBackgroundEvents() {
     const unlisten = await listen<WorkBuddySessionWatchStatus>(WORKBUDDY_SESSION_WATCH_EVENT, (event) => {
       set({ sessionWatchStatus: event.payload });
-      void get().loadAccounts();
+      if (event.payload.outcome === 'TOKEN_UPDATED' || event.payload.outcome === 'SNAPSHOT_UPDATED' || event.payload.githubSynced || event.payload.githubError) {
+        void get().loadAccounts(false);
+      }
     });
     return unlisten;
   },

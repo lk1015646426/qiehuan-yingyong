@@ -31,6 +31,7 @@ export interface WorkBuddyAccountView {
   maskedPhone: string | null;
   checkinEnabled: boolean;
   tokenExpiresAt: number | null;
+  credentialRevision?: string;
   createdAt: number;
   updatedAt: number;
   lastUsedAt: number | null;

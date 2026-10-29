@@ -27,6 +27,8 @@ export function githubSyncPresentation(
 // 网络/超时类刷新失败不在此列，不应标记凭证失效。
 const CREDENTIAL_INVALID_MARKERS = [
   '认证已失效',
+  '登录凭证被拒绝',
+  '认证被拒绝',
   'refresh token 已失效',
   '缺少 refresh token',
   'refresh token 无效',
@@ -42,7 +44,7 @@ export function credentialInvalidated(
   return CREDENTIAL_INVALID_MARKERS.some((marker) => haystack.includes(marker));
 }
 
-// Token 剩余天数预警（TRAE / WorkBuddy / 智谱 三页共用）。
+// Token 剩余天数预警（TRAE / WorkBuddy 两页共用）。
 // 阈值与云端 auto 刷新逻辑对齐：客户端剩 1/3 寿命时刷新；
 // 剩余 ≤5 天预警、≤1 天（含已过期）危险。expiresAt 为秒级时间戳。
 export type TokenTone = 'ok' | 'warn' | 'danger' | 'unknown';

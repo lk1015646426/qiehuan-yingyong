@@ -299,6 +299,10 @@ pub fn sync_workbuddy_accounts_with(runner: &dyn GitHubRunner) -> Result<(), Str
         mark_sync_state(&account_ids, "pending", None);
         return Err(message);
     }
+    let expected_revisions = accounts
+        .iter()
+        .map(|a| (a.id.clone(), a.credential_revision.clone()))
+        .collect();
     let enabled_accounts = match accounts
         .into_iter()
         .filter(|account| account.checkin_enabled)
@@ -314,7 +318,15 @@ pub fn sync_workbuddy_accounts_with(runner: &dyn GitHubRunner) -> Result<(), Str
             return Err(error);
         }
     };
-    let payload = match build_aggregate_secret(enabled_accounts) {
+
+    let payload = match build_aggregate_secret(enabled_accounts).and_then(|raw| {
+        let settings = crate::modules::workbuddy_activities::load_settings()?;
+        let mut value: serde_json::Value =
+            serde_json::from_str(&raw).map_err(|_| "WorkBuddy 聚合配置结构无效".to_string())?;
+        value["activities"] =
+            serde_json::to_value(settings).map_err(|_| "活动配置序列化失败".to_string())?;
+        serde_json::to_string(&value).map_err(|_| "活动聚合配置序列化失败".to_string())
+    }) {
         Ok(payload) => payload,
         Err(error) => {
             mark_sync_state(&account_ids, "failed", Some(&error));
@@ -324,8 +336,14 @@ pub fn sync_workbuddy_accounts_with(runner: &dyn GitHubRunner) -> Result<(), Str
     match set_aggregate_secret(runner, config.repository.trim(), &payload) {
         Ok(()) => {
             if dataset_generation() == observed_generation {
-                mark_sync_state(&account_ids, "synced", None);
-                clear_cleanup_if_generation(observed_generation)?;
+                if crate::modules::workbuddy_account::mark_github_sync_if_revisions_match(
+                    &account_ids,
+                    &expected_revisions,
+                    "synced",
+                    None,
+                )? {
+                    clear_cleanup_if_generation(observed_generation)?;
+                }
             }
             Ok(())
         }
@@ -666,6 +684,7 @@ mod tests {
             masked_phone: None,
             checkin_enabled: true,
             token_expires_at: None,
+            credential_revision: String::new(),
             created_at: 0,
             updated_at: 0,
             last_used_at: None,
@@ -812,10 +831,12 @@ mod tests {
         assert!(!github_cleanup_pending());
         let calls = runner.recorded_calls();
         assert_eq!(calls.len(), 2, "auth status + secret set");
-        assert_eq!(
-            calls[1].stdin.as_deref(),
-            Some(r#"{"version":1,"accounts":[]}"#)
-        );
+        let payload: serde_json::Value =
+            serde_json::from_str(calls[1].stdin.as_deref().unwrap()).unwrap();
+        assert_eq!(payload["version"], 1);
+        assert_eq!(payload["accounts"], serde_json::json!([]));
+        assert_eq!(payload["activities"]["enabled"], false);
+        assert_eq!(payload["activities"]["expiryDays"], 7);
 
         std::env::remove_var("COCKPIT_TOOLS_TEST_DATA_DIR");
         let _ = fs::remove_dir_all(dir);

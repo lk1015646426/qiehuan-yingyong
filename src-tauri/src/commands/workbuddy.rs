@@ -111,6 +111,20 @@ pub async fn get_workbuddy_account_status(
     workbuddy_status::query_account_status(&account_id).await
 }
 
+/// Explicit credential recovery; balance reads never invoke this command.
+#[tauri::command]
+pub async fn recover_workbuddy_auth(account_id: String) -> Result<WorkBuddyAccountView, String> {
+    workbuddy_account::refresh_account_auth(&account_id).await?;
+    tauri::async_runtime::spawn_blocking(move || {
+        workbuddy_account::list_workbuddy_accounts()?
+            .into_iter()
+            .find(|a| a.id == account_id)
+            .ok_or_else(|| "账号已不存在".to_string())
+    })
+    .await
+    .map_err(|_| "认证恢复结果读取失败".to_string())?
+}
+
 #[tauri::command]
 pub async fn update_workbuddy_account(
     account_id: String,
@@ -163,22 +177,17 @@ pub async fn switch_workbuddy_account(
             },
         );
     };
-    // 目标账号可能已在 WorkBuddy 后台轮换过 access token；需先用 refresh token
-    // 获取最新快照，避免把旧凭证重新写回官方客户端。token 刷新（网络请求）
-    // 与客户端关闭（本地进程操作）互不依赖，因此并行执行：刷新任务在
-    // tauri 运行时上启动，结果经 channel 在关闭完成后汇合（见 blocking 内 recv）。
-    let (refresh_tx, refresh_rx) = std::sync::mpsc::channel::<Result<String, String>>();
-    let refresh_account_id = account_id.clone();
-    tauri::async_runtime::spawn(async move {
-        let result = workbuddy_account::refresh_account_auth(&refresh_account_id).await;
-        let _ = refresh_tx.send(result);
-    });
     tauri::async_runtime::spawn_blocking(move || {
-        switch_workbuddy_account_blocking(&account_id, refresh_rx, on_progress)
+        switch_workbuddy_account_blocking(&account_id, on_progress)
     })
     .await
     .map_err(|error| format!("切换 WorkBuddy 账号任务失败: {error}"))?
     .map_err(|error| {
+        crate::modules::logger::log_warn(&format!(
+            "[WorkBuddy Switch] failed code={:?} error={}",
+            error.code,
+            crate::modules::work_cn_github::redact_for_log(&error.message)
+        ));
         // 认证刷新失败沿用纯文本错误（前端直接展示），
         // 其余错误保持 JSON 结构由前端解析 code/message/detail。
         if error.code == WorkBuddyErrorCode::AuthRefreshFailed {
@@ -200,185 +209,220 @@ struct WorkBuddySwitchProgress {
     stage: String,
 }
 
-fn switch_workbuddy_account_blocking(
-    account_id: &str,
-    refresh_rx: std::sync::mpsc::Receiver<Result<String, String>>,
-    on_progress: impl Fn(&str),
-) -> Result<WorkBuddySwitchResult, WorkBuddyCommandError> {
-    let _switch_guard = try_lock_workbuddy_switch()?;
-    let transaction_id = uuid::Uuid::new_v4().to_string();
-
-    on_progress("validating");
-    let snapshot = workbuddy_account::snapshot_json(account_id).map_err(|_| {
-        WorkBuddyCommandError::new(
-            WorkBuddyErrorCode::AccountNotFound,
-            "找不到目标 WorkBuddy 账号",
-        )
-    })?;
-    let expected_uid = workbuddy_account::snapshot_uid(&snapshot).map_err(|_| {
-        WorkBuddyCommandError::new(WorkBuddyErrorCode::SnapshotIncomplete, "目标账号快照不完整")
-    })?;
-
-    // 启动路径先行校验，避免关闭旧实例后才发现无法启动新实例。
-    process::resolve_workbuddy_launch_path().map_err(|error| {
-        WorkBuddyCommandError::new(
-            WorkBuddyErrorCode::ClientNotInstalled,
-            "未找到 WorkBuddy 安装路径",
-        )
-        .with_detail(error)
-    })?;
-
-    let user_data_dir = process::get_default_workbuddy_user_data_dir().map_err(|error| {
-        WorkBuddyCommandError::new(WorkBuddyErrorCode::ClientCloseFailed, error)
-    })?;
-    let user_data_dir = user_data_dir.to_string_lossy().to_string();
-    let auth_path = workbuddy_account::default_auth_file_path().map_err(|error| {
-        WorkBuddyCommandError::new(
-            WorkBuddyErrorCode::InjectFailed,
-            "无法定位 WorkBuddy 认证文件",
-        )
-        .with_detail(error)
-    })?;
-    let previous_auth_exists = auth_path.exists();
-    let previous_auth = match std::fs::read(&auth_path) {
-        Ok(bytes) => Some(bytes),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-        Err(error) => {
-            return Err(WorkBuddyCommandError::new(
-                WorkBuddyErrorCode::InjectFailed,
-                "读取 WorkBuddy 原认证文件失败，未执行切换",
-            )
-            .with_detail(error.to_string()));
-        }
-    };
-    log_workbuddy_auth_checkpoint(&transaction_id, "before_close", &auth_path);
-    // 切换前客户端是否在运行：刷新失败回滚时用于决定是否把客户端拉回原账号。
-    // 探测失败按"在运行"处理（宁可多一次无害的重启，也不把用户留在关闭状态）。
-    #[cfg(target_os = "windows")]
-    let was_running = process::collect_workbuddy_process_entries_checked()
-        .map(|entries| !entries.is_empty())
-        .unwrap_or(true);
-    #[cfg(not(target_os = "windows"))]
-    let was_running = !process::collect_workbuddy_process_entries().is_empty();
-    let close_started = std::time::Instant::now();
-    on_progress("closing");
-    process::close_workbuddy_instances(std::slice::from_ref(&user_data_dir), 20).map_err(
-        |error| {
-            WorkBuddyCommandError::new(
-                WorkBuddyErrorCode::ClientCloseFailed,
-                "WorkBuddy 旧实例未能关闭，未修改认证文件",
-            )
-            .with_detail(error)
-        },
-    )?;
-    crate::modules::logger::log_info(&format!(
-        "[WorkBuddy Switch] close finished elapsed_ms={}",
-        close_started.elapsed().as_millis()
-    ));
-
-    // 客户端退出期间可能完成最后一次 token 刷新并写回认证文件。此处必须在
-    // 关闭成功后马上保存当前托管账号的新快照，避免下次切回时回写旧 token。
-    let snapshot_started = std::time::Instant::now();
-    if let Err(error) = workbuddy_account::refresh_current_managed_snapshot() {
-        restore_previous_workbuddy_auth(&auth_path, previous_auth.as_deref(), previous_auth_exists);
-        return Err(WorkBuddyCommandError::new(
-            WorkBuddyErrorCode::InjectFailed,
-            "读取当前 WorkBuddy 登录状态失败，未执行切换",
-        )
-        .with_detail(error));
-    }
-    log_workbuddy_auth_checkpoint(&transaction_id, "after_close_refresh", &auth_path);
-    crate::modules::logger::log_info(&format!(
-        "[WorkBuddy Switch] current snapshot refreshed elapsed_ms={}",
-        snapshot_started.elapsed().as_millis()
-    ));
-
-    // 汇合点：客户端已关闭且当前账号快照已保存，等待并行执行的目标账号
-    // token 刷新结果。刷新失败则回滚认证文件；切换前客户端在运行的话，
-    // 尽力把它拉回原账号，避免用户停在"客户端被关闭"的状态。
-    on_progress("refreshing");
-    let refresh_result = refresh_rx.recv().map_err(|_| {
-        WorkBuddyCommandError::new(
-            WorkBuddyErrorCode::AuthRefreshFailed,
-            "目标 WorkBuddy 账号认证刷新任务异常退出，请重试",
-        )
-    })?;
-    if let Err(error) = refresh_result {
-        restore_previous_workbuddy_auth(&auth_path, previous_auth.as_deref(), previous_auth_exists);
-        if was_running {
-            if let Err(restart_error) =
-                process::start_workbuddy_default_with_args_with_new_window(&[], true)
-            {
-                crate::modules::logger::log_warn(&format!(
-                    "[WorkBuddy] 刷新失败回滚后重启原客户端失败: {restart_error}"
-                ));
+struct ClientAuthRecovery {
+    path: std::path::PathBuf,
+    auth: Option<Vec<u8>>,
+    marker: Option<Vec<u8>>,
+    written: Option<[u8; 32]>,
+}
+impl ClientAuthRecovery {
+    fn capture(path: &Path) -> Result<Self, String> {
+        fn read(path: &Path) -> Result<Option<Vec<u8>>, String> {
+            match std::fs::read(path) {
+                Ok(v) => Ok(Some(v)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e.to_string()),
             }
         }
-        let message = if crate::modules::workbuddy_account::refresh_error_requires_login(&error) {
-            format!("目标 WorkBuddy 账号的 refresh token 已失效，请重新登录后再导入：{error}")
-        } else {
-            format!("目标 WorkBuddy 账号认证刷新失败，请稍后重试：{error}")
-        };
-        return Err(WorkBuddyCommandError::new(
-            WorkBuddyErrorCode::AuthRefreshFailed,
-            message,
-        ));
+        Ok(Self {
+            path: path.to_owned(),
+            auth: read(path)?,
+            marker: read(&std::path::PathBuf::from(format!(
+                "{}.logged-out",
+                path.to_string_lossy()
+            )))?,
+            written: None,
+        })
     }
-    log_workbuddy_auth_checkpoint(&transaction_id, "after_target_refresh", &auth_path);
-
-    on_progress("injecting");
-    if let Err(error) = workbuddy_account::write_account_to_default_client(account_id) {
-        restore_previous_workbuddy_auth(&auth_path, previous_auth.as_deref(), previous_auth_exists);
-        return Err(WorkBuddyCommandError::new(
-            WorkBuddyErrorCode::InjectFailed,
-            "写入 WorkBuddy 目标账号失败",
-        )
-        .with_detail(error));
+    fn hash(&self) -> Option<[u8; 32]> {
+        use sha2::{Digest, Sha256};
+        self.auth.as_ref().map(|v| Sha256::digest(v).into())
     }
-    log_workbuddy_auth_checkpoint(&transaction_id, "after_target_write", &auth_path);
+    fn restore(&self) -> Result<(), String> {
+        if let Some(written) = self.written {
+            if !crate::modules::atomic_write::replace_bytes_if_unchanged(
+                &self.path,
+                Some(written),
+                self.auth.as_deref(),
+            )? {
+                return Err("回滚期间登录状态又已变化，已保留新状态".into());
+            }
+            let marker =
+                std::path::PathBuf::from(format!("{}.logged-out", self.path.to_string_lossy()));
+            if !crate::modules::atomic_write::replace_bytes_if_unchanged(
+                &marker,
+                None,
+                self.marker.as_deref(),
+            )? {
+                return Err("登出标记已有新变化，未覆盖".into());
+            }
+        }
+        Ok(())
+    }
+}
 
-    on_progress("launching");
-    let pid = match process::start_workbuddy_default_with_args_with_new_window(&[], true) {
-        Ok(pid) => pid,
-        Err(error) => {
-            restore_previous_workbuddy_auth(
-                &auth_path,
-                previous_auth.as_deref(),
-                previous_auth_exists,
-            );
+fn reopen_previous_if_needed(was_running: bool) -> Result<(), String> {
+    if !was_running {
+        return Ok(());
+    }
+    #[cfg(windows)]
+    if !process::collect_workbuddy_process_entries_checked()?.is_empty() {
+        return Ok(());
+    }
+    #[cfg(not(windows))]
+    if !process::collect_workbuddy_process_entries().is_empty() {
+        return Ok(());
+    }
+    process::start_workbuddy_default_with_args_with_new_window(&[], true).map(|_| ())
+}
+
+fn switch_workbuddy_account_blocking(
+    account_id: &str,
+    on_progress: impl Fn(&str),
+) -> Result<WorkBuddySwitchResult, WorkBuddyCommandError> {
+    let _switch = try_lock_workbuddy_switch()?;
+    let _auth = workbuddy_account::try_begin_auth_transaction()
+        .map_err(|e| WorkBuddyCommandError::new(WorkBuddyErrorCode::Busy, e))?;
+    let tx = uuid::Uuid::new_v4().to_string();
+    let on_progress = |stage: &str| {
+        crate::modules::logger::log_info(&format!("[WorkBuddy Switch] tx={tx} stage={stage}"));
+        on_progress(stage);
+    };
+    on_progress("validating");
+    let initial = workbuddy_account::snapshot_json(account_id)
+        .map_err(|e| WorkBuddyCommandError::new(WorkBuddyErrorCode::AccountNotFound, e))?;
+    let expected_uid = workbuddy_account::snapshot_uid(&initial)
+        .map_err(|e| WorkBuddyCommandError::new(WorkBuddyErrorCode::SnapshotIncomplete, e))?;
+    process::resolve_workbuddy_launch_path()
+        .map_err(|e| WorkBuddyCommandError::new(WorkBuddyErrorCode::ClientNotInstalled, e))?;
+    crate::modules::workbuddy_auth_crypto::prepare()
+        .map_err(|e| WorkBuddyCommandError::new(WorkBuddyErrorCode::InjectFailed, e))?;
+    let auth_path = workbuddy_account::default_auth_file_path()
+        .map_err(|e| WorkBuddyCommandError::new(WorkBuddyErrorCode::InjectFailed, e))?;
+    let data_dir = process::get_default_workbuddy_user_data_dir()
+        .map_err(|e| WorkBuddyCommandError::new(WorkBuddyErrorCode::ClientCloseFailed, e))?;
+    #[cfg(windows)]
+    let was_running = !process::collect_workbuddy_process_entries_checked()
+        .map_err(|e| WorkBuddyCommandError::new(WorkBuddyErrorCode::ClientCloseFailed, e))?
+        .is_empty();
+    #[cfg(not(windows))]
+    let was_running = !process::collect_workbuddy_process_entries().is_empty();
+    on_progress("closing");
+    process::close_workbuddy_instances(&[data_dir.to_string_lossy().into_owned()], 20)
+        .map_err(|e| WorkBuddyCommandError::new(WorkBuddyErrorCode::ClientCloseFailed, e))?;
+    // Last stable official state, not the pre-close state, is the recovery point.
+    let current = workbuddy_account::refresh_current_managed_snapshot_in_transaction();
+    let mut recovery = match ClientAuthRecovery::capture(&auth_path) {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = reopen_previous_if_needed(was_running);
             return Err(WorkBuddyCommandError::new(
-                WorkBuddyErrorCode::LaunchFailed,
-                "启动 WorkBuddy 失败",
-            )
-            .with_detail(error));
+                WorkBuddyErrorCode::InjectFailed,
+                e,
+            ));
         }
     };
-    spawn_workbuddy_post_launch_auth_checks(transaction_id.clone(), auth_path.clone());
-    if let Err(error) = workbuddy_account::mark_last_used(account_id) {
-        crate::modules::logger::log_warn(&format!(
-            "[WorkBuddy] 客户端已启动，但记录当前账号失败: account_id={}, error={}",
-            account_id, error
-        ));
+    let expected_auth_file = recovery.hash();
+    let mut current_refreshed = false;
+    let mut current_recovery_ready = false;
+    let current_id = current
+        .as_ref()
+        .ok()
+        .and_then(|v| v.as_ref())
+        .map(|v| v.id.clone());
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+        || -> Result<WorkBuddySwitchResult, WorkBuddyCommandError> {
+            current.map_err(|e| WorkBuddyCommandError::new(WorkBuddyErrorCode::InjectFailed, e))?;
+            on_progress("refreshing");
+            tauri::async_runtime::block_on(workbuddy_account::refresh_account_auth_in_transaction(
+                account_id,
+            ))
+            .map_err(|e| WorkBuddyCommandError::new(WorkBuddyErrorCode::AuthRefreshFailed, e))?;
+            if current_id.as_deref() == Some(account_id) {
+                current_refreshed = true;
+                let raw = workbuddy_account::snapshot_json(account_id)
+                    .map_err(|e| WorkBuddyCommandError::new(WorkBuddyErrorCode::InjectFailed, e))?;
+                let snapshot = serde_json::from_str(&raw).map_err(|_| {
+                    WorkBuddyCommandError::new(
+                        WorkBuddyErrorCode::SnapshotIncomplete,
+                        "恢复快照格式无效",
+                    )
+                })?;
+                // The prior token may have been rotated by this transaction; recovery must use the new one.
+                recovery.auth = Some(
+                    workbuddy_account::encoded_snapshot_for_client(&snapshot).map_err(|e| {
+                        WorkBuddyCommandError::new(WorkBuddyErrorCode::InjectFailed, e)
+                    })?,
+                );
+                current_recovery_ready = true;
+            }
+            on_progress("injecting");
+            // The official process must still be closed before a credential replacement.
+            #[cfg(windows)]
+            if !process::collect_workbuddy_process_entries_checked()
+                .map_err(|e| WorkBuddyCommandError::new(WorkBuddyErrorCode::ClientCloseFailed, e))?
+                .is_empty()
+            {
+                return Err(WorkBuddyCommandError::new(
+                    WorkBuddyErrorCode::ClientCloseFailed,
+                    "WorkBuddy 已被重新打开，已取消覆盖登录文件",
+                ));
+            }
+            recovery.written = Some(
+                workbuddy_account::write_account_to_default_client_checked(
+                    account_id,
+                    expected_auth_file,
+                    recovery.auth.as_deref(),
+                )
+                .map_err(|e| WorkBuddyCommandError::new(WorkBuddyErrorCode::InjectFailed, e))?,
+            );
+            on_progress("launching");
+            let pid = process::start_workbuddy_default_with_args_with_new_window(&[], true)
+                .map_err(|e| WorkBuddyCommandError::new(WorkBuddyErrorCode::LaunchFailed, e))?;
+            log_workbuddy_auth_checkpoint(&tx, "after_target_write", &auth_path);
+            spawn_workbuddy_post_launch_auth_checks(tx.clone(), auth_path.clone());
+            let _ = workbuddy_account::mark_last_used(account_id);
+            queue_workbuddy_github_sync("switch");
+            on_progress("syncing");
+            let _ = process::activate_workbuddy_window_for_pid(pid);
+            Ok(WorkBuddySwitchResult {
+                transaction_id: tx.clone(),
+                account_id: account_id.into(),
+                verified_uid: expected_uid,
+                forced_close: false,
+                github_sync_pending: true,
+            })
+        },
+    ))
+    .unwrap_or_else(|_| {
+        Err(WorkBuddyCommandError::new(
+            WorkBuddyErrorCode::InjectFailed,
+            "切换任务异常中断，正在恢复",
+        ))
+    });
+    match result {
+        Ok(value) => {
+            crate::modules::logger::log_info(&format!("[WorkBuddy Switch] tx={tx} completed"));
+            Ok(value)
+        }
+        Err(mut error) => {
+            error.transaction_id = Some(tx.clone());
+            if current_refreshed && !current_recovery_ready {
+                error.message=format!("{}；新凭证已保存在托管账号中，但无法准备客户端恢复文件，未自动重启旧会话。请重试写回",error.message);
+                return Err(error);
+            }
+            match recovery.restore() {
+                Ok(()) => {
+                    if let Err(e) = reopen_previous_if_needed(was_running) {
+                        error.message =
+                            format!("{}；原登录文件已保留，但重新打开失败：{}", error.message, e);
+                    }
+                }
+                Err(e) => error.message = format!("{}；恢复未完成：{}", error.message, e),
+            }
+            Err(error)
+        }
     }
-    queue_workbuddy_github_sync("switch");
-    on_progress("syncing");
-    if let Err(error) = process::activate_workbuddy_window_for_pid(pid) {
-        // 进程和认证状态已经成功切换；窗口激活失败不应再向前端报告“切换失败”，
-        // 否则用户会误以为旧账号仍在使用。记录警告后交由用户手动切到已启动窗口。
-        crate::modules::logger::log_warn(&format!(
-            "[WorkBuddy] 账号已切换并启动，但窗口激活失败: pid={}, error={}",
-            pid, error
-        ));
-    }
-    let github_sync_pending = true;
-
-    Ok(WorkBuddySwitchResult {
-        transaction_id,
-        account_id: account_id.to_string(),
-        verified_uid: expected_uid,
-        forced_close: false,
-        github_sync_pending,
-    })
 }
 
 fn log_workbuddy_auth_checkpoint(transaction_id: &str, stage: &str, auth_path: &Path) {
@@ -409,21 +453,6 @@ fn spawn_workbuddy_post_launch_auth_checks(transaction_id: String, auth_path: st
         });
 }
 
-fn restore_previous_workbuddy_auth(path: &Path, previous: Option<&[u8]>, existed: bool) {
-    let result = if let Some(previous) = previous {
-        crate::modules::atomic_write::write_bytes_atomic(path, previous)
-    } else if !existed {
-        crate::modules::atomic_write::remove_file_locked(path).map(|_| ())
-    } else {
-        Ok(())
-    };
-    if let Err(error) = result {
-        crate::modules::logger::log_warn(&format!(
-            "[WorkBuddy] 切换失败后恢复认证文件失败: {error}"
-        ));
-    }
-}
-
 #[tauri::command]
 pub async fn sync_workbuddy_github() -> Result<(), String> {
     workbuddy_github::sync_background_now("manual sync").await
@@ -451,33 +480,24 @@ mod tests {
     }
 
     #[test]
-    fn target_auth_write_failure_branch_restores_previous_auth() {
-        let source = include_str!("workbuddy.rs");
-        let write_branch = source
-            .split("workbuddy_account::write_account_to_default_client(account_id)")
-            .nth(1)
-            .expect("目标认证写入分支应存在");
-        let before_launch = write_branch
-            .split("start_workbuddy_default_with_args_with_new_window")
-            .next()
-            .expect("写入失败分支应位于启动前");
-
-        assert!(before_launch.contains("restore_previous_workbuddy_auth"));
-    }
-
-    #[test]
-    fn window_activation_failure_does_not_report_switch_failure_after_launch() {
-        let source = include_str!("workbuddy.rs");
-        let activation_branch = source
-            .split("process::activate_workbuddy_window_for_pid(pid)")
-            .nth(1)
-            .expect("窗口激活分支应存在");
-        let branch_body = activation_branch
-            .split("let github_sync_pending")
-            .next()
-            .expect("窗口激活分支应在结果构造前结束");
-
-        assert!(!branch_body.contains("return Err"));
-        assert!(branch_body.contains("log_warn"));
+    fn recovery_restores_marker_and_latest_auth_without_overwriting_external_change() {
+        use sha2::{Digest, Sha256};
+        let dir = std::env::temp_dir().join(format!("workbuddy-recovery-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("auth.json");
+        let marker = dir.join("auth.json.logged-out");
+        std::fs::write(&path, b"after-close-final").unwrap();
+        std::fs::write(&marker, b"logout-marker").unwrap();
+        let mut recovery = super::ClientAuthRecovery::capture(&path).unwrap();
+        std::fs::write(&path, b"target").unwrap();
+        std::fs::remove_file(&marker).unwrap();
+        recovery.written = Some(Sha256::digest(b"target").into());
+        recovery.restore().unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"after-close-final");
+        assert_eq!(std::fs::read(&marker).unwrap(), b"logout-marker");
+        std::fs::write(&path, b"external-new-session").unwrap();
+        assert!(recovery.restore().is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"external-new-session");
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

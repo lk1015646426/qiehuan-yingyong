@@ -6,7 +6,6 @@ pub mod token;
 pub mod trae;
 pub mod work_cn;
 pub mod workbuddy;
-pub mod zhipu;
 
 pub use account::{Account, AccountIndex, AccountSummary, QuotaErrorInfo};
 pub use instance::{

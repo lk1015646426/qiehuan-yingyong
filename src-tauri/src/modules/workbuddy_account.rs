@@ -4,10 +4,10 @@ use reqwest::header::{HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::{LazyLock, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 
 const INDEX_FILE: &str = "workbuddy_accounts.json";
 const DETAILS_DIR: &str = "workbuddy_accounts";
@@ -16,6 +16,17 @@ const SNAPSHOT_KIND: &str = "workbuddy";
 static ACCOUNT_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static REFRESH_LOCK: LazyLock<tokio::sync::Mutex<()>> =
     LazyLock::new(|| tokio::sync::Mutex::new(()));
+static AUTH_FLOW: LazyLock<Arc<tokio::sync::Mutex<()>>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(())));
+static REFRESH_FAILURES: LazyLock<Mutex<HashMap<String, (i64, String)>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub(crate) fn try_begin_auth_transaction() -> Result<tokio::sync::OwnedMutexGuard<()>, String> {
+    AUTH_FLOW
+        .clone()
+        .try_lock_owned()
+        .map_err(|_| "正在处理 WorkBuddy 认证事务，请稍后重试".to_string())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkBuddyAccountRecord {
@@ -45,6 +56,8 @@ struct WorkBuddyAccountSummary {
     masked_phone: Option<String>,
     checkin_enabled: bool,
     token_expires_at: Option<i64>,
+    #[serde(default)]
+    credential_revision: String,
     created_at: i64,
     updated_at: i64,
     last_used_at: Option<i64>,
@@ -203,6 +216,7 @@ fn access_token_from_value(value: &Value) -> Option<String> {
     raw_access_token_from_value(value).and_then(|token| normalize_access_token(&token))
 }
 
+#[cfg(test)]
 fn merge_refreshed_auth(
     snapshot: &mut Value,
     access_token: &str,
@@ -336,6 +350,17 @@ fn uid_from_token(raw_token: &str) -> Option<String> {
 fn parse_snapshot_json(raw: &str) -> Result<ParsedSnapshot, String> {
     let value: Value = serde_json::from_str(raw)
         .map_err(|error| format!("WorkBuddy 认证文件 JSON 无效: {}", error))?;
+    // WorkBuddy 5.6+ 官方客户端把 auth/account 等敏感字段改为 $wbEncrypted
+    // 加密信封；解析前先解密成明文快照。本函数只在 blocking worker 上被
+    // 调用，prepare() 最多同步等待官方密钥 helper 约 5 秒，明文文件不受影响。
+    let value = if crate::modules::workbuddy_auth_crypto::contains_encrypted_wrapper(&value) {
+        crate::modules::workbuddy_auth_crypto::prepare()
+            .map_err(|error| format!("WorkBuddy 官方加密凭据解密失败: {error}"))?;
+        crate::modules::workbuddy_auth_crypto::decode_session(&value)
+            .map_err(|error| format!("WorkBuddy 官方加密凭据解密失败: {error}"))?
+    } else {
+        value
+    };
     let account = value.get("account");
     let auth = value.get("auth");
     let raw_token = raw_access_token_from_value(&value)
@@ -345,6 +370,9 @@ fn parse_snapshot_json(raw: &str) -> Result<ParsedSnapshot, String> {
         .or_else(|| object_string(auth, &["uid", "userId"]))
         .or_else(|| uid_from_token(&raw_token))
         .ok_or_else(|| "WorkBuddy 认证文件缺少账号 UID".to_string())?;
+    if let Some(subject)=uid_from_jwt(&normalize_access_token(&raw_token).unwrap_or_else(||raw_token.clone())) {
+        if subject!=uid{return Err("认证快照中的账号与凭证主体不一致，已停止导入".into());}
+    }
     let uin = object_string(account, &["uin"]).or_else(|| object_string(Some(&value), &["uin"]));
     let nickname = sanitized_display_name(
         object_string(account, &["nickname", "name", "label"])
@@ -407,9 +435,8 @@ pub(crate) fn detail_path(account_id: &str) -> Result<PathBuf, String> {
 /// 主因。这里以（索引文件 mtime + 明细目录文件名/mtime 清单）为指纹，
 /// 磁盘状态未变化时直接复用上次对账结果（list_workbuddy_accounts 与
 /// has_account_id 均受益）。
-static INDEX_RECONCILE_CACHE: LazyLock<
-    Mutex<Option<(IndexFingerprint, WorkBuddyAccountIndex)>>,
-> = LazyLock::new(|| Mutex::new(None));
+static INDEX_RECONCILE_CACHE: LazyLock<Mutex<Option<(IndexFingerprint, WorkBuddyAccountIndex)>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 #[derive(Clone, PartialEq, Eq)]
 struct IndexFingerprint {
@@ -478,14 +505,28 @@ fn save_index(index: &WorkBuddyAccountIndex) -> Result<(), String> {
 
 fn build_index_from_details() -> Result<WorkBuddyAccountIndex, String> {
     let directory = details_dir()?;
+    let mut failures = Vec::new();
     let records = crate::modules::account_index_repair::load_accounts_from_details(
         &directory,
         |account_id| {
-            valid_account_id(account_id)
-                .then(|| load_record_read_only(account_id).ok())
-                .flatten()
+            if !valid_account_id(account_id) {
+                return None;
+            }
+            match load_record_read_only(account_id) {
+                Ok(record) => Some(record),
+                Err(_) => {
+                    failures.push(account_id.to_string());
+                    None
+                }
+            }
         },
     )?;
+    if !failures.is_empty() {
+        return Err(format!(
+            "有 {} 个 WorkBuddy 账号暂时无法读取，已保留原索引；请检查原密钥和账号文件",
+            failures.len()
+        ));
+    }
     Ok(WorkBuddyAccountIndex {
         version: 1,
         accounts: records.iter().map(summary).collect(),
@@ -532,7 +573,7 @@ fn load_record(account_id: &str) -> Result<WorkBuddyAccountRecord, String> {
     let content = fs::read_to_string(&path)
         .map_err(|error| format!("读取 WorkBuddy 账号详情失败: {}", error))?;
     let (record, needs_rewrite) =
-        crate::modules::secure_account_storage::deserialize_account_file(&path, &content)?;
+        crate::modules::secure_account_storage::deserialize_account_file_read_only(&path, &content)?;
     if needs_rewrite {
         save_record(&record)?;
     }
@@ -544,7 +585,7 @@ fn load_record_read_only(account_id: &str) -> Result<WorkBuddyAccountRecord, Str
     let content = fs::read_to_string(&path)
         .map_err(|error| format!("读取 WorkBuddy 账号详情失败: {}", error))?;
     let (record, _) =
-        crate::modules::secure_account_storage::deserialize_account_file(&path, &content)?;
+        crate::modules::secure_account_storage::deserialize_account_file_read_only(&path, &content)?;
     Ok(record)
 }
 
@@ -556,7 +597,10 @@ fn summary(record: &WorkBuddyAccountRecord) -> WorkBuddyAccountSummary {
         display_name: record.display_name.clone(),
         masked_phone: record.masked_phone.clone(),
         checkin_enabled: record.checkin_enabled,
-        token_expires_at: record.token_expires_at,
+        token_expires_at: snapshot_access_token(&record.snapshot)
+            .and_then(|t| jwt_number(&t, "exp"))
+            .or(record.token_expires_at),
+        credential_revision: credential_revision(&record.snapshot),
         created_at: record.created_at,
         updated_at: record.updated_at,
         last_used_at: record.last_used_at,
@@ -582,6 +626,7 @@ fn view(value: &WorkBuddyAccountSummary) -> WorkBuddyAccountView {
         masked_phone: value.masked_phone.clone(),
         checkin_enabled: value.checkin_enabled,
         token_expires_at: value.token_expires_at,
+        credential_revision: value.credential_revision.clone(),
         created_at: value.created_at,
         updated_at: value.updated_at,
         last_used_at: value.last_used_at,
@@ -595,12 +640,25 @@ pub fn import_snapshot_json(
     raw: &str,
     display_name: Option<String>,
 ) -> Result<WorkBuddyAccountView, String> {
+    let _auth = try_begin_auth_transaction()?;
+    import_snapshot_json_in_transaction(raw, display_name)
+}
+
+pub(crate) fn import_snapshot_json_in_transaction(
+    raw: &str,
+    display_name: Option<String>,
+) -> Result<WorkBuddyAccountView, String> {
     let parsed = parse_snapshot_json(raw)?;
     let _guard = ACCOUNT_LOCK
         .lock()
         .map_err(|_| "WorkBuddy 账号锁已损坏".to_string())?;
     let mut index = load_index()?;
     let account_id = stable_account_id(&parsed.uid);
+    if let Ok(old) = load_record_read_only(&account_id) {
+        if incoming_snapshot_is_older(&old.snapshot, &parsed.value) {
+            return Ok(view(&summary(&old)));
+        }
+    }
     let now = chrono::Utc::now().timestamp();
     let existing = index
         .accounts
@@ -667,6 +725,9 @@ pub fn import_snapshot_json(
     }
     index.accounts.sort_by(|left, right| left.id.cmp(&right.id));
     save_index(&index)?;
+    if let Ok(mut failures) = REFRESH_FAILURES.lock() {
+        failures.remove(&account_id);
+    }
     Ok(view(&new_summary))
 }
 
@@ -712,11 +773,17 @@ pub fn import_current_workbuddy_account(
     import_snapshot_json(&read_stable_auth_file(&path)?, display_name)
 }
 
+pub(crate) fn current_managed_account_id_checked() -> Result<Option<String>, String> {
+    let path = default_auth_file_path()?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = read_stable_auth_file(&path)?;
+    let id = stable_account_id(&snapshot_uid(&raw)?);
+    Ok(has_account_id(&id)?.then_some(id))
+}
 pub fn current_managed_account_id() -> Option<String> {
-    let path = default_auth_file_path().ok()?;
-    let raw = read_stable_auth_file(&path).ok()?;
-    let account_id = stable_account_id(&snapshot_uid(&raw).ok()?);
-    has_account_id(&account_id).ok()?.then_some(account_id)
+    current_managed_account_id_checked().ok().flatten()
 }
 
 /// 在切换前立即吸收官方客户端刚写入的最新认证快照。
@@ -725,6 +792,12 @@ pub fn current_managed_account_id() -> Option<String> {
 /// access/refresh token。如果此时直接切换，旧快照会被重新写回客户端，
 /// 表现为刚登录不久却被要求重新登录。
 pub(crate) fn refresh_current_managed_snapshot() -> Result<Option<WorkBuddyAccountView>, String> {
+    let _auth = try_begin_auth_transaction()?;
+    refresh_current_managed_snapshot_in_transaction()
+}
+
+pub(crate) fn refresh_current_managed_snapshot_in_transaction(
+) -> Result<Option<WorkBuddyAccountView>, String> {
     let path = default_auth_file_path()?;
     if !path.is_file() {
         return Ok(None);
@@ -735,7 +808,7 @@ pub(crate) fn refresh_current_managed_snapshot() -> Result<Option<WorkBuddyAccou
     if !has_account_id(&account_id)? {
         return Ok(None);
     }
-    import_snapshot_json(&raw, None).map(Some)
+    import_snapshot_json_in_transaction(&raw, None).map(Some)
 }
 
 pub fn list_workbuddy_accounts() -> Result<Vec<WorkBuddyAccountView>, String> {
@@ -749,6 +822,7 @@ pub fn update_workbuddy_account(
     account_id: &str,
     update: WorkBuddyAccountUpdate,
 ) -> Result<WorkBuddyAccountView, String> {
+    let _auth = try_begin_auth_transaction()?;
     let _guard = ACCOUNT_LOCK
         .lock()
         .map_err(|_| "WorkBuddy 账号锁已损坏".to_string())?;
@@ -807,40 +881,71 @@ pub(crate) fn snapshot_json(account_id: &str) -> Result<String, String> {
 ///
 /// 认证文件是 WorkBuddy 启动时读取的共享状态，因此写入必须在客户端关闭后进行，
 /// 并在原子替换后重新读取校验，避免窗口启动后仍使用旧账号。
+
+pub(crate) fn encoded_snapshot_for_client(snapshot: &Value) -> Result<Vec<u8>, String> {
+    crate::modules::workbuddy_auth_crypto::prepare()?;
+    let encoded = crate::modules::workbuddy_auth_crypto::encode_session(snapshot)?;
+    serde_json::to_vec_pretty(&encoded).map_err(|_| "官方认证格式序列化失败".into())
+}
+
 pub(crate) fn write_account_to_default_client(account_id: &str) -> Result<(), String> {
-    let auth_path = default_auth_file_path()?;
+    let path = default_auth_file_path()?;
+    let hash = match fs::read(&path) {
+        Ok(raw) => Some(Sha256::digest(raw).into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.to_string()),
+    };
+    write_account_to_default_client_checked(account_id, hash, None).map(|_| ())
+}
+
+pub(crate) fn write_account_to_default_client_checked(
+    account_id: &str,
+    expected_file: Option<[u8; 32]>,
+    recovery_bytes: Option<&[u8]>,
+) -> Result<[u8; 32], String> {
+    let path = default_auth_file_path()?;
     let snapshot = load_snapshot(account_id)?;
-    let expected = parse_snapshot_json(
-        &serde_json::to_string(&snapshot)
-            .map_err(|error| format!("序列化 WorkBuddy 目标账号失败: {}", error))?,
-    )?;
-    let expected_uid = expected.uid;
-    let expected_token = access_token_from_value(&expected.value)
-        .ok_or_else(|| "目标 WorkBuddy 账号缺少 access token".to_string())?;
-
-    let marker = PathBuf::from(format!("{}.logged-out", auth_path.to_string_lossy()));
-    if marker.exists() {
-        fs::remove_file(&marker)
-            .map_err(|error| format!("清理 WorkBuddy 登出标记失败: {}", error))?;
+    let expected_uid = snapshot_uid_from_value(&snapshot).ok_or("目标账号身份缺失")?;
+    let expected_revision = credential_revision(&snapshot);
+    let original = match fs::read(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.to_string()),
+    };
+    let content = encoded_snapshot_for_client(&snapshot)?;
+    let written_hash: [u8; 32] = Sha256::digest(&content).into();
+    if !crate::modules::atomic_write::replace_bytes_if_unchanged(
+        &path,
+        expected_file,
+        Some(&content),
+    )? {
+        return Err("官方客户端登录文件已变化，已取消覆盖，请重试".into());
     }
-
-    let content = serde_json::to_string_pretty(&snapshot)
-        .map_err(|error| format!("序列化 WorkBuddy 登录信息失败: {}", error))?;
-    crate::modules::atomic_write::write_string_atomic(&auth_path, &content)
-        .map_err(|error| format!("写入 WorkBuddy 登录信息失败: {}", error))?;
-
-    let written = read_stable_auth_file(&auth_path)
-        .map_err(|error| format!("校验 WorkBuddy 登录信息失败: {}", error))?;
-    let written = parse_snapshot_json(&written)
-        .map_err(|error| format!("校验 WorkBuddy 登录信息内容失败: {}", error))?;
-    let written_token = access_token_from_value(&written.value);
-    if written.uid != expected_uid || written_token.as_deref() != Some(expected_token.as_str()) {
-        return Err(format!(
-            "校验 WorkBuddy 登录信息失败，未写入目标账号: {}",
-            auth_path.display()
-        ));
+    let verify = (|| {
+        let raw = read_stable_auth_file(&path)?;
+        let parsed = parse_snapshot_json(&raw)?;
+        if parsed.uid != expected_uid || credential_revision(&parsed.value) != expected_revision {
+            return Err("官方认证文件回读与目标凭证不一致".to_string());
+        }
+        let marker = PathBuf::from(format!("{}.logged-out", path.to_string_lossy()));
+        if marker.exists() {
+            crate::modules::atomic_write::remove_file_locked(&marker)?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = verify {
+        let restored = crate::modules::atomic_write::replace_bytes_if_unchanged(
+            &path,
+            Some(written_hash),
+            recovery_bytes.or(original.as_deref()),
+        )?;
+        return Err(if restored {
+            format!("认证写入校验失败，已恢复原文件：{error}")
+        } else {
+            "认证校验失败且文件又发生变化，未覆盖较新登录状态".into()
+        });
     }
-    Ok(())
+    Ok(written_hash)
 }
 
 pub(crate) fn has_account_id(account_id: &str) -> Result<bool, String> {
@@ -881,6 +986,24 @@ pub(crate) fn mark_github_sync_many(
     state: &str,
     error: Option<&str>,
 ) -> Result<(), String> {
+    mark_github_sync_checked(account_ids, state, error, None).map(|_| ())
+}
+
+pub(crate) fn mark_github_sync_if_revisions_match(
+    account_ids: &[String],
+    expected: &HashMap<String, String>,
+    state: &str,
+    error: Option<&str>,
+) -> Result<bool, String> {
+    mark_github_sync_checked(account_ids, state, error, Some(expected))
+}
+
+fn mark_github_sync_checked(
+    account_ids: &[String],
+    state: &str,
+    error: Option<&str>,
+    expected: Option<&HashMap<String, String>>,
+) -> Result<bool, String> {
     let _guard = ACCOUNT_LOCK
         .lock()
         .map_err(|_| "WorkBuddy 账号锁已损坏".to_string())?;
@@ -910,6 +1033,14 @@ pub(crate) fn mark_github_sync_many(
         .map(|entry| load_record(&entry.id))
         .collect::<Result<Vec<_>, String>>()?;
 
+    if let Some(expected) = expected {
+        if records
+            .iter()
+            .any(|r| expected.get(&r.id) != Some(&credential_revision(&r.snapshot)))
+        {
+            return Ok(false);
+        }
+    }
     for record in &mut records {
         if state != "pending" {
             record.last_github_sync_at = Some(now);
@@ -926,7 +1057,8 @@ pub(crate) fn mark_github_sync_many(
             *entry = summary(record);
         }
     }
-    save_index(&index)
+    save_index(&index)?;
+    Ok(true)
 }
 
 pub(crate) fn mark_github_sync_pending(account_id: &str) -> Result<(), String> {
@@ -968,107 +1100,460 @@ fn parse_refresh_response(
     Ok((access, refresh, expires_at, refresh_expires_at))
 }
 
-async fn request_refreshed_auth(
-    refresh_token: &str,
-    domain: Option<&str>,
-) -> Result<(String, Option<String>, Option<i64>, Option<i64>), String> {
-    let client = crate::utils::http::create_domestic_client(30, "copilot.tencent.com");
-    let headers = build_refresh_headers(refresh_token, domain)?;
-    let request = client
-        .post("https://copilot.tencent.com/v2/plugin/auth/token/refresh")
-        .headers(headers)
-        .header("Content-Type", "application/json")
-        .json(&serde_json::json!({}));
-    let response = request
-        .send()
-        .await
-        .map_err(|error| format!("WorkBuddy 刷新请求失败: {error}"))?;
-    let status = response.status();
-    if status == reqwest::StatusCode::UNAUTHORIZED {
-        return Err("refresh token 已失效，请重新登录 WorkBuddy".to_string());
-    }
-    let payload = response
-        .json::<Value>()
-        .await
-        .map_err(|error| format!("WorkBuddy 刷新响应无法解析: {error}"))?;
-    if !status.is_success() {
-        return Err(format!("WorkBuddy 刷新失败（HTTP {}）", status.as_u16()));
-    }
-    if let Some(code) = payload.get("code").and_then(Value::as_i64) {
-        if code != 0 && code != 200 {
-            let message = payload
-                .get("message")
-                .or_else(|| payload.get("msg"))
-                .and_then(Value::as_str)
-                .unwrap_or("refresh token 已失效");
-            return Err(format!("WorkBuddy 刷新失败（code={code}）：{message}"));
-        }
-    }
-    parse_refresh_response(&payload)
+fn jwt_number(token: &str, key: &str) -> Option<i64> {
+    let payload = token.split('.').nth(1)?;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(payload)
+        .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(payload))
+        .ok()?;
+    serde_json::from_slice::<Value>(&bytes)
+        .ok()?
+        .get(key)?
+        .as_i64()
 }
 
-fn build_refresh_headers(
-    refresh_token: &str,
-    domain: Option<&str>,
-) -> Result<HeaderMap, String> {
+fn credential_revision(snapshot: &Value) -> String {
+    let value = serde_json::json!([
+        snapshot_uid_from_value(snapshot),
+        snapshot_access_token(snapshot),
+        snapshot_refresh_token(snapshot)
+    ]);
+    format!(
+        "{:x}",
+        Sha256::digest(serde_json::to_vec(&value).unwrap_or_default())
+    )[..24]
+        .into()
+}
+
+fn incoming_snapshot_is_older(current: &Value, incoming: &Value) -> bool {
+    let issued = |v: &Value| {
+        snapshot_access_token(v)
+            .and_then(|t| jwt_number(&t, "iat"))
+            .or_else(|| {
+                object_i64(v.get("auth"), &["lastRefreshTime"]).map(normalize_epoch_seconds)
+            })
+    };
+    matches!((issued(current), issued(incoming)), (Some(old), Some(new)) if new < old)
+}
+
+pub(crate) fn auth_refresh_due(account_id: &str) -> Result<bool, String> {
+    let snapshot = load_record_read_only(account_id)?.snapshot;
+    let expiry = snapshot_access_token(&snapshot)
+        .and_then(|t| jwt_number(&t, "exp"))
+        .or_else(|| object_i64(snapshot.get("auth"), &["expiresAt"]).map(normalize_epoch_seconds));
+    Ok(expiry.is_some_and(|e| e <= chrono::Utc::now().timestamp() + 86400))
+}
+
+fn trusted_auth_host(snapshot: &Value) -> Result<String, String> {
+    let domain = snapshot_domain(snapshot).unwrap_or_else(|| "www.workbuddy.cn".into());
+    if !matches!(
+        domain.as_str(),
+        "www.workbuddy.cn" | "www.codebuddy.cn" | "copilot.tencent.com"
+    ) {
+        return Err("认证域名不在已核对的官方范围，已停止发送凭证".into());
+    }
+    Ok(domain)
+}
+
+fn build_auth_headers(snapshot: &Value, refresh: bool) -> Result<HeaderMap, String> {
     let mut headers = HeaderMap::new();
-    headers.insert(
-        "X-Refresh-Token",
-        HeaderValue::from_str(refresh_token)
-            .map_err(|error| format!("刷新 token 请求头无效: {error}"))?,
-    );
-    headers.insert("X-Auth-Refresh-Source", HeaderValue::from_static("plugin"));
-    if let Some(domain) = domain.filter(|value| !value.trim().is_empty()) {
+    let mut put = |name: &'static str, value: String| -> Result<(), String> {
         headers.insert(
-            "X-Domain",
-            HeaderValue::from_str(domain)
-                .map_err(|error| format!("WorkBuddy 域名请求头无效: {error}"))?,
+            name,
+            HeaderValue::from_str(&value).map_err(|_| "认证请求头无效，未发送")?,
         );
+        Ok(())
+    };
+    let token = snapshot_access_token(snapshot).ok_or("认证快照缺少 access token")?;
+    put("authorization", format!("Bearer {token}"))?;
+    put(
+        "x-user-id",
+        snapshot_uid_from_value(snapshot).ok_or("认证快照缺少账号身份")?,
+    )?;
+    put("x-domain", trusted_auth_host(snapshot)?)?;
+    if let Some(id) =
+        snapshot_string(snapshot, &["enterpriseId", "enterprise_id"]).filter(|v| !v.is_empty())
+    {
+        put("x-enterprise-id", id.clone())?;
+        put("x-tenant-id", id)?;
+    }
+    if let Some(value) = snapshot_string(snapshot, &["departmentFullName"]) {
+        put("x-department-info", value)?;
+    }
+    if refresh {
+        put(
+            "x-refresh-token",
+            snapshot_refresh_token(snapshot)
+                .ok_or("认证快照缺少 refresh token，请从官方客户端更新")?,
+        )?;
+        put("x-auth-refresh-source", "plugin".into())?;
     }
     Ok(headers)
 }
 
-pub(crate) async fn refresh_account_auth(account_id: &str) -> Result<String, String> {
-    let _refresh_guard = REFRESH_LOCK.lock().await;
-    let record = load_record_read_only(account_id)?;
-    let old_snapshot = record.snapshot;
-    let refresh_token = snapshot_refresh_token(&old_snapshot)
-        .ok_or_else(|| "WorkBuddy 快照缺少 refresh token，请重新登录 WorkBuddy".to_string())?;
-    let domain = snapshot_domain(&old_snapshot);
-    let (new_access, new_refresh, expires_at, refresh_expires_at) =
-        request_refreshed_auth(&refresh_token, domain.as_deref()).await?;
-
-    let _guard = ACCOUNT_LOCK
-        .lock()
-        .map_err(|_| "WorkBuddy 账号锁已损坏".to_string())?;
-    let mut index = load_index()?;
-    let mut record = load_record(account_id)?;
-    merge_refreshed_auth(
-        &mut record.snapshot,
-        &new_access,
-        new_refresh.as_deref(),
-        expires_at,
-        refresh_expires_at,
-    )?;
-    record.token_expires_at = expires_at.or(record.token_expires_at);
-    record.updated_at = chrono::Utc::now().timestamp();
-    save_record(&record)?;
-    if let Some(entry) = index
-        .accounts
-        .iter_mut()
-        .find(|entry| entry.id == account_id)
-    {
-        *entry = summary(&record);
+fn normalized_refresh_auth(
+    payload: &Value,
+    previous: &Value,
+    now_ms: i64,
+) -> Result<Value, String> {
+    let data = payload.get("data").unwrap_or(payload);
+    let mut auth = data.as_object().cloned().ok_or("刷新响应缺少认证对象")?;
+    let (access, refresh, expires, refresh_expires) = parse_refresh_response(payload)?;
+    let expiry = expires
+        .or_else(|| {
+            object_i64(Some(data), &["expiresIn", "expires_in"])
+                .filter(|n| *n > 0)
+                .map(|n| now_ms / 1000 + n)
+        })
+        .or_else(|| jwt_number(&access, "exp"))
+        .ok_or("刷新响应缺少有效到期时间，未覆盖原凭证")?;
+    if expiry <= now_ms / 1000 {
+        return Err("刷新响应中的凭证已经到期，未覆盖原凭证".into());
     }
-    save_index(&index)?;
-    Ok(new_access)
+    let refresh_token = refresh
+        .or_else(|| snapshot_refresh_token(previous))
+        .ok_or("刷新响应缺少 refresh token")?;
+    let refresh_expiry = refresh_expires
+        .or_else(|| {
+            object_i64(Some(data), &["refreshExpiresIn", "refresh_expires_in"])
+                .filter(|n| *n > 0)
+                .map(|n| now_ms / 1000 + n)
+        })
+        .or_else(|| jwt_number(&refresh_token, "exp"));
+    auth.insert("accessToken".into(), Value::String(access));
+    auth.insert("refreshToken".into(), Value::String(refresh_token));
+    auth.insert("expiresAt".into(), serde_json::json!(expiry * 1000));
+    if let Some(expiry) = refresh_expiry {
+        auth.insert("refreshExpiresAt".into(), serde_json::json!(expiry * 1000));
+    }
+    auth.insert("lastRefreshTime".into(), serde_json::json!(now_ms));
+    if !auth.contains_key("domain") {
+        auth.insert(
+            "domain".into(),
+            serde_json::json!(trusted_auth_host(previous)?),
+        );
+    }
+    if !auth.contains_key("tokenType") {
+        if let Some(value) = previous.pointer("/auth/tokenType") {
+            auth.insert("tokenType".into(), value.clone());
+        }
+    }
+    Ok(Value::Object(auth))
+}
+
+fn merge_verified_account(previous: &Value, auth: Value, payload: &Value) -> Result<Value, String> {
+    let account = payload.get("data").unwrap_or(payload);
+    let expected = snapshot_uid_from_value(previous).ok_or("原账号身份缺失")?;
+    let uid = object_string(Some(account), &["uid", "id"])
+        .ok_or("官方账号校验未返回身份，未保存新凭证")?;
+    if uid != expected {
+        return Err("刷新后的账号身份与原账号不同，已停止保存".into());
+    }
+    if let Some(subject) = auth
+        .get("accessToken")
+        .and_then(Value::as_str)
+        .and_then(uid_from_jwt)
+    {
+        if subject != expected {
+            return Err("刷新凭证与账号身份不一致，已停止保存".into());
+        }
+    }
+    // The official account endpoint may omit the descriptive type even when
+    // the UID and token subject still identify the same account. Unspecified
+    // type is not a change of identity; retain known metadata when merging.
+    let unspecified_type = |value: &Value| {
+        value.is_null() || value.as_str().is_some_and(|value| value.trim().is_empty())
+    };
+    for field in ["enterpriseId", "type", "oneidAccountId", "idp"] {
+        if let (Some(old), Some(new)) = (
+            previous.pointer(&format!("/account/{field}")),
+            account.get(field),
+        ) {
+            if field == "type" && (unspecified_type(old) || unspecified_type(new)) {
+                continue;
+            }
+            if !old.is_null() && !new.is_null() && old != new {
+                return Err(format!(
+                    "刷新后的账号权限上下文发生变化（{field}），已停止保存"
+                ));
+            }
+        }
+    }
+    let mut result = previous.clone();
+    result["auth"] = auth;
+    let mut merged = previous
+        .get("account")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    for (key, value) in account.as_object().ok_or("官方账号校验返回格式无效")? {
+        if key == "type" && unspecified_type(value) {
+            continue;
+        }
+        merged.insert(key.clone(), value.clone());
+    }
+    result["account"] = Value::Object(merged.clone());
+    for key in ["accounts", "allAccounts"] {
+        if let Some(list) = result.get_mut(key).and_then(Value::as_array_mut) {
+            for item in list {
+                if object_string(Some(item), &["uid", "id"]).as_deref() == Some(expected.as_str()) {
+                    *item = Value::Object(merged.clone());
+                }
+            }
+        }
+    }
+    Ok(result)
+}
+
+async fn checked_auth_json(response: reqwest::Response, step: &str) -> Result<Value, String> {
+    let status = response.status().as_u16();
+    if status == 401 || status == 403 {
+        return Err(format!(
+            "认证被拒绝（{step} HTTP {status}），未确认具体原因；请在官方客户端核对登录"
+        ));
+    }
+    if !(200..300).contains(&status) {
+        return Err(format!(
+            "认证服务暂不可用（{step} HTTP {status}），未判定凭证失效"
+        ));
+    }
+    let payload: Value = response
+        .json()
+        .await
+        .map_err(|_| format!("{step}返回格式无效，未覆盖凭证"))?;
+    if payload
+        .get("code")
+        .and_then(Value::as_i64)
+        .is_some_and(|n| n != 0 && n != 200)
+    {
+        return Err(format!(
+            "认证服务返回业务错误（{step} code={}），未判定凭证失效",
+            payload["code"]
+        ));
+    }
+    Ok(payload)
+}
+
+#[derive(Serialize, Deserialize)]
+struct PendingRefresh {
+    previous_revision: String,
+    received_at_ms: i64,
+    payload: Value,
+}
+fn pending_refresh_path(account_id: &str) -> Result<PathBuf, String> {
+    if !valid_account_id(account_id) {
+        return Err("账号ID无效".into());
+    }
+    Ok(crate::modules::account::get_data_dir()?
+        .join("workbuddy-auth-pending")
+        .join(format!("{account_id}.json")))
+}
+fn load_pending_refresh(
+    account_id: &str,
+    previous: &Value,
+) -> Result<Option<PendingRefresh>, String> {
+    let path = pending_refresh_path(account_id)?;
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("待验证认证文件不可读，请检查原密钥及文件权限".into()),
+    };
+    let (pending, _): (PendingRefresh, bool) =
+        crate::modules::secure_account_storage::deserialize_account_file_read_only(&path, &raw)?;
+    Ok((pending.previous_revision == credential_revision(previous)).then_some(pending))
+}
+fn save_pending_refresh(account_id: &str, pending: &PendingRefresh) -> Result<(), String> {
+    let content = crate::modules::secure_account_storage::serialize_account_file(
+        "workbuddy-auth-pending",
+        pending,
+    )?;
+    crate::modules::atomic_write::write_string_atomic(&pending_refresh_path(account_id)?, &content)
+}
+async fn request_refreshed_snapshot(account_id: &str, previous: &Value) -> Result<Value, String> {
+    let host = trusted_auth_host(previous)?;
+    let host_for_client = host.clone();
+    let client = tauri::async_runtime::spawn_blocking(move || {
+        crate::utils::http::create_domestic_client(30, &host_for_client)
+    })
+    .await
+    .map_err(|_| "认证网络初始化失败")?;
+    // Resume a previously returned rotation instead of consuming the old refresh token again.
+    let pending = match load_pending_refresh(account_id, previous)? {
+        Some(pending) => pending,
+        None => {
+            let response = client
+                .post(format!("https://{host}/v2/plugin/auth/token/refresh"))
+                .headers(build_auth_headers(previous, true)?)
+                .json(&serde_json::json!({}))
+                .send()
+                .await
+                .map_err(|e| crate::utils::http::format_request_error("认证恢复", &e))?;
+            let payload = checked_auth_json(response, "刷新").await?;
+            let pending = PendingRefresh {
+                previous_revision: credential_revision(previous),
+                received_at_ms: chrono::Utc::now().timestamp_millis(),
+                payload,
+            };
+            // Encrypt the complete returned auth before any follow-up network request can fail.
+            save_pending_refresh(account_id, &pending)?;
+            pending
+        }
+    };
+    let auth = normalized_refresh_auth(&pending.payload, previous, pending.received_at_ms)?;
+    let mut candidate = previous.clone();
+    candidate["auth"] = auth.clone();
+    let response = client
+        .get(format!("https://{host}/v2/plugin/account"))
+        .headers(build_auth_headers(&candidate, false)?)
+        .send()
+        .await
+        .map_err(|e| {
+            format!(
+                "新凭证已加密保留，账号校验待重试：{}",
+                crate::utils::http::format_request_error("账号校验", &e)
+            )
+        })?;
+    let account = checked_auth_json(response, "账号校验")
+        .await
+        .map_err(|e| format!("{e}；刷新结果已加密保留，未覆盖正式账号"))?;
+    merge_verified_account(previous, auth, &account)
+}
+
+pub(crate) async fn refresh_account_auth(account_id: &str) -> Result<String, String> {
+    let _auth = AUTH_FLOW.clone().lock_owned().await;
+    let id = account_id.to_string();
+    let active = tauri::async_runtime::spawn_blocking(move || {
+        let active = current_managed_account_id_checked()?;
+        #[cfg(windows)]
+        let running = !super::process::collect_workbuddy_process_entries_checked()?.is_empty();
+        #[cfg(not(windows))]
+        let running = !super::process::collect_workbuddy_process_entries().is_empty();
+        Ok::<_, String>((active.as_deref() == Some(id.as_str()), running))
+    })
+    .await
+    .map_err(|_| "客户端认证状态检查失败")??;
+    if active.0 && active.1 {
+        let before = access_token(account_id)?;
+        tauri::async_runtime::spawn_blocking(refresh_current_managed_snapshot_in_transaction)
+            .await
+            .map_err(|_| "当前会话同步失败")??;
+        let after = access_token(account_id)?;
+        return if after != before { Ok(after) } else {
+            let live=read_stable_auth_file(&default_auth_file_path()?).ok().and_then(|r|parse_snapshot_json(&r).ok()).and_then(|p|snapshot_access_token(&p.value));
+            if live.as_deref()!=Some(before.as_str()) {Err("托管凭证与正在运行的客户端不同，未覆盖当前会话；请保存任务后使用“切换并打开”重新载入".into())}
+            else {Err("此账号正由官方客户端管理，未额外轮换凭证；请核对原客户端登录后重新导入".into())}
+        };
+    }
+    refresh_account_auth_in_transaction(account_id).await
+}
+
+/// Caller owns AUTH_FLOW for the entire switch/recovery transaction.
+pub(crate) async fn refresh_account_auth_in_transaction(
+    account_id: &str,
+) -> Result<String, String> {
+    let _refresh = REFRESH_LOCK.lock().await;
+    let now = chrono::Utc::now().timestamp();
+    if let Some((until, error)) = REFRESH_FAILURES
+        .lock()
+        .map_err(|_| "认证状态锁异常")?
+        .get(account_id)
+        .cloned()
+    {
+        if until > now {
+            return Err(format!(
+                "认证恢复冷却中，{}秒后可重试：{error}",
+                until - now
+            ));
+        }
+    }
+    let previous = load_record_read_only(account_id)?.snapshot;
+    let refreshed = match request_refreshed_snapshot(account_id, &previous).await {
+        Ok(value) => value,
+        Err(error) => {
+            REFRESH_FAILURES
+                .lock()
+                .map_err(|_| "认证状态锁异常")?
+                .insert(account_id.into(), (now + 60, error.clone()));
+            return Err(error);
+        }
+    };
+    let access = snapshot_access_token(&refreshed).ok_or("新会话缺少 access token")?;
+    let sync;
+    {
+        let _guard = ACCOUNT_LOCK.lock().map_err(|_| "WorkBuddy 账号锁已损坏")?;
+        let path = detail_path(account_id)?;
+        let raw = fs::read(&path).map_err(|_| "刷新期间账号文件不可读，未覆盖")?;
+        let expected_hash: [u8; 32] = Sha256::digest(&raw).into();
+        let mut record: WorkBuddyAccountRecord =
+            crate::modules::secure_account_storage::deserialize_account_file_read_only(
+                &path,
+                std::str::from_utf8(&raw).map_err(|_| "账号文件编码无效")?,
+            )?
+            .0;
+        if record.snapshot != previous {
+            return Err("刷新期间账号状态已变化，已保留较新凭证，请重试".into());
+        }
+        sync = record.checkin_enabled
+            && snapshot_access_token(&previous).as_deref() != Some(access.as_str());
+        record.snapshot = refreshed;
+        record.token_expires_at =
+            object_i64(record.snapshot.get("auth"), &["expiresAt"]).map(normalize_epoch_seconds);
+        record.updated_at = chrono::Utc::now().timestamp();
+        if sync {
+            record.last_github_sync_state = "pending".into();
+            record.last_github_sync_error = None;
+        }
+        // Credential persistence wins over auxiliary sync-state errors after a server rotation.
+        if let Err(error) = crate::modules::workbuddy_github::mark_dataset_changed() {
+            crate::modules::logger::log_warn(&format!(
+                "[WorkBuddy] 同步代次暂未更新，凭证仍将安全保存：{error}"
+            ));
+        }
+        let content =
+            crate::modules::secure_account_storage::serialize_account_file(SNAPSHOT_KIND, &record)?;
+        if !crate::modules::atomic_write::write_string_atomic_if_hash_matches(
+            &path,
+            expected_hash,
+            || Ok(content),
+        )? {
+            return Err("账号文件已被其他写入更新，未覆盖较新凭证".into());
+        }
+        match load_index() {
+            Ok(mut index) => {
+                if let Some(entry) = index.accounts.iter_mut().find(|a| a.id == account_id) {
+                    *entry = summary(&record);
+                }
+                if let Err(e) = save_index(&index) {
+                    crate::modules::logger::log_warn(&format!(
+                        "[WorkBuddy] 新凭证已保存，索引更新待重试：{e}"
+                    ));
+                }
+            }
+            Err(e) => crate::modules::logger::log_warn(&format!(
+                "[WorkBuddy] 新凭证已保存，索引对账待重试：{e}"
+            )),
+        }
+    }
+    REFRESH_FAILURES
+        .lock()
+        .map_err(|_| "认证状态锁异常")?
+        .remove(account_id);
+    let _ = crate::modules::atomic_write::remove_file_locked(&pending_refresh_path(account_id)?);
+    if sync {
+        crate::modules::workbuddy_github::queue_background_sync(
+            "credential commit",
+            std::time::Duration::from_secs(2),
+            false,
+        );
+    }
+    Ok(access)
 }
 
 pub(crate) fn refresh_error_requires_login(error: &str) -> bool {
-    let value = error.to_ascii_lowercase();
-    value.contains("refresh token 已失效")
-        || value.contains("缺少 refresh token")
-        || value.contains("refresh token 无效")
+    error.contains("认证被拒绝")
+        || error.contains("缺少 refresh token")
+        || error.contains("refresh token 已失效")
+        || error.contains("refresh token 无效")
 }
 
 pub(crate) fn request_identity(
@@ -1105,6 +1590,7 @@ fn snapshot_string(snapshot: &Value, keys: &[&str]) -> Option<String> {
 }
 
 pub fn remove_workbuddy_account(account_id: &str) -> Result<(), String> {
+    let _auth = try_begin_auth_transaction()?;
     let _guard = ACCOUNT_LOCK
         .lock()
         .map_err(|_| "WorkBuddy 账号锁已损坏".to_string())?;
@@ -1126,39 +1612,243 @@ mod tests {
     use std::fs;
 
     #[test]
-    fn refresh_client_uses_official_copilot_route() {
-        let production_source = include_str!("workbuddy_account.rs")
-            .split("#[cfg(test)]")
-            .next()
-            .expect("生产代码应在测试模块之前");
-        assert!(production_source.contains("create_domestic_client(30, \"copilot.tencent.com\")"));
-        assert!(production_source.contains("https://copilot.tencent.com/v2/plugin/auth/token/refresh"));
+    #[ignore = "Explicit live diagnostic: one selected account only; may recover and persist that account"]
+    fn live_recover_one_selected_account() {
+        let id = std::env::var("WORKBUDDY_RECOVERY_ACCOUNT").expect("Explicit account ID required");
+        assert!(valid_account_id(&id));
+        let output =
+            std::env::var("WORKBUDDY_RECOVERY_REPORT").expect("Explicit report path required");
+        let before = list_workbuddy_accounts()
+            .unwrap()
+            .into_iter()
+            .map(|a| (a.id, a.credential_revision))
+            .collect::<HashMap<_, _>>();
+        let initial = tauri::async_runtime::block_on(
+            crate::modules::workbuddy_status::query_account_status(&id),
+        );
+        let rejected = initial.as_ref().ok().is_some_and(|s| {
+            s.credits_error
+                .as_ref()
+                .is_some_and(|e| e.contains("凭证被拒绝") || e.contains("认证已失效"))
+        });
+        let result = if rejected {
+            Some(tauri::async_runtime::block_on(refresh_account_auth(&id)).map(|_| ()))
+        } else {
+            None
+        };
+        let after_status = tauri::async_runtime::block_on(
+            crate::modules::workbuddy_status::query_account_status(&id),
+        );
+        let github_sync = if std::env::var("WORKBUDDY_RECOVERY_SYNC_GITHUB").as_deref() == Ok("1")
+            && after_status.as_ref().ok().is_some_and(|s| s.credits_error.is_none())
+        {
+            Some(tauri::async_runtime::block_on(
+                crate::modules::workbuddy_github::sync_background_now("verified account reauthorization"),
+            ))
+        } else {
+            None
+        };
+        let after = list_workbuddy_accounts().unwrap();
+        let changed = after
+            .iter()
+            .filter(|a| before.get(&a.id) != Some(&a.credential_revision))
+            .map(|a| a.id.clone())
+            .collect::<Vec<_>>();
+        let report = serde_json::json!({"checkedAt":chrono::Utc::now().to_rfc3339(),"accountId":id,"attemptedRecovery":rejected,"recovery":match &result{Some(Ok(()))=>"completed",Some(Err(_))=>"not-completed",None=>"not-attempted"},"error":result.as_ref().and_then(|r|r.as_ref().err()).cloned(),"balanceAfter":after_status.as_ref().ok().and_then(|s|s.credits),"balanceErrorAfter":after_status.as_ref().ok().and_then(|s|s.credits_error.clone()),"credentialChangedAccountIds":changed,"pendingVerificationSaved":pending_refresh_path(&id).unwrap().exists(),"scope":"one account; no client switch/restart or chat call"});
+        std::fs::write(output, serde_json::to_string_pretty(&report).unwrap()).unwrap();
+        if let Some(sync) = github_sync {
+            let mut report = report;
+            report["githubSync"] = serde_json::json!({"completed":sync.is_ok(),"error":sync.err()});
+            std::fs::write(
+                std::env::var("WORKBUDDY_RECOVERY_REPORT").unwrap(),
+                serde_json::to_string_pretty(&report).unwrap(),
+            ).unwrap();
+        }
+        println!("Selected-account diagnostic recorded; see the explicit report (no credentials printed).");
+    }
+    #[test]
+    fn pending_rotation_is_encrypted_and_not_reused_after_new_import() {
+        let _env = crate::modules::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("workbuddy-pending-check-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("COCKPIT_TOOLS_TEST_DATA_DIR", &dir);
+        let account = import_snapshot_json(&fixture("pending-uid", "old-token"), None).unwrap();
+        let old = load_record_read_only(&account.id).unwrap().snapshot;
+        let pending = PendingRefresh {
+            previous_revision: credential_revision(&old),
+            received_at_ms: 1_000_000,
+            payload: serde_json::json!({"data":{"accessToken":"candidate-secret-token","refreshToken":"candidate-secret-refresh","expiresIn":3600}}),
+        };
+        save_pending_refresh(&account.id, &pending).unwrap();
+        let raw = fs::read_to_string(pending_refresh_path(&account.id).unwrap()).unwrap();
+        assert!(!raw.contains("candidate-secret"));
+        assert!(load_pending_refresh(&account.id, &old).unwrap().is_some());
+        assert_eq!(access_token(&account.id).unwrap(), "old-token");
+        let expected = HashMap::from([(account.id.clone(), account.credential_revision)]);
+        import_snapshot_json(&fixture("pending-uid", "new-import-token"), None).unwrap();
+        let fresh = load_record_read_only(&account.id).unwrap().snapshot;
+        assert!(load_pending_refresh(&account.id, &fresh).unwrap().is_none());
+        assert!(!mark_github_sync_if_revisions_match(
+            &[account.id.clone()],
+            &expected,
+            "synced",
+            None
+        )
+        .unwrap());
+        assert_ne!(
+            load_record_read_only(&account.id)
+                .unwrap()
+                .last_github_sync_state,
+            "synced"
+        );
+        let auth = try_begin_auth_transaction().unwrap();
+        assert!(import_snapshot_json(&fixture("pending-uid", "racing-import"), None).is_err());
+        drop(auth);
+        assert_eq!(access_token(&account.id).unwrap(), "new-import-token");
+        std::env::remove_var("COCKPIT_TOOLS_TEST_DATA_DIR");
+        let _ = fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn unreadable_account_does_not_rebuild_or_remove_index_entries() {
+        let _env = crate::modules::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir =
+            std::env::temp_dir().join(format!("workbuddy-index-guard-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("COCKPIT_TOOLS_TEST_DATA_DIR", &dir);
+        let account = import_snapshot_json(&fixture("guard-uid", "guard-token"), None).unwrap();
+        let index = fs::read(index_path().unwrap()).unwrap();
+        let detail = detail_path(&account.id).unwrap();
+        fs::write(&detail, b"temporarily invalid account").unwrap();
+        assert!(list_workbuddy_accounts().is_err());
+        assert_eq!(fs::read(index_path().unwrap()).unwrap(), index);
+        std::env::remove_var("COCKPIT_TOOLS_TEST_DATA_DIR");
+        let _ = fs::remove_dir_all(dir);
+    }
+    #[test]
+    fn old_snapshot_cannot_replace_newer_server_issued_credentials() {
+        let token = |iat| {
+            format!(
+                "e30.{}.sig",
+                base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .encode(format!("{{\"iat\":{iat}}}"))
+            )
+        };
+        let newer = serde_json::json!({"auth":{"accessToken":token(200)}});
+        let older = serde_json::json!({"auth":{"accessToken":token(100)}});
+        assert!(incoming_snapshot_is_older(&newer, &older));
+        assert!(!incoming_snapshot_is_older(&older, &newer));
+    }
+    #[test]
+    fn refresh_headers_include_identity_and_current_access() {
+        let snapshot = serde_json::json!({"account":{"uid":"fixture","enterpriseId":"enterprise"},"auth":{"accessToken":"old","refreshToken":"refresh","domain":"www.workbuddy.cn"}});
+        let headers = build_auth_headers(&snapshot, true).unwrap();
+        assert_eq!(headers["authorization"], "Bearer old");
+        assert_eq!(headers["x-user-id"], "fixture");
+        assert_eq!(headers["x-tenant-id"], "enterprise");
+        assert_eq!(headers["x-refresh-token"], "refresh");
+    }
+    #[test]
+    fn refresh_normalizes_relative_expiry_and_preserves_new_metadata() {
+        let old = serde_json::json!({"account":{"uid":"fixture"},"auth":{"accessToken":"old","refreshToken":"old-refresh","domain":"www.workbuddy.cn","expiresAt":1,"lastRefreshTime":1}});
+        let payload = serde_json::json!({"data":{"accessToken":"new","refreshToken":"new-refresh","expiresIn":3600,"refreshExpiresIn":7200,"sessionState":"new-session"}});
+        let auth = normalized_refresh_auth(&payload, &old, 1_000_000).unwrap();
+        assert_eq!(auth["expiresAt"], 4_600_000i64);
+        assert_eq!(auth["refreshExpiresAt"], 8_200_000i64);
+        assert_eq!(auth["lastRefreshTime"], 1_000_000i64);
+        assert_eq!(auth["sessionState"], "new-session");
+        assert!(merge_verified_account(
+            &old,
+            auth.clone(),
+            &serde_json::json!({"data":{"uid":"different"}})
+        )
+        .is_err());
+        assert_eq!(
+            merge_verified_account(&old, auth, &serde_json::json!({"data":{"uid":"fixture"}}))
+                .unwrap()["auth"]["accessToken"],
+            "new"
+        );
+    }
+    #[test]
+    fn verified_account_merge_accepts_unspecified_type_without_losing_profile() {
+        let previous = serde_json::json!({
+            "account": {"uid":"fixture", "type":"personal", "oneidAccountId":"oneid", "idp":"wechat", "enterpriseId":"enterprise", "localPreference":"keep"},
+            "auth": {"accessToken":"old", "refreshToken":"old-refresh"},
+            "accounts": [{"uid":"fixture", "type":"personal"}, {"uid":"other", "type":"other-type"}],
+            "allAccounts": [{"uid":"fixture", "type":"personal"}]
+        });
+        let auth = serde_json::json!({"accessToken":"new", "refreshToken":"new-refresh"});
+        for unspecified in [serde_json::json!(""), serde_json::json!("  "), Value::Null] {
+            let payload = serde_json::json!({"data": {
+                "uid":"fixture", "type":unspecified, "oneidAccountId":"oneid",
+                "idp":"wechat", "enterpriseId":"enterprise", "nickname":"updated"
+            }});
+            let merged = merge_verified_account(&previous, auth.clone(), &payload)
+                .expect("same identity with unspecified account type must remain switchable");
+            assert_eq!(merged["account"]["type"], "personal");
+            assert_eq!(merged["account"]["nickname"], "updated");
+            assert_eq!(merged["account"]["localPreference"], "keep");
+            assert_eq!(merged["auth"]["accessToken"], "new");
+            assert_eq!(merged["accounts"][0]["type"], "personal");
+            assert_eq!(merged["allAccounts"][0]["type"], "personal");
+            assert_eq!(merged["accounts"][1], previous["accounts"][1]);
+        }
     }
 
     #[test]
-    fn refresh_request_headers_match_official_workbuddy_protocol() {
-        let headers = build_refresh_headers("refresh-token", Some("www.workbuddy.cn"))
-        .expect("刷新请求头应可构造");
+    fn verified_account_merge_can_fill_a_previously_unspecified_type() {
+        for unspecified in [serde_json::json!(""), serde_json::json!("  "), Value::Null] {
+            let previous = serde_json::json!({"account":{"uid":"fixture", "type":unspecified}, "auth":{"accessToken":"old"}});
+            let merged = merge_verified_account(&previous, serde_json::json!({"accessToken":"new"}), &serde_json::json!({"data":{"uid":"fixture", "type":"personal"}})).unwrap();
+            assert_eq!(merged["account"]["type"], "personal");
+        }
+    }
 
-        assert_eq!(
-            headers
-                .get("x-refresh-token")
-                .and_then(|value| value.to_str().ok()),
-            Some("refresh-token")
-        );
-        assert_eq!(
-            headers
-                .get("x-auth-refresh-source")
-                .and_then(|value| value.to_str().ok()),
-            Some("plugin")
-        );
-        assert_eq!(
-            headers
-                .get("x-domain")
-                .and_then(|value| value.to_str().ok()),
-            Some("www.workbuddy.cn")
-        );
-        assert!(headers.get("authorization").is_none());
+    #[test]
+    #[ignore = "Explicit read-only check of one existing pending rotation; never refreshes or writes credentials"]
+    fn live_verify_pending_account_metadata_read_only() {
+        let id = std::env::var("WORKBUDDY_COMPAT_ACCOUNT").expect("explicit account required");
+        let previous = load_record_read_only(&id).unwrap().snapshot;
+        let pending = load_pending_refresh(&id, &previous).unwrap().expect("existing matching pending rotation required");
+        let auth = normalized_refresh_auth(&pending.payload, &previous, pending.received_at_ms).unwrap();
+        let host = trusted_auth_host(&previous).unwrap();
+        let mut candidate = previous.clone();
+        candidate["auth"] = auth.clone();
+        let headers = build_auth_headers(&candidate, false).unwrap();
+        let payload = tauri::async_runtime::block_on(async {
+            let client = crate::utils::http::create_domestic_client(15, &host);
+            let response = client.get(format!("https://{host}/v2/plugin/account")).headers(headers).send().await.unwrap();
+            checked_auth_json(response, "只读账号校验").await.unwrap()
+        });
+        let merged = merge_verified_account(&previous, auth, &payload).expect("official verified identity must merge successfully");
+        assert!(snapshot_uid_from_value(&merged) == snapshot_uid_from_value(&previous));
+        assert!(merged["auth"] == candidate["auth"]);
+        println!("Official account verification and metadata merge passed; no refresh or credential writes performed.");
+    }
+
+    #[test]
+    fn verified_account_merge_still_rejects_identity_and_security_context_changes() {
+        let previous = serde_json::json!({
+            "account":{"uid":"fixture", "type":"personal", "enterpriseId":"enterprise", "oneidAccountId":"oneid", "idp":"wechat"},
+            "auth":{"accessToken":"old"}
+        });
+        let auth = serde_json::json!({"accessToken":"new"});
+        for (field, changed) in [
+            ("uid", "different-user"), ("type", "enterprise"),
+            ("enterpriseId", "different-enterprise"),
+            ("oneidAccountId", "different-oneid"), ("idp", "different-provider")
+        ] {
+            let mut payload = serde_json::json!({"data":previous["account"].clone()});
+            payload["data"][field] = serde_json::json!(changed);
+            assert!(merge_verified_account(&previous, auth.clone(), &payload).is_err(), "must reject changed {field}");
+        }
+        let foreign_token = format!("e30.{}.sig", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"sub":"different-user"}"#));
+        assert!(merge_verified_account(&previous, serde_json::json!({"accessToken":foreign_token}), &serde_json::json!({"data":{"uid":"fixture", "type":""}})).is_err());
+        assert_eq!(previous["auth"]["accessToken"], "old");
     }
 
     #[test]
@@ -1542,17 +2232,24 @@ mod tests {
         )
         .unwrap();
 
-        write_account_to_default_client(&imported.id).unwrap();
-
-        assert!(!auth_path
-            .with_file_name("live-workbuddy.info.logged-out")
-            .exists());
-        let written = read_stable_auth_file(&auth_path).unwrap();
-        assert_eq!(snapshot_uid(&written).unwrap(), "uid-write");
-        assert_eq!(
-            snapshot_access_token(&serde_json::from_str(&written).unwrap()).as_deref(),
-            Some("token-write")
-        );
+        crate::modules::workbuddy_auth_crypto::with_test_key(|| {
+            write_account_to_default_client(&imported.id).unwrap();
+            assert!(!auth_path
+                .with_file_name("live-workbuddy.info.logged-out")
+                .exists());
+            let written = read_stable_auth_file(&auth_path).unwrap();
+            let parsed = parse_snapshot_json(&written).unwrap();
+            assert_eq!(parsed.uid, "uid-write");
+            assert_eq!(
+                snapshot_access_token(&parsed.value).as_deref(),
+                Some("token-write")
+            );
+            assert!(
+                crate::modules::workbuddy_auth_crypto::contains_encrypted_wrapper(
+                    &serde_json::from_str(&written).unwrap()
+                )
+            );
+        });
 
         std::env::remove_var("COCKPIT_TOOLS_TEST_DATA_DIR");
         let _ = fs::remove_dir_all(dir);

@@ -219,6 +219,41 @@ pub fn remove_file_locked(path: &Path) -> Result<bool, String> {
     }
 }
 
+/// Compare the observed file version while holding the same writer lock.
+/// None means the caller observed an absent file. Never restore over a new writer.
+pub fn replace_bytes_if_unchanged(
+    path: &Path,
+    expected: Option<[u8; 32]>,
+    content: Option<&[u8]>,
+) -> Result<bool, String> {
+    let lock = path_write_lock(path)?;
+    let _guard = lock.lock().map_err(|_| "文件写入锁已损坏".to_string())?;
+    let current = match fs::read(path) {
+        Ok(bytes) => Some(<[u8; 32]>::from(Sha256::digest(bytes))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format_io_error("检查文件版本", path, &e)),
+    };
+    if current != expected {
+        return Ok(false);
+    }
+    if let Some(bytes) = content {
+        let parent = path.parent().ok_or("无法定位目标目录")?;
+        fs::create_dir_all(parent).map_err(|e| format_io_error("创建目录", parent, &e))?;
+        let temp = build_temp_file_path(parent, path, "conditional");
+        if let Err(e) = write_synced_temp_file_bytes(&temp, bytes) {
+            let _ = fs::remove_file(&temp);
+            return Err(e);
+        }
+        if let Err(e) = fs::rename(&temp, path) {
+            let _ = fs::remove_file(&temp);
+            return Err(format_io_error("替换文件", path, &e));
+        }
+    } else if current.is_some() {
+        fs::remove_file(path).map_err(|e| format_io_error("删除文件", path, &e))?;
+    }
+    Ok(true)
+}
+
 pub fn restore_from_backup(path: &Path) -> Result<bool, String> {
     let backup_path = build_backup_path(path)?;
     if !backup_path.exists() {

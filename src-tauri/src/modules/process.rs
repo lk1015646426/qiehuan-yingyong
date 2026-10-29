@@ -1108,6 +1108,10 @@ fn windows_trae_candidate_matches_platform(
     path: &std::path::Path,
     platform: crate::modules::trae_account::TraePlatformKind,
 ) -> bool {
+    // 搬动/重命名安装文件夹后，官方产品元数据比文件夹名称可靠。
+    if let Some(actual) = crate::modules::trae_account::trae_platform_for_executable(path) {
+        return actual == platform;
+    }
     let expected = platform.app_support_dir_aliases();
     path.components().any(|component| {
         component
@@ -2853,6 +2857,18 @@ fn detect_trae_exec_path_for_platform(
                 return Some(candidate);
             }
         }
+        // 非默认路径：沿用上游多来源探测思路，优先接收正在运行的官方主程序。
+        if let Ok(running) = scan_windows_app_launch_targets(platform.provider_key(), None) {
+            if let Some(candidate) = running.into_iter().map(|v| std::path::PathBuf::from(v.target))
+                .find(|path| path.is_file() && windows_trae_candidate_matches_platform(path, platform)) {
+                return Some(candidate);
+            }
+        }
+        if let Some(candidate) = detect_windows_exec_path_by_signatures(
+            platform.display_name(), exe_names, app_dirs, app_dirs, app_dirs,
+        ).filter(|path| windows_trae_candidate_matches_platform(path, platform)) {
+            return Some(candidate);
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -4424,7 +4440,7 @@ pub(crate) fn resolve_trae_launch_path_for_platform(
         } else {
             TRAE_LAUNCH_PATH_TTL_ERR
         };
-        if at.elapsed() < ttl {
+        if at.elapsed() < ttl && cached.as_ref().map(|path| path.exists()).unwrap_or(true) {
             return cached;
         }
     }
@@ -4440,30 +4456,23 @@ fn resolve_trae_launch_path_uncached(
     platform: crate::modules::trae_account::TraePlatformKind,
 ) -> Result<std::path::PathBuf, String> {
     let current = config::get_user_config();
-    if let Some(custom) = normalize_custom_path(Some(trae_configured_app_path(&current, platform)))
-    {
-        if let Some(exec) = resolve_trae_macos_exec_path(&custom) {
-            return Ok(exec);
+    let configured = normalize_custom_path(Some(trae_configured_app_path(&current, platform)));
+    resolve_trae_custom_or_detected_path(configured.as_deref(), || {
+        if configured.is_some() {
+            crate::modules::logger::log_info(&format!("[Path Detect] {} 原启动路径已失效，重新自动检测", platform.display_name()));
         }
-        return Err(app_path_missing_error(platform.provider_key()));
-    }
+        detect_trae_exec_path_for_platform(platform)
+    }).ok_or_else(|| app_path_missing_error(platform.provider_key()))
+}
 
-    if let Some(detected) = detect_trae_exec_path_for_platform(platform) {
-        let detected_str = detected.to_string_lossy();
-        if let Some(exec) = resolve_trae_macos_exec_path(&detected_str) {
-            return Ok(exec);
-        }
-        #[cfg(target_os = "macos")]
-        if detected.is_file() {
-            return Ok(detected);
-        }
-        #[cfg(not(target_os = "macos"))]
-        if detected.exists() {
-            return Ok(detected);
-        }
-    }
-
-    Err(app_path_missing_error(platform.provider_key()))
+fn resolve_trae_custom_or_detected_path(
+    configured: Option<&str>,
+    detect: impl FnOnce() -> Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    configured.and_then(resolve_trae_macos_exec_path).or_else(|| {
+        let detected = detect()?;
+        resolve_trae_macos_exec_path(&detected.to_string_lossy())
+    })
 }
 
 /// WorkBuddy 安装路径解析缓存（键：两处配置路径）。与 TRAE 同策略：
@@ -9250,16 +9259,12 @@ pub fn close_workbuddy_instances(
             return Ok(());
         }
 
-        close_user_data_dir_scoped_instances(
-            "WorkBuddy Close",
-            "WorkBuddy",
-            "Unable to close managed WorkBuddy instances; please close them manually and retry",
-            &normalized,
-            timeout_secs,
-            true,
-            default_dir.clone(),
-            collect_workbuddy_process_entries,
-        )?;
+        let targets = filter_entries_by_target_dirs(collect_workbuddy_process_entries_checked()?, &target_dirs, default_dir.as_deref());
+        let pids = collect_remaining_pids(&targets);
+        for pid in &pids { request_windows_graceful_close(*pid,"WorkBuddy Close"); }
+        if !wait_pids_exit(&pids, timeout_secs) {
+            return Err("WorkBuddy 尚未正常退出。请保存当前任务并手动退出客户端，再重试切换；本次未强制关闭".into());
+        }
 
         let entries = collect_workbuddy_process_entries_checked()
             .map_err(|error| format!("WorkBuddy 关闭后进程复查失败，已取消切换: {error}"))?;
@@ -11313,44 +11318,61 @@ fn request_codex_graceful_close(pid: u32) -> bool {
     if pid == 0 || !is_pid_running(pid) {
         return true;
     }
-
     let focus_script = format!(
-        "tell application \"System Events\" to set frontmost of (first process whose unix id is {}) to true",
-        pid
+        "tell application \"System Events\" to set frontmost of (first process whose unix id is {}) to true", pid
     );
+    Command::new("osascript")
+        .args(["-e", &focus_script, "-e", "tell application \"System Events\" to keystroke \"q\" using command down"])
+        .output()
+        .is_ok_and(|output| output.status.success())
+}
+
+#[cfg(target_os = "windows")]
+fn normal_windows_shutdown_args(pid:u32)->[String;3]{["/PID".into(),pid.to_string(),"/T".into()]}
+
+#[cfg(target_os = "windows")]
+fn windows_graceful_shutdown_command(pid: u32) -> Command {
+    use std::os::windows::process::CommandExt;
+    let mut command = Command::new("taskkill");
+    command
+        .args(normal_windows_shutdown_args(pid))
+        .creation_flags(CREATE_NO_WINDOW)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+#[cfg(target_os = "windows")]
+fn request_windows_graceful_close(pid: u32,label:&str) -> bool {
+    if pid == 0 || !is_pid_running(pid) {
+        return true;
+    }
+
     crate::modules::logger::log_info(&format!(
-        "[Codex Close] graceful osascript start pid={}",
+        "[{label}] graceful taskkill start pid={}",
         pid
     ));
-    match Command::new("osascript")
-        .args([
-            "-e",
-            &focus_script,
-            "-e",
-            "tell application \"System Events\" to keystroke \"q\" using command down",
-        ])
-        .output()
-    {
+    match windows_graceful_shutdown_command(pid).output() {
         Ok(output) => {
             if output.status.success() {
                 crate::modules::logger::log_info(&format!(
-                    "[Codex Close] graceful osascript success pid={}",
+                    "[{label}] graceful taskkill success pid={}",
                     pid
                 ));
                 true
             } else {
-                let stderr = String::from_utf8_lossy(&output.stderr);
                 crate::modules::logger::log_warn(&format!(
-                    "[Codex Close] graceful osascript failed pid={} err={}",
+                    "[{label}] graceful taskkill failed pid={} status={}",
                     pid,
-                    stderr.trim()
+                    output.status
                 ));
                 false
             }
         }
         Err(err) => {
             crate::modules::logger::log_warn(&format!(
-                "[Codex Close] graceful osascript error pid={} err={}",
+                "[{label}] graceful taskkill error pid={} err={}",
                 pid, err
             ));
             false
@@ -13800,6 +13822,28 @@ pub fn start_trae_default_with_args_with_new_window(
     }
 }
 
+fn trae_default_start_args(
+    agent_workbench: bool,
+    use_new_window: bool,
+    extra_args: &[String],
+) -> Vec<String> {
+    let mut args = Vec::new();
+    // 合并版冷启动应尊重官方 Agent 启动偏好；编辑器开窗参数会绕过它。
+    if !agent_workbench {
+        args.push(if use_new_window { "--new-window" } else { "--reuse-window" }.to_string());
+    }
+    for arg in extra_args {
+        let arg = arg.trim();
+        if arg.is_empty() { continue; }
+        if agent_workbench && (matches!(arg, "--new-window" | "--reuse-window" | "-n" | "-r")
+            || arg.starts_with("--new-window=") || arg.starts_with("--reuse-window=")) {
+            continue;
+        }
+        args.push(arg.to_string());
+    }
+    args
+}
+
 pub fn start_trae_platform_default_with_args_with_new_window(
     platform_id: &str,
     extra_args: &[String],
@@ -13835,6 +13879,7 @@ pub fn start_trae_platform_default_with_args_with_new_window(
         use std::os::windows::process::CommandExt;
 
         let launch_path = resolve_trae_launch_path_for_platform(platform)?;
+        let agent_workbench = crate::modules::trae_account::is_unified_trae_cn_executable(&launch_path);
         let mut cmd = Command::new(&launch_path);
         apply_managed_proxy_env_to_command(&mut cmd);
         if should_detach_child() {
@@ -13845,17 +13890,7 @@ pub fn start_trae_platform_default_with_args_with_new_window(
         } else {
             cmd.creation_flags(0x08000000);
         }
-        if use_new_window {
-            cmd.arg("--new-window");
-        } else {
-            cmd.arg("--reuse-window");
-        }
-        for arg in extra_args {
-            let trimmed = arg.trim();
-            if !trimmed.is_empty() {
-                cmd.arg(trimmed);
-            }
-        }
+        cmd.args(trae_default_start_args(agent_workbench, use_new_window, extra_args));
         let child = spawn_command_with_trace(&mut cmd)
             .map_err(|e| format!("启动 {} 失败: {}", platform.display_name(), e))?;
         crate::modules::logger::log_info(&format!(
@@ -14314,6 +14349,21 @@ mod codex_path_migration_tests {
 
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
+    #[test]
+    fn workbuddy_shutdown_command_uses_windows_without_forcing_exit() {
+        let command = super::windows_graceful_shutdown_command(123);
+        assert_eq!(command.get_program(), "taskkill");
+        let args = command.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>();
+        assert_eq!(args, ["/PID", "123", "/T"]);
+        assert!(!args.iter().any(|arg| arg.eq_ignore_ascii_case("/F")));
+    }
+
+    #[test]
+    fn workbuddy_shutdown_arguments_never_force_exit(){
+        assert_eq!(super::normal_windows_shutdown_args(123),["/PID","123","/T"]);
+        assert!(!super::normal_windows_shutdown_args(123).iter().any(|a|a=="/F"));
+    }
+
     use super::{
         build_elevated_taskkill_arguments, running_app_candidate_matches,
         windows_app_launch_signature, windows_trae_candidate_matches_platform,
@@ -14451,6 +14501,50 @@ mod tests {
             solo_cn,
             TraePlatformKind::TraeSolo
         ));
+    }
+
+    #[test]
+    fn relocated_trae_is_recognized_by_product_identity_not_folder_name() {
+        let dir = std::env::temp_dir().join(format!("relocated-trae-{}-{}", std::process::id(), uuid::Uuid::new_v4()));
+        let resources = dir.join("resources/app");
+        std::fs::create_dir_all(&resources).unwrap();
+        std::fs::write(resources.join("product.json"), r#"{"applicationName":"trae-cn","appVersion":"3.4.3"}"#).unwrap();
+        let exe = dir.join("Trae CN.exe");
+        std::fs::write(&exe, b"fixture").unwrap();
+        assert!(windows_trae_candidate_matches_platform(&exe, TraePlatformKind::TraeCn));
+        assert!(!windows_trae_candidate_matches_platform(&exe, TraePlatformKind::TraeSoloCn));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn stale_custom_trae_path_falls_back_to_detection() {
+        let dir = std::env::temp_dir().join(format!("trae-path-fallback-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("Trae CN.exe");
+        std::fs::write(&exe, b"fixture").unwrap();
+        let old = dir.join("removed/Trae CN.exe");
+        assert_eq!(super::resolve_trae_custom_or_detected_path(Some(&old.to_string_lossy()), || Some(exe.clone())), Some(exe.clone()));
+        assert_eq!(super::resolve_trae_custom_or_detected_path(Some(&exe.to_string_lossy()), || panic!("valid custom path must win")), Some(exe));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn trae_default_start_agent_workbench_uses_official_startup_preference() {
+        assert!(super::trae_default_start_args(true, true, &[]).is_empty());
+        assert!(super::trae_default_start_args(true, false, &[]).is_empty());
+    }
+
+    #[test]
+    fn trae_default_start_agent_workbench_removes_forced_editor_flags() {
+        let args = ["--new-window", "-r", "--reuse-window", "-n", "--locale=zh-CN"]
+            .map(str::to_string);
+        assert_eq!(super::trae_default_start_args(true, true, &args), vec!["--locale=zh-CN"]);
+    }
+
+    #[test]
+    fn trae_default_start_legacy_keeps_existing_window_behavior() {
+        assert_eq!(super::trae_default_start_args(false, true, &[]), vec!["--new-window"]);
+        assert_eq!(super::trae_default_start_args(false, false, &[]), vec!["--reuse-window"]);
     }
 
     #[test]

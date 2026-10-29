@@ -101,3 +101,7 @@ export function syncWorkBuddyGitHub(): Promise<void> {
 export function triggerWorkBuddyCheckin(accountId: string): Promise<void> {
   return invoke('trigger_workbuddy_checkin', { accountId });
 }
+
+export function recoverWorkBuddyAuth(accountId: string): Promise<WorkBuddyAccountView> {
+  return invoke('recover_workbuddy_auth', { accountId });
+}

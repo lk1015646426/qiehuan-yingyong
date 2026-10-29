@@ -67,6 +67,29 @@ pub fn create_domestic_client(timeout_secs: u64, host: &str) -> Client {
     }
 }
 
+/// Same route and proxy policy as domestic status queries, for loopback relay workers.
+pub(crate) fn create_domestic_blocking_client(
+    timeout_secs: u64,
+    host: &str,
+) -> Result<reqwest::blocking::Client, String> {
+    let mut builder = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .connect_timeout(Duration::from_secs(15))
+        .no_proxy();
+    #[cfg(windows)]
+    if !host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback()) {
+        if let Some((ip, addresses)) = resolve_domestic_route(host) {
+            builder = builder.local_address(IpAddr::V4(ip));
+            if let Some(address) = addresses.first() {
+                builder = builder.resolve(host, SocketAddr::new(IpAddr::V4(*address), 443));
+            }
+        }
+    }
+    builder
+        .build()
+        .map_err(|_| "国内网络客户端初始化失败".into())
+}
+
 pub(crate) fn format_request_error(label: &str, error: &dyn Error) -> String {
     let mut parts = Vec::new();
     let mut current = Some(error);
@@ -118,6 +141,18 @@ fn select_preferred_ipv4(addresses: &[IpAddr]) -> Option<Ipv4Addr> {
 
 #[cfg(windows)]
 fn resolve_domestic_route(host: &str) -> Option<(Ipv4Addr, Vec<Ipv4Addr>)> {
+    static PROBE: Mutex<()> = Mutex::new(());
+    static FAILED: LazyLock<Mutex<Option<(String, Instant)>>> = LazyLock::new(|| Mutex::new(None));
+    let _single_flight = PROBE.lock().ok()?;
+    if FAILED
+        .lock()
+        .ok()?
+        .as_ref()
+        .is_some_and(|(name, until)| name == host && *until > Instant::now())
+    {
+        return None;
+    }
+
     if let Ok(cache) = DOMESTIC_ROUTE_CACHE.lock() {
         if let Some(entry) = cache
             .as_ref()
@@ -165,7 +200,13 @@ fn resolve_domestic_route(host: &str) -> Option<(Ipv4Addr, Vec<Ipv4Addr>)> {
         .filter(|value| select_preferred_ipv4(&[IpAddr::V4(*value)]).is_some())
         .collect::<Vec<_>>();
     if addresses.is_empty() {
+        if let Ok(mut failed) = FAILED.lock() {
+            *failed = Some((host.into(), Instant::now() + Duration::from_secs(15)));
+        }
         return None;
+    }
+    if let Ok(mut failed) = FAILED.lock() {
+        *failed = None;
     }
     if let Ok(mut cache) = DOMESTIC_ROUTE_CACHE.lock() {
         *cache = Some(CachedDomesticRoute {
