@@ -8,7 +8,7 @@
 
 ## 下载与安装
 
-当前版本：**0.1.17**。前往 [GitHub Releases](https://github.com/lk1015646426/qiehuan-yingyong/releases/tag/v0.1.17) 下载 `切换应用_0.1.17_x64-setup.exe`，同页提供 `SHA256SUMS.txt`。已安装旧版时可原地升级；升级前保存正在执行的任务。账号保存在当前 Windows 用户的本地数据目录，安装包不包含个人账号或密钥。
+当前版本：**0.1.17**。前往 [GitHub Releases](https://github.com/lk1015646426/qiehuan-yingyong/releases/tag/v0.1.17) 下载 `qiehuan-yingyong_0.1.17_x64-setup.exe`，同页提供 `SHA256SUMS.txt`。已安装旧版时可原地升级；升级前保存正在执行的任务。账号保存在当前 Windows 用户的本地数据目录，安装包不包含个人账号或密钥。
 
 ## 功能定位
 
