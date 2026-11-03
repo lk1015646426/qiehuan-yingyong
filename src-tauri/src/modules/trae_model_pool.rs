@@ -533,7 +533,32 @@ pub fn status() -> Result<Status, String> {
     }
 }
 
+fn debug_log(line: &str) {
+    use std::io::Write;
+    let Some(home) = std::env::var_os("USERPROFILE") else {
+        return;
+    };
+    let dir = std::path::Path::new(&home)
+        .join(".qiehuan_yingyong")
+        .join("logs");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("trae-pool-debug.log"))
+    {
+        let _ = writeln!(file, "{stamp} {line}");
+    }
+}
+
 fn reply(request: Request, status: u16, message: &str) {
+    debug_log(&format!("reply status={status} message={message}"));
     let _ = request.respond(
         Response::from_string(
             json!({"error":{"type":"trae_pool_error","message":message}}).to_string(),
@@ -718,6 +743,14 @@ fn handle(mut request: Request, pool: &Pool) {
         }
     };
     let requested = input.get("model").and_then(Value::as_str).unwrap_or_default();
+    debug_log(&format!(
+        "chat path={} bytes={} model={} stream={} body={}",
+        request.url(),
+        bytes.len(),
+        requested,
+        input.get("stream").and_then(Value::as_bool).unwrap_or(false),
+        String::from_utf8_lossy(&bytes[..bytes.len().min(3000)])
+    ));
     let normalized = requested.rsplit_once("//").map_or(requested, |(_, tail)| tail);
     let Some(model) = normalized.strip_prefix(PREFIX).map(str::to_owned) else {
         reply(
@@ -745,6 +778,10 @@ fn handle(mut request: Request, pool: &Pool) {
             return;
         }
     };
+    debug_log(&format!(
+        "forward model={model} candidates={}",
+        available.len()
+    ));
     relay(request, pool, &input, body, &model, available, ORIGIN);
 }
 
