@@ -717,13 +717,14 @@ fn handle(mut request: Request, pool: &Pool) {
             return;
         }
     };
-    let Some(model) = input
-        .get("model")
-        .and_then(Value::as_str)
-        .and_then(|s| s.strip_prefix(PREFIX))
-        .map(str::to_owned)
-    else {
-        reply(request, 400, "请选择 trae-pool- 账号池模型");
+    let requested = input.get("model").and_then(Value::as_str).unwrap_or_default();
+    let normalized = requested.rsplit_once("//").map_or(requested, |(_, tail)| tail);
+    let Some(model) = normalized.strip_prefix(PREFIX).map(str::to_owned) else {
+        reply(
+            request,
+            400,
+            &format!("请选择 trae-pool- 账号池模型（收到：{requested}）"),
+        );
         return;
     };
     if !pool.selected.lock().is_ok_and(|s| s.contains(&model)) {
