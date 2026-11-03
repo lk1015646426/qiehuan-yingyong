@@ -1,5 +1,6 @@
 pub mod system;
 pub mod trae_instance;
+pub mod trae_pool;
 pub mod work_cn;
 pub mod work_cn_checkin;
 pub mod work_cn_github;

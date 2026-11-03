@@ -4,7 +4,7 @@
 //! 已有 GitHub Actions 仓库的 Secrets。**绝不**在本地执行签到（claim）。
 //!
 //! 所有 `gh` 子进程调用都抽象为 `GitHubRunner`，测试用 `FakeGitHubRunner`
-//! 验证参数不含凭证、secret 值走 stdin、四个 secret 都被调用、且首个失败后
+//! 验证参数不含凭证、secret 值走 stdin、五个 secret 都被调用、且首个失败后
 //! 不报告整体成功（开发指南 §8.5 自动测试要求）。
 
 use std::path::PathBuf;
@@ -582,7 +582,7 @@ fn configured_secret_stem(slot: &WorkCnGitHubSlot) -> Result<Option<String>, Str
 fn resolved_secret_names(
     account: &TraeAccount,
     slot: &WorkCnGitHubSlot,
-) -> Result<[String; 4], String> {
+) -> Result<[String; 5], String> {
     let stem = configured_secret_stem(slot)?.unwrap_or_else(|| slot_secret_stem(account));
     Ok([
         if slot.token_secret.is_empty() {
@@ -597,6 +597,7 @@ fn resolved_secret_names(
         },
         format!("{stem}_DEVICE_BRAND"),
         format!("{stem}_DEVICE_TYPE"),
+        format!("{stem}_REFRESH_JSON"),
     ])
 }
 
@@ -792,8 +793,12 @@ fn sync_account_secrets_with_context(
 
     // 默认 secret 名以本地账号槽位名命名（如备注「backup-1」→ BACKUP_1_TOKEN），
     // 手动配置过的名字优先。
-    let [token_secret, device_secret, device_brand_secret, device_type_secret] =
+    let [token_secret, device_secret, device_brand_secret, device_type_secret, refresh_secret] =
         resolved_secret_names(account, slot)?;
+
+    let refresh_material = serde_json::to_string(
+        &crate::modules::trae_account::build_cloud_refresh_material(account)?,
+    ).map_err(|_| "云端续期材料序列化失败".to_string())?;
 
     // 4) set every value through stdin only. Ordering is stable for tests and
     // makes the token failure short-circuit before any device metadata write.
@@ -802,6 +807,7 @@ fn sync_account_secrets_with_context(
         (device_secret.as_str(), device_id),
         (device_brand_secret.as_str(), device_brand.trim()),
         (device_type_secret.as_str(), device_type.trim()),
+        (refresh_secret.as_str(), refresh_material.as_str()),
     ] {
         let output = runner
             .run(
@@ -1064,6 +1070,24 @@ mod tests {
     }
 
     #[test]
+    fn work_cn_github_sync_includes_current_refresh_material() {
+        let runner = FakeGitHubRunner::new();
+        let mut account = make_account("refresh-test", &jwt_with_exp(9_999_999_999), Some("1132918838145530"));
+        account.machine_id = Some("test-machine".into());
+        let slot = WorkCnGitHubSlot { slot: 1, account_id: account.id.clone(), checkin_enabled: true, token_secret: "TEST_TOKEN".into(), device_secret: "TEST_DEVICE_ID".into() };
+        sync_account_secrets(&runner, &account, &slot, "o/r").unwrap();
+        let calls = runner.recorded_calls();
+        let refresh = calls.iter().find(|c| c.args.get(2).map(String::as_str) == Some("TEST_REFRESH_JSON")).expect("cloud refresh material must be synced with access token");
+        let material: serde_json::Value = serde_json::from_str(refresh.stdin.as_ref().unwrap()).unwrap();
+        assert_eq!(material["refresh_token"], "rt");
+        assert_eq!(material["device_id"], "1132918838145530");
+        assert_eq!(material["machine_id"], "test-machine");
+        assert_eq!(material["private_key_pem"], "private-key");
+        assert!(material["client_id"].as_str().is_some_and(|s| !s.is_empty()));
+        assert_eq!(material["device_info"]["DeviceID"], "1132918838145530");
+    }
+
+    #[test]
     fn work_cn_github_parse_jwt_exp_roundtrip() {
         let exp = 9_999_999_999i64;
         let token = jwt_with_exp(exp);
@@ -1187,13 +1211,13 @@ mod tests {
         assert!(!result.skipped);
 
         let calls = runner.recorded_calls();
-        // auth + 4 secret sets = 5 calls
-        assert_eq!(calls.len(), 5, "应调用 auth status + 四个 secret set");
+        // auth + 5 secret sets = 6 calls
+        assert_eq!(calls.len(), 6, "应调用 auth status + 五个 secret set");
         let secret_calls: Vec<&FakeCall> = calls
             .iter()
             .filter(|c| c.args.first().map(|s| s.as_str()) == Some("secret"))
             .collect();
-        assert_eq!(secret_calls.len(), 4, "应恰好设置四个 secret");
+        assert_eq!(secret_calls.len(), 5, "应恰好设置五个 secret");
 
         for c in &secret_calls {
             // token/device must NOT appear on the command line
@@ -1247,6 +1271,7 @@ mod tests {
                 "CUSTOM_DEVICE_ID".to_string(),
                 "CUSTOM_DEVICE_BRAND".to_string(),
                 "CUSTOM_DEVICE_TYPE".to_string(),
+                "CUSTOM_REFRESH_JSON".to_string(),
             ]
         );
     }
@@ -1433,7 +1458,7 @@ mod tests {
             device_secret: String::new(),
         };
         let deleted = delete_slot_secrets_with(&runner, &account, &slot, "o/r").unwrap();
-        assert_eq!(deleted.len(), 4, "应删除全部 4 个 secret");
+        assert_eq!(deleted.len(), 5, "应删除全部 5 个 secret");
         let calls = runner.recorded_calls();
         let delete_calls: Vec<&FakeCall> = calls
             .iter()
@@ -1442,7 +1467,7 @@ mod tests {
                     && c.args.get(1).map(String::as_str) == Some("delete")
             })
             .collect();
-        assert_eq!(delete_calls.len(), 4, "必须逐个删除 4 个 secret");
+        assert_eq!(delete_calls.len(), 5, "必须逐个删除 5 个 secret");
         for call in &delete_calls {
             assert!(
                 call.args.iter().any(|a| a == "o/r"),
@@ -1641,7 +1666,7 @@ mod tests {
         assert!(!result.skipped);
 
         let calls = runner.recorded_calls();
-        assert_eq!(calls.len(), 5, "应调用 auth status + 四个 secret set");
+        assert_eq!(calls.len(), 6, "应调用 auth status + 五个 secret set");
         assert_eq!(calls[0].args.first().map(|s| s.as_str()), Some("auth"));
         assert_eq!(calls[1].args.first().map(|s| s.as_str()), Some("secret"));
         assert_eq!(calls[2].args.first().map(|s| s.as_str()), Some("secret"));

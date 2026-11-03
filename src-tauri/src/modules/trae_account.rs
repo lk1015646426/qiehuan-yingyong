@@ -5343,6 +5343,30 @@ fn build_refresh_device_info(account: &TraeAccount, public_key_pem: &str) -> Val
     Value::Object(device_info)
 }
 
+/// Exact official refresh context for the cloud signer. This value contains
+/// credentials: pass it through stdin to Secrets, never through logs or UI.
+pub(crate) fn build_cloud_refresh_material(account: &TraeAccount) -> Result<Value, String> {
+    let pair = resolve_device_key_pair_for_refresh(account)
+        .ok_or_else(|| "缺少设备密钥，请重新导入完整账号快照".to_string())?;
+    let refresh = normalize_non_empty(account.refresh_token.as_deref())
+        .ok_or_else(|| "缺少刷新令牌，请重新登录并导入账号".to_string())?;
+    let device_id = resolve_official_checkin_device_id(account)?;
+    let mut info = build_refresh_device_info(account, &pair.public_key_pem);
+    info["DeviceID"] = serde_json::json!(device_id);
+    let machine_id = account.machine_id.as_deref()
+        .or_else(|| info.get("MachineID").and_then(Value::as_str)).unwrap_or("").to_string();
+    info["MachineID"] = serde_json::json!(machine_id);
+    Ok(serde_json::json!({
+        "refresh_token": refresh,
+        "private_key_pem": pair.private_key_pem,
+        "public_key_pem": pair.public_key_pem,
+        "device_id": device_id,
+        "machine_id": machine_id,
+        "client_id": build_refresh_routing_context(account).client_id,
+        "device_info": info,
+    }))
+}
+
 fn build_device_proof_message(
     client_id: &str,
     refresh_token: &str,

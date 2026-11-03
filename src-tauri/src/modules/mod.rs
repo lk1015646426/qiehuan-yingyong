@@ -27,6 +27,7 @@ pub mod sync_settings;
 pub mod test_support;
 pub mod trae_account;
 pub mod trae_instance;
+pub mod trae_pool;
 pub mod trae_oauth;
 pub mod tray;
 pub mod webkit_cache_maintenance;
@@ -42,6 +43,8 @@ pub mod workbuddy_settings;
 pub mod workbuddy_silent_refresh;
 pub mod workbuddy_status;
 pub mod workbuddy_pool;
+pub(crate) mod trae_pool_protocol;
+pub mod trae_model_pool;
 
 // 重新导出常用函数
 pub use account::*;

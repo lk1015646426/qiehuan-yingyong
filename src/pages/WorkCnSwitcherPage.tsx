@@ -19,6 +19,7 @@ import { CloudCheckinPanel } from '../components/checkin/CloudCheckinPanel';
 import { WorkCnAddAccountDialog } from '../components/work-cn/WorkCnAddAccountDialog';
 import { WorkCnSettingsDialog } from '../components/work-cn/WorkCnSettingsDialog';
 import { WorkCnStatusBanner } from '../components/work-cn/WorkCnStatusBanner';
+import { TraePoolPanel } from '../components/work-cn/TraePoolPanel';
 import { GhSetupDialog } from '../components/work-cn/GhSetupDialog';
 import type { WorkCnInstallation, WorkCnAccountView, WorkCnCreditsSummary, WorkCnGitHubSyncResult, WorkCnSessionWatchStatus } from '../types/workCn';
 import type { RefreshFlowState } from '../types/checkin';
@@ -586,6 +587,8 @@ export function WorkCnSwitcherPage() {
       <WorkCnStatusBanner />
 
       <StoreErrorBanner />
+
+      <TraePoolPanel accountId={activeAccountId} />
 
       <section>
         <h2 className="wc-section-title">

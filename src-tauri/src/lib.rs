@@ -274,6 +274,7 @@ pub fn run() {
 
             modules::work_cn_session_watcher::ensure_started(app.handle().clone());
             tauri::async_runtime::spawn(modules::workbuddy_pool::restore_workbuddy_pool());
+            tauri::async_runtime::spawn(modules::trae_model_pool::restore());
 
             #[cfg(target_os = "macos")]
             apply_macos_activation_policy(&app.handle());
@@ -437,6 +438,16 @@ pub fn run() {
             commands::workbuddy::sync_workbuddy_github,
             commands::workbuddy::trigger_workbuddy_checkin,
             // Trae Instance Commands
+            // TRAE 账号池：每账号一个隔离实例，启动走既有切换事务
+            commands::trae_pool::get_trae_pool_status,
+            commands::trae_pool::ensure_trae_pool_instance,
+            commands::trae_pool::start_trae_pool_account,
+            commands::trae_pool::get_trae_model_pool_status,
+            commands::trae_pool::get_trae_model_pool_models,
+            commands::trae_pool::save_trae_model_pool_models,
+            commands::trae_pool::start_trae_model_pool,
+            commands::trae_pool::stop_trae_model_pool,
+            commands::trae_pool::register_trae_model_pool_models,
             commands::trae_instance::trae_get_instance_defaults,
             commands::trae_instance::trae_list_instances,
             commands::trae_instance::trae_create_instance,
