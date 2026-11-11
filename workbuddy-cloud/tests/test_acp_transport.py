@@ -31,6 +31,10 @@ class ACPFixtureHandler(BaseHTTPRequestHandler):
         if self.path != "/acp" or self.headers.get("Authorization") != f"Bearer {TICKET}":
             self.send_error(401)
             return
+        connection_queue = queue.Queue()
+        with self.server.active_lock:
+            self.server.active_queue = connection_queue
+            self.server.all_queues.append(connection_queue)
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.send_header("Acp-Connection-Id", CONNECTION)
@@ -38,7 +42,7 @@ class ACPFixtureHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.flush()
         while True:
-            item = self.server.events.get()
+            item = connection_queue.get()
             if item is None:
                 break
             wire = ("data: " + json.dumps(item, ensure_ascii=False) + "\n\n").encode("utf-8")
@@ -70,23 +74,27 @@ class ACPFixtureHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
         self.wfile.flush()
+        with self.server.active_lock:
+            target = self.server.active_queue
+        if target is None:
+            return
         if rpc["method"] in ("initialize", "session/load"):
-            self.server.events.put({"jsonrpc":"2.0","id":rpc["id"],"result":{}})
+            target.put({"jsonrpc":"2.0","id":rpc["id"],"result":{}})
         elif rpc["method"] == "session/prompt":
             if self.server.permission_mode:
-                self.server.events.put({"jsonrpc":"2.0","id":100,
+                target.put({"jsonrpc":"2.0","id":100,
                     "method":"session/request_permission",
                     "params":{"sessionId":TASK_ID,"options":[{"optionId":"allow"}]}})
             else:
                 for part in ("你好", "，ACP"):
-                    self.server.events.put({
+                    target.put({
                         "jsonrpc":"2.0","method":"session/update",
                         "params":{"sessionId":TASK_ID,"update":{
                             "sessionUpdate":"agent_message_chunk",
                             "content":{"type":"text","text":part}
                         }},
                     })
-                self.server.events.put({
+                target.put({
                     "jsonrpc":"2.0","id":rpc["id"],"result":{"stopReason":"end_turn"},
                 })
 
@@ -96,14 +104,17 @@ class ACPTransportTests(unittest.TestCase):
         cls.server = ThreadingHTTPServer(("127.0.0.1", 0), ACPFixtureHandler)
         cls.server.record = []
         cls.server.rpcs = []
-        cls.server.events = queue.Queue()
+        cls.server.active_lock = threading.Lock()
+        cls.server.active_queue = None
+        cls.server.all_queues = []
         cls.server.permission_mode = False
         cls.background = threading.Thread(target=cls.server.serve_forever,daemon=True)
         cls.background.start()
 
     @classmethod
     def tearDownClass(cls):
-        cls.server.events.put(None)
+        for connection_queue in cls.server.all_queues:
+            connection_queue.put(None)
         cls.server.shutdown()
         cls.server.server_close()
         cls.background.join(timeout=3)
@@ -112,8 +123,8 @@ class ACPTransportTests(unittest.TestCase):
         self.server.permission_mode = False
         self.server.record.clear()
         self.server.rpcs.clear()
-        while not self.server.events.empty():
-            self.server.events.get_nowait()
+        with self.server.active_lock:
+            self.server.active_queue = None
         self.task = Task(
             TASK_ID, "working",
             f"http://127.0.0.1:{self.server.server_port}/acp",
