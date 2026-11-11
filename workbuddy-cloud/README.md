@@ -69,3 +69,43 @@ GitHub Actions 将使用 ubuntu-latest + windows-latest 跑相同测试。
 5. **最终路线决策**：如果官方任务接口不能提供原模型池额度，就将两者分开，不把云端任务接口误称为多账号池云端化成功。
 
 **严格不做：**使用官方客户端私有加密密钥迁移到 Linux、将桌面 refresh token 导出公开仓库、绕开第三方平台授权、以多账号规避平台限额、将无保护的测试服务器暴露公网。
+
+
+## P0.2：ACP → OpenAI 协议适配器（离线测试）
+
+新增：
+- bridge.py：将 ACP v1 的 agent_message_chunk 文本事件转换为 OpenAI Chat Completions SSE 帧。
+- mock_openai_server.py：仅在 127.0.0.1 提供 HTTP 模拟接口，提供模型列表、流式/非流式聊天。
+- tests/test_bridge.py / tests/test_mock_gateway.py：检查消息顺序、中文 UTF-8、角色标记、结束信号、拒绝权限自动批准、错误模型与回环安全边界。
+
+2026-11-11 本机测试：Python unittest **33/33 通过**；未访问实际 WorkBuddy 云端，亦未读取本机账号池。
+
+### 启动本地模拟服务（Windows PowerShell）
+
+在仓库根目录运行：
+
+    $env:WB_MOCK_CLIENT_KEY = 'local-fixture-key-only-123456789'
+    python workbuddy-cloud/mock_openai_server.py
+
+在本机客户端设置：
+
+- 协议：OpenAI Chat Completions
+- Base URL：http://127.0.0.1:18792/v1
+- API Key：上面自行设置的测试密钥
+- 模型 ID：workbuddy-official-acp-mock
+
+**这是纯模拟，不提供真实 AI 回复。** 只监听电脑本机，不能在平板上直接访问。使用真实云端模型必须首先取得官方开放平台第三方应用授权；不得直接把这个 P0 服务暴露公网。
+
+### 实际落地判定
+
+| 条件 | 当前状态 |
+| --- | --- |
+| OpenAI HTTP 格式 / ACP 文本转换 | 离线通过 |
+| Linux CI | 由 GitHub Actions 单独验收 |
+| 第三方应用获批、OAuth 授权 | 未完成 |
+| 官方真实云端任务 / ACP 会话 | 未调用 |
+| 原多账号池积分可用于官方云端任务 | 官方文档没有承诺，未证实 |
+| 免费且中国大陆节点、无需 ICP 的云端托管 | 未证实 |
+| 安卓 DSH Go 真实接入 | 未完成 |
+
+**现阶段不应购买云服务器或上传任何 WorkBuddy 登录快照。**
