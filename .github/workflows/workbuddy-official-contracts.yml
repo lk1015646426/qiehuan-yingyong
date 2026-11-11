@@ -1,0 +1,29 @@
+name: WorkBuddy official cloud contract (no real credentials)
+
+on:
+  push:
+    branches: [codex/workbuddy-official-cloud-p0]
+    paths:
+      - 'workbuddy-cloud/**'
+      - '.github/workflows/workbuddy-official-contracts.yml'
+  pull_request:
+    paths:
+      - 'workbuddy-cloud/**'
+      - '.github/workflows/workbuddy-official-contracts.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  official-protocol:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python version
+        run: python3 --version
+      - name: Official OAuth cloud task and ACP offline tests
+        run: python3 -m unittest discover -s workbuddy-cloud/tests -p 'test_*.py' -v
+      - name: Static compile check
+        run: python3 -m compileall -q workbuddy-cloud
