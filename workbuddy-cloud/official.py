@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Any
 from urllib.parse import urlencode, urlsplit, urlunsplit
 from urllib.request import Request, build_opener, HTTPRedirectHandler
@@ -107,6 +107,9 @@ class Task:
     link: str | None
     # Do not store ACP task ticket in a printable Task.
     token_available: bool
+    # Secret is deliberately excluded from repr, logs and equality comparison.
+    # Held only in memory after official user OAuth consent; never written to files.
+    acp_ticket: str | None = field(default=None, repr=False, compare=False)
 
     @classmethod
     def from_response(cls, payload: dict) -> "Task":
@@ -119,7 +122,10 @@ class Task:
             parts=urlsplit(link)
             if parts.scheme!="https" or not parts.hostname or parts.username or parts.password:
                 raise WorkBuddyOfficialError("Invalid ACP link")
-        return cls(task_id,status,link, bool(payload.get("token")))
+        token=payload.get("token")
+        if token is not None and (not isinstance(token,str) or not token or len(token)>4096):
+            raise WorkBuddyOfficialError("Invalid ACP task ticket")
+        return cls(task_id,status,link, bool(token),token)
 
 class TasksClient:
     def __init__(self, access_token: str, transport: Transport=real_transport):
