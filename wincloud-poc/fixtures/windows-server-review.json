@@ -1,0 +1,10 @@
+{
+  "OsCaption": "Microsoft Windows Server 2022 Datacenter",
+  "MemoryGB": 4,
+  "CpuCores": 2,
+  "DiskFreeGB": 35,
+  "InteractiveSession": true,
+  "ClientProcessDetected": true,
+  "PoolLoopbackResponds": true,
+  "TailscaleInstalled": true
+}
