@@ -44,7 +44,7 @@ class AuditTests(unittest.TestCase):
 
     def test_no_runtime_or_credentials_discovery(self):
         source = SCRIPT.read_text(encoding="utf-8")
-        self.assertNotIn("LOCALAPPDATA", source)
+        self.assertNotIn("os.environ", source)
         self.assertNotIn("os.environ.get", source)
         self.assertNotIn("subprocess.run", source)
         self.assertNotIn("requests.get", source)
