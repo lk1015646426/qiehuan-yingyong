@@ -1,0 +1,10 @@
+{
+  "OsCaption": "Microsoft Windows 11 Pro",
+  "MemoryGB": 8,
+  "CpuCores": 4,
+  "DiskFreeGB": 65,
+  "InteractiveSession": true,
+  "ClientProcessDetected": true,
+  "PoolLoopbackResponds": true,
+  "TailscaleInstalled": true
+}
