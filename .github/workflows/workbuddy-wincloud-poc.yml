@@ -1,0 +1,35 @@
+name: WorkBuddy Windows cloud POC offline preflight
+
+on:
+  push:
+    branches: [codex/workbuddy-wincloud-poc]
+    paths:
+      - "wincloud-poc/**"
+      - ".github/workflows/workbuddy-wincloud-poc.yml"
+  pull_request:
+    paths:
+      - "wincloud-poc/**"
+      - ".github/workflows/workbuddy-wincloud-poc.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wincloud-contract:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: PowerShell 7 syntax and fixture tests
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          ./wincloud-poc/Test-WinCloudPoc.Tests.ps1
+      - name: Validate private Serve defaults without publishing
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $preview = ./wincloud-poc/Enable-PrivateTailnet.ps1
+          if (($preview -join ' ') -notmatch 'No changes made') { throw 'Serve preview must be no-op' }
+          Write-Output 'PASS: no cloud instance, credentials, public port or network exposure'
