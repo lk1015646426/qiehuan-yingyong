@@ -1,0 +1,44 @@
+name: Headless cloud API contract tests
+
+on:
+  push:
+    branches:
+      - codex/cloud-api-p0
+    paths:
+      - 'cloud-p0/**'
+      - 'cloud-p1/**'
+      - '.github/workflows/cloud-api-contracts.yml'
+  pull_request:
+    paths:
+      - 'cloud-p0/**'
+      - 'cloud-p1/**'
+      - '.github/workflows/cloud-api-contracts.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-contracts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+      - name: Show toolchain
+        run: |
+          rustc --version
+          cargo --version
+          python3 --version
+      - name: P0 Rust tests
+        run: cargo test --locked --manifest-path cloud-p0/Cargo.toml
+      - name: P0 HTTP tests
+        run: |
+          cargo build --locked --manifest-path cloud-p0/Cargo.toml
+          python3 cloud-p0/tests/contract.py cloud-p0/target/debug/qiehuan-cloud-p0
+      - name: P1 Rust tests
+        run: cargo test --locked --manifest-path cloud-p1/Cargo.toml
+      - name: P1 HTTP tests (mock upstream only)
+        run: |
+          cargo build --locked --manifest-path cloud-p1/Cargo.toml
+          python3 cloud-p1/tests/contract.py cloud-p1/target/debug/qiehuan-cloud-p1
