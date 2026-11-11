@@ -7,6 +7,18 @@ All notable changes to Cockpit Tools will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ---
+## [0.1.22] - 2026-11-04
+
+### Changed
+- Unified compact WorkBuddy / TRAE account-pool cards with model-management drawers and model search, addition, removal, and clearing.
+- Improved TRAE pool model registration, consecutive conversations, compatibility with custom OpenAI model identifiers, and request-scoped diagnostics.
+- Improved theme contrast, modal focus management, and warnings for unsaved changes.
+- Preserved existing account authentication, encryption, and refresh behavior; no backend credential-rotation changes in the 0.1.22 UI update.
+
+### Verification
+- On 2026-11-11, TypeScript type checking and all 57 automated tests passed.
+- The Windows x64 NSIS installer is provided with SHA-256 checksums. Real-device UI and account-sync verification remains separate.
+
 ## [0.1.17] - 2026-10-29
 
 ### Fixed and delivered

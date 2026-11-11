@@ -217,6 +217,7 @@ export function WorkBuddyPage() {
     </section>
     {sessionWatchStatus?.message ? <section className={`wc-status${sessionWatchStatus.outcome === 'FAILED' || sessionWatchStatus.githubError ? ' wc-status--error' : sessionWatchStatus.outcome === 'TOKEN_UPDATED' ? ' wc-status--ok' : ''}`}><span className="wc-status-dot" /><div>{sessionWatchStatus.message}</div></section> : null}
     {error || notice ? <section className={`wc-status ${error ? 'wc-status--error' : 'wc-status--ok'}`}><div style={{ flex: 1 }}>{error ?? notice}</div><button type="button" className="wc-btn" onClick={clearFeedback}>知道了</button></section> : null}
+    <WorkBuddyPoolPanel />
     <WorkBuddyCreditsSummary accountIds={accounts.map(account => account.id)} statuses={statusById} loading={updatingCredits} />
     <section>
       <h2 className="wc-section-title">已保存账号（{accounts.length}{loading ? ' · 加载中…' : ''}）</h2>
@@ -228,7 +229,6 @@ export function WorkBuddyPage() {
     {/* 云端签到任务（共享面板）：与 TRAE 同一签到仓库，可查看运行记录并手动触发验证。
         触发条件由后端校验（github.json 未配置时返回友好提示）。 */}
     <WorkBuddyActivitiesPanel />
-    <WorkBuddyPoolPanel />
     <CloudCheckinPanel />
     <WorkBuddyAddAccountDialog open={dialogOpen} onClose={() => setDialogOpen(false)} />
     <WorkBuddySettingsDialog open={settingsOpen} onClose={() => setSettingsOpen(false)} onSaved={refreshInstallation} />

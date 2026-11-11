@@ -2,6 +2,12 @@
 //! The official client owns conversation history and executes its own tools.
 use super::trae_pool_protocol::{self as protocol, FrameAction, StreamGuard};
 use crate::models::trae::TraeAccount;
+use aes_gcm::{
+    aead::{Aead, Payload},
+    Aes256Gcm, KeyInit, Nonce,
+};
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -57,7 +63,60 @@ pub struct RegistrationResult {
     pub endpoint: String,
 }
 
-fn registration_payload(model: &Model, local_key: &str) -> Value {
+// Model credentials use the llm-client AEAD envelope, not the unrelated
+// storage.json byte-crypto envelope. These constants describe the public wire
+// format; the user's local API key is never used as the encryption key.
+fn native_model_cipher() -> Result<Aes256Gcm, String> {
+    let mut material = *b"f4gh7jk9lkln0qs2tuxyjk9ln0qs2tu5";
+    for i in 0..8 {
+        material[i] ^= b"qs2tu5vw"[i];
+    }
+    Aes256Gcm::new_from_slice(&material).map_err(|_| "TRAE 模型密钥封装初始化失败".into())
+}
+
+fn seal_model_key(local_key: &str) -> Result<String, String> {
+    if local_key.trim().is_empty() {
+        return Err("本地模型连接密钥为空，未注册".into());
+    }
+    let mut nonce = [0u8; 12];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let encrypted = native_model_cipher()?
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: local_key.as_bytes(),
+                aad: b"1741255278",
+            },
+        )
+        .map_err(|_| "TRAE 模型密钥封装失败，未回退到明文".to_string())?;
+    let mut wire = nonce.to_vec();
+    wire.extend(encrypted);
+    Ok(B64.encode(wire))
+}
+
+fn open_model_key(encoded: &str) -> Result<String, String> {
+    if encoded.len() > 8192 {
+        return Err("TRAE 模型密钥封装过大".into());
+    }
+    let raw = B64
+        .decode(encoded)
+        .map_err(|_| "TRAE 模型密钥不是有效封装")?;
+    if raw.len() < 28 {
+        return Err("TRAE 模型密钥封装不完整".into());
+    }
+    let decoded = native_model_cipher()?
+        .decrypt(
+            Nonce::from_slice(&raw[..12]),
+            Payload {
+                msg: &raw[12..],
+                aad: b"1741255278",
+            },
+        )
+        .map_err(|_| "TRAE 模型密钥封装认证失败")?;
+    String::from_utf8(decoded).map_err(|_| "TRAE 模型密钥内容无效".into())
+}
+
+fn registration_payload(model: &Model, local_key: &str) -> Result<Value, String> {
     let mut limits = serde_json::Map::new();
     if let Some(n) = model.input_limit.filter(|n| *n > 0) {
         limits.insert("prompt_max_tokens".into(), json!(n));
@@ -65,9 +124,18 @@ fn registration_payload(model: &Model, local_key: &str) -> Value {
     if let Some(n) = model.output_limit.filter(|n| *n > 0) {
         limits.insert("max_tokens".into(), json!(n));
     }
-    json!({"provider":"custom_openai_compatible","model_name":format!("{PREFIX}{}",model.id),"is_custom":true,"auth_type":0,"ak":local_key,
+    Ok(
+        json!({"provider":"custom_openai_compatible","model_name":format!("{PREFIX}{}",model.id),"is_custom":true,"auth_type":0,"ak":seal_model_key(local_key)?,
         "base_url":format!("http://127.0.0.1:{PORT}/v1/chat/completions"),"display_name":format!("TRAE 账号池 · {}",model.name),
-        "config_detail":{"multimodal":model.multimodal,"model_hyper_params":limits,"max_turn":500}})
+        "config_detail":{"multimodal":model.multimodal,"model_hyper_params":limits,"max_turn":500}}),
+    )
+}
+
+fn registration_fingerprint(payload: &Value, local_key: &str) -> String {
+    let mut logical = payload.clone();
+    logical["ak"] = json!(format!("{:x}", Sha256::digest(local_key.as_bytes())));
+    logical["credential_encoding"] = json!("trae-llm-aead-v1");
+    format!("{:x}", Sha256::digest(logical.to_string().as_bytes()))
 }
 
 fn manager_models(
@@ -160,12 +228,17 @@ pub fn register_models(account_id: &str) -> Result<RegistrationResult, String> {
             .iter()
             .find(|m| m.id == id)
             .ok_or("所选模型不属于当前注册账号，请刷新目录")?;
-        let mut payload = registration_payload(model, &local_key);
-        let digest = format!("{:x}", Sha256::digest(payload.to_string().as_bytes()));
+        let mut payload = registration_payload(model, &local_key)?;
+        let digest = registration_fingerprint(&payload, &local_key);
         let receipt_key = format!("{}:{id}", account.id);
         let wire_name = format!("{PREFIX}{id}");
         let path = if let Some(existing) = remote.get(&wire_name) {
-            if receipts.get(&receipt_key) == Some(&digest) {
+            let key_confirmed = existing
+                .get("ak")
+                .and_then(Value::as_str)
+                .and_then(|s| open_model_key(s).ok())
+                .is_some_and(|s| s == local_key);
+            if receipts.get(&receipt_key) == Some(&digest) && key_confirmed {
                 result.already_registered.push(id);
                 continue;
             }
@@ -215,6 +288,15 @@ pub fn register_models(account_id: &str) -> Result<RegistrationResult, String> {
         remote = manager_models(&account, &http)?;
         if !remote.contains_key(&wire_name) {
             return Err("注册请求已提交，但云端模型列表尚未确认该条目，请稍后刷新后重试".into());
+        }
+        let confirmed = remote
+            .get(&wire_name)
+            .and_then(|v| v.get("ak"))
+            .and_then(Value::as_str)
+            .and_then(|s| open_model_key(s).ok())
+            .is_some_and(|s| s == local_key);
+        if !confirmed {
+            return Err("模型已保存，但原生密钥封装尚未验证，未记为注册成功".into());
         }
         receipts.insert(receipt_key, digest);
         super::atomic_write::write_string_atomic(
@@ -535,12 +617,9 @@ pub fn status() -> Result<Status, String> {
 
 fn debug_log(line: &str) {
     use std::io::Write;
-    let Some(home) = std::env::var_os("USERPROFILE") else {
+    let Ok(dir) = data_path("logs") else {
         return;
     };
-    let dir = std::path::Path::new(&home)
-        .join(".qiehuan_yingyong")
-        .join("logs");
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
@@ -558,7 +637,7 @@ fn debug_log(line: &str) {
 }
 
 fn reply(request: Request, status: u16, message: &str) {
-    debug_log(&format!("reply status={status} message={message}"));
+    debug_log(&format!("reply status={status}"));
     let _ = request.respond(
         Response::from_string(
             json!({"error":{"type":"trae_pool_error","message":message}}).to_string(),
@@ -742,16 +821,22 @@ fn handle(mut request: Request, pool: &Pool) {
             return;
         }
     };
-    let requested = input.get("model").and_then(Value::as_str).unwrap_or_default();
+    let requested = input
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     debug_log(&format!(
-        "chat path={} bytes={} model={} stream={} body={}",
+        "chat path={} bytes={} stream={}",
         request.url(),
         bytes.len(),
-        requested,
-        input.get("stream").and_then(Value::as_bool).unwrap_or(false),
-        String::from_utf8_lossy(&bytes[..bytes.len().min(3000)])
+        input
+            .get("stream")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
     ));
-    let normalized = requested.rsplit_once("//").map_or(requested, |(_, tail)| tail);
+    let normalized = requested
+        .rsplit_once("//")
+        .map_or(requested, |(_, tail)| tail);
     let Some(model) = normalized.strip_prefix(PREFIX).map(str::to_owned) else {
         reply(
             request,
@@ -1226,7 +1311,12 @@ mod tests {
             input_limit: Some(32000),
             output_limit: Some(4096),
         };
-        let payload = registration_payload(&model, "local-key-fixture");
+        let payload = registration_payload(&model, "local-key-fixture").unwrap();
+        assert_ne!(payload["ak"], "local-key-fixture");
+        assert_eq!(
+            open_model_key(payload["ak"].as_str().unwrap()).unwrap(),
+            "local-key-fixture"
+        );
         assert_eq!(payload["model_name"], "trae-pool-example/Model");
         assert_eq!(
             payload["base_url"],
@@ -1238,6 +1328,73 @@ mod tests {
         );
         assert!(payload.get("access_token").is_none());
         assert_eq!(payload["provider"], "custom_openai_compatible");
+    }
+
+    #[test]
+    fn native_model_credential_matches_independent_aead_fixture() {
+        let fixture = "AAECAwQFBgcICQoLkwWArMNkg7wccds6a9vBriDUnmFfh35NiZWUu3DFtQ==";
+        assert_eq!(open_model_key(fixture).unwrap(), "fixture-api-key");
+        let mut corrupt = B64.decode(fixture).unwrap();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(open_model_key(&B64.encode(corrupt)).is_err());
+        assert!(open_model_key("local-plaintext-key").is_err());
+        assert!(seal_model_key("").is_err());
+    }
+
+    #[test]
+    fn registration_fingerprint_is_stable_across_randomized_native_envelopes() {
+        let model = Model {
+            id: "a".into(),
+            name: "A".into(),
+            multimodal: false,
+            tools: Some(true),
+            input_limit: None,
+            output_limit: None,
+        };
+        let first = registration_payload(&model, "fixture-key").unwrap();
+        let second = registration_payload(&model, "fixture-key").unwrap();
+        assert_ne!(first["ak"], second["ak"]);
+        assert_eq!(
+            registration_fingerprint(&first, "fixture-key"),
+            registration_fingerprint(&second, "fixture-key")
+        );
+        assert_ne!(
+            registration_fingerprint(&first, "fixture-key"),
+            registration_fingerprint(&first, "another-key")
+        );
+        let old = format!("{:x}", Sha256::digest(first.to_string().as_bytes()));
+        assert_ne!(old, registration_fingerprint(&first, "fixture-key"));
+    }
+
+    #[test]
+    fn authenticated_requests_never_log_conversation_text_or_connection_key() {
+        let _env = crate::modules::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("trae-pool-log-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = std::env::var_os("QIEHUAN_YINGYONG_TEST_DATA_DIR");
+        std::env::set_var("QIEHUAN_YINGYONG_TEST_DATA_DIR", &dir);
+        let pool = fixture_pool();
+        let endpoint = format!("http://{}/v1/chat/completions", pool.server.server_addr());
+        let worker = pool.clone();
+        let server = std::thread::spawn(move || {
+            let request = worker.server.recv().unwrap();
+            handle(request, &worker);
+        });
+        let response=reqwest::blocking::Client::builder().no_proxy().build().unwrap().post(endpoint)
+            .bearer_auth("fixture-key").json(&json!({"model":"trae-pool-model","messages":[{"role":"user","content":"PRIVATE_CONVERSATION_SENTINEL"}]})).send().unwrap();
+        assert!(!response.status().is_success());
+        server.join().unwrap();
+        let log = std::fs::read_to_string(dir.join("logs/trae-pool-debug.log")).unwrap();
+        assert!(!log.contains("PRIVATE_CONVERSATION_SENTINEL"));
+        assert!(!log.contains("fixture-key"));
+        assert!(log.contains("chat path="));
+        match old {
+            Some(v) => std::env::set_var("QIEHUAN_YINGYONG_TEST_DATA_DIR", v),
+            None => std::env::remove_var("QIEHUAN_YINGYONG_TEST_DATA_DIR"),
+        };
+        std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn streamed_utf8_text_usage_and_finish_are_valid_openai() {
