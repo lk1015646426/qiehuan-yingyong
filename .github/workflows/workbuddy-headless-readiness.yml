@@ -1,0 +1,45 @@
+name: WorkBuddy original pool headless readiness gate
+
+on:
+  push:
+    branches:
+      - codex/workbuddy-headless-readiness
+    paths:
+      - 'workbuddy-headless/**'
+      - 'src-tauri/src/modules/workbuddy_pool.rs'
+      - 'src-tauri/src/modules/workbuddy_account.rs'
+      - 'src-tauri/src/modules/workbuddy_auth_crypto.rs'
+      - 'src-tauri/src/modules/secure_account_storage.rs'
+      - '.github/workflows/workbuddy-headless-readiness.yml'
+  pull_request:
+    paths:
+      - 'workbuddy-headless/**'
+      - 'src-tauri/src/modules/workbuddy_pool.rs'
+      - 'src-tauri/src/modules/workbuddy_account.rs'
+      - 'src-tauri/src/modules/workbuddy_auth_crypto.rs'
+      - 'src-tauri/src/modules/secure_account_storage.rs'
+      - '.github/workflows/workbuddy-headless-readiness.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-static-audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Python source-only audit tests
+        run: python3 -m unittest discover -s workbuddy-headless/tests -p 'test_*.py' -v
+      - name: Produce no-credential evidence
+        run: python3 workbuddy-headless/audit.py --root . --json
+      - name: Verify deployment safety gate correctly blocks
+        shell: bash
+        run: |
+          set +e
+          python3 workbuddy-headless/audit.py --root . --require-cloud-ready
+          result=$?
+          set -e
+          test "$result" -eq 3
+          echo "EXPECTED: cloud deployment is blocked pending official server API authorization and headless dependencies"
