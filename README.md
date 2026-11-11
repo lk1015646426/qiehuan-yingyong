@@ -8,7 +8,7 @@
 
 ## 下载与安装
 
-当前版本：**0.1.22**。前往 [GitHub Releases](https://github.com/lk1015646426/qiehuan-yingyong/releases/tag/v0.1.22) 下载 Windows x64 安装包 `切换应用_0.1.22_x64-setup.exe`，并根据同页的 `SHA256SUMS.txt` 校验文件完整性。已安装旧版可原地升级；升级前保存正在执行的任务。账号数据保存在本机，不包含在发布安装包中。
+当前版本：**0.1.22**。前往 [GitHub Releases](https://github.com/lk1015646426/qiehuan-yingyong/releases/tag/v0.1.22) 下载 Windows x64 安装包 `qiehuan-yingyong_0.1.22_x64-setup.exe`，并根据同页的 `SHA256SUMS.txt` 校验文件完整性。已安装旧版可原地升级；升级前保存正在执行的任务。账号数据保存在本机，不包含在发布安装包中。
 
 ## 0.1.22 更新摘要（2026-11-04）
 
