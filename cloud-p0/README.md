@@ -57,3 +57,12 @@ Linux 将 exe 后缀去掉。已缓存 Rust 依赖时可使用 --offline。
 5. 取得合法授权与无客户端端到端验收后，再评估中国大陆部署、备案要求与几个月免费额度是否足够。
 
 当前成果仅证实“脱离 Tauri 的 OpenAI 兼容接口可以独立运行”，不是 WorkBuddy 账号池已经迁移成功。
+
+
+## 2026-11-11 实测结果
+
+- Windows 11 + Rust 1.96.1：cargo test --offline，4/4 单元测试通过。
+- cargo build --offline：构建成功。
+- Python 标准库运行真实 HTTP 合约测试：7/7 通过；验证鉴权、模型列表、JSON 对话、SSE、多项错误码。
+- 测试使用临时模拟 Key 与自动选择的 127.0.0.1 本机端口，不读取真实账号文件，不请求上游模型。
+- Linux 构建和安卓 DSH Go 端到端尚未验证；P0 原型并不处理真实 WorkBuddy 凭证。
