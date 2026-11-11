@@ -33,7 +33,7 @@ PowerShell:
     $env:P1_CLIENT_API_KEY = 'your-own-unique-24-plus-character-client-key'
     $env:P1_UPSTREAM_API_KEY = 'your-own-authorized-bailian-key'
     $env:P1_UPSTREAM_BASE_URL = 'https://dashscope.aliyuncs.com/compatible-mode/v1'
-    $env:P1_MODEL = 'qwen-plus'
+    $env:P1_MODEL = 'deepseek-v4.1-flash'
     cargo run --manifest-path cloud-p1/Cargo.toml
 
 从同一台电脑发送：
@@ -69,7 +69,24 @@ Linux 去掉最后一行的 .exe。测试启动本机 HTTP 假上游，完全不
 - 协议：OpenAI Chat Completions
 - Base URL：经授权的 HTTPS 网关地址，末尾为 /v1
 - Key：P1_CLIENT_API_KEY，非上游模型 Key
-- Model：P1_MODEL 指定的模型名（如 qwen-plus）
+- Model：P1_MODEL 指定的模型名（当前测试首选 deepseek-v4.1-flash）
 - 不要选择仅支持 /v1/responses 的渠道；P1 目前没有实现该接口
 
 如果用户只需要几个月测试，优先使用官方模型 API 直连来减少云服务成本；不要为此先购买云服务器。
+
+## 本次选型：DeepSeek V4.1 Flash（2026-11-11）
+
+短期实际使用目标：国内普通网络、几个月内、尽量仅使用新人免费额度、无需自建服务器。
+
+- 模型 ID：`deepseek-v4.1-flash`。
+- 北京地域 OpenAI 兼容 Base URL：`https://dashscope.aliyuncs.com/compatible-mode/v1`。
+- 模型 ID 可直接用于 DSH Go 的自定义 OpenAI 渠道；**优先直连百炼官方 HTTPS API**，不需要 P1 代理。
+- 百炼北京地域新人额度官方列表中标记该模型为通常 100 万 Token、有效期 90 天；以具体账号的模型广场或免费额度页面为准。
+- **先开启免费额度用完即停**，否则额度耗尽后可能自动按量计费。控制台开关默认关闭。
+- 正式接入所需的 API Key 在用户自己设备上配置，不要提交到 GitHub、复制到聊天或公开分享。
+- P1 本身只保留作授权 API 网关研发备用；当前尚无真实 API Key 的端到端验收。
+
+官方参考：
+- 模型信息：https://help.aliyun.cn/zh/model-studio/deepseek-v4-1-flash
+- 北京地域 Base URL：https://help.aliyun.com/zh/model-studio/base-url
+- 免费额度与安心模式：https://help.aliyun.com/zh/model-studio/new-free-quota
