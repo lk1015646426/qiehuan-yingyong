@@ -205,6 +205,13 @@ pub fn run() {
         }))
         .setup(|app| {
             info!("切换应用启动...");
+
+            #[cfg(target_os = "windows")]
+            if let Some(window) = app.get_webview_window("main") {
+                if let Err(err) = hide_main_window_caption(&window) {
+                    logger::log_warn(&format!("[Window] 隐藏主窗口标题失败: {err}"));
+                }
+            }
             let current_exe = std::env::current_exe()
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|err| format!("unknown: {}", err));
@@ -567,4 +574,34 @@ pub fn run() {
             let _ = (app_handle, event);
         }
     });
+}
+
+
+#[cfg(target_os = "windows")]
+fn hide_main_window_caption(window: &tauri::WebviewWindow) -> Result<(), Box<dyn std::error::Error>> {
+    use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongW, SendMessageW, SetWindowLongW, SetWindowPos, GWL_EXSTYLE, ICON_SMALL,
+        SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, WM_SETICON,
+        WS_EX_DLGMODALFRAME,
+    };
+
+    window.set_title("")?;
+    let hwnd = HWND(window.hwnd()?.0);
+    unsafe {
+        // Suppress the caption icon while keeping the native window controls.
+        let style = GetWindowLongW(hwnd, GWL_EXSTYLE);
+        SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_DLGMODALFRAME.0 as i32);
+        SendMessageW(hwnd, WM_SETICON, WPARAM(ICON_SMALL as usize), LPARAM(0));
+        SetWindowPos(
+            hwnd,
+            HWND::default(),
+            0,
+            0,
+            0,
+            0,
+            SWP_FRAMECHANGED | SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER,
+        )?;
+    }
+    Ok(())
 }

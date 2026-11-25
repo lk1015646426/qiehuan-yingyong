@@ -46,14 +46,7 @@ export default function App() {
   return (
     <div className="app-container with-sidebar">
       <aside className="sidebar">
-        <div className="sidebar-header">
-          <div className="sidebar-brand">
-            <img src={traeCnIcon} alt="TRAE" width={22} height={22} />
-            <h1>切换应用</h1>
-          </div>
-        </div>
         <nav className="sidebar-nav" aria-label="主导航">
-          <div className="sidebar-group-label">切换应用</div>
           <button
             type="button"
             title="WorkBuddy"
