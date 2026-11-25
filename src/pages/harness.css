@@ -1,0 +1,30 @@
+.harness-page { padding: 28px; max-width: 1100px; margin: auto; color: var(--text-primary); }
+.harness-heading { display:flex; justify-content:space-between; align-items:center; gap:16px; margin-bottom:24px; }
+.harness-heading h1 { display:flex; align-items:center; gap:10px; font-size:25px; margin:6px 0 10px; }
+.harness-eyebrow, .harness-hint, .harness-heading p { color:var(--text-secondary); font-size:13px; line-height:1.7; }
+.harness-card { background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius-md); padding:22px; margin-bottom:16px; }
+.harness-card h2 { font-size:17px; margin:0 0 18px; }
+.harness-page button { display:inline-flex; align-items:center; justify-content:center; gap:7px; border:1px solid var(--border); border-radius:8px; background:var(--bg-card); color:var(--text-primary); padding:9px 13px; cursor:pointer; }
+.harness-page button:hover:not(:disabled) { background:var(--bg-hover); }
+.harness-page button:disabled { opacity:.5; cursor:default; }
+.harness-page :focus-visible { outline:2px solid var(--text-primary); outline-offset:3px; }
+.harness-status { display:grid; grid-template-columns:1fr 1fr; gap:18px; margin:0 0 20px; }
+.harness-status dt { color:var(--text-secondary); font-size:12px; margin-bottom:7px; }
+.harness-status dd { margin:0; font-size:14px; overflow-wrap:anywhere; }
+.harness-page label { display:block; font-size:13px; margin-bottom:8px; }
+.harness-page select { width:100%; padding:10px; border:1px solid var(--border); border-radius:8px; background:var(--bg-card); color:var(--text-primary); }
+.harness-actions { display:flex; flex-wrap:wrap; gap:10px; }
+.harness-error { padding:12px; border:1px solid #d75b5b; border-radius:8px; overflow-wrap:anywhere; }
+.harness-notice { padding:12px; border:1px solid #409979; border-radius:8px; overflow-wrap:anywhere; }
+.harness-page pre { overflow:auto; max-height:260px; font-size:12px; padding:12px; background:var(--bg-primary); }
+.harness-table { overflow:auto; }
+.harness-table table { width:100%; border-collapse:collapse; font-size:12px; text-align:left; }
+.harness-table td, .harness-table th { padding:10px 8px; border-bottom:1px solid var(--border); overflow-wrap:anywhere; }
+.sidebar-group-label { font-size:11px; color:var(--text-secondary); padding:8px 12px; margin-top:10px; }
+@media(max-width:860px) { .harness-page { padding:18px; } .harness-heading { align-items:flex-start; flex-wrap:wrap; } .harness-status { grid-template-columns:1fr; } .sidebar-group-label { padding:8px 0; font-size:10px; text-align:center; } }
+
+.with-sidebar .sidebar .harness-nav span { white-space:normal; text-align:left; }
+.harness-nav svg { flex-shrink:0; }
+
+.harness-pool-selector { display:flex; gap:10px; align-items:center; padding:18px 28px 0; color:var(--text-primary); }
+.harness-pool-selector select { color:var(--text-primary); background:var(--bg-card); border:1px solid var(--border); padding:8px; border-radius:8px; }

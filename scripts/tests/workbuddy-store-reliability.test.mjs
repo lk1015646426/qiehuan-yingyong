@@ -20,4 +20,58 @@ test('WorkBuddy：无变化不联网，导入后的旧状态响应被丢弃',asy
  globalThis.__workbuddyTest.getWorkBuddyAccountStatus=()=>new Promise(r=>{resolveOld=r});const pending=s.getState().refreshAccountStatus('a');await tick();
  globalThis.__workbuddyTest.getWorkBuddyAccountStatus=async()=>status;assert.equal(await s.getState().importCurrent('updated'),true);assert.equal(s.getState().statusById.a.credits,42);
  resolveOld({...status,credits:null,creditsError:'old rejected credential'});await pending;assert.equal(s.getState().statusById.a.credits,42);assert.equal(s.getState().statusById.a.creditsError,null);
+ // Switch feedback must use the backend result before slow account and installation reads.
+ let resolveBalance; let queried=[];
+ const savedAccounts=[{id:'a',credentialRevision:'after'},{id:'b',credentialRevision:'other'}];
+ const installation={installed:true,running:true,currentAccountId:'b'};
+ s.setState({accounts:savedAccounts,installation,installationLoading:false});
+ let resolveOldInstallation;
+ globalThis.__workbuddyTest.getWorkBuddyInstallation=()=>new Promise(r=>{resolveOldInstallation=r});
+ const earlierDetection=s.getState().refreshInstallation();
+ let resolveAccountList;
+ globalThis.__workbuddyTest.listWorkBuddyAccounts=()=>new Promise(r=>{resolveAccountList=r});
+ globalThis.__workbuddyTest.getWorkBuddyInstallation=async()=>({...installation,currentAccountId:'a',running:false});
+ globalThis.__workbuddyTest.switchWorkBuddyAccount=async()=>({accountId:'a',githubSyncPending:true});
+ globalThis.__workbuddyTest.getWorkBuddyAccountStatus=id=>{queried.push(id);return new Promise(r=>{resolveBalance=r})};
+ let switchDone=false;
+ const switching=s.getState().switchTo('a').then(()=>{switchDone=true});
+ await tick();await tick();await tick();
+ assert.equal(switchDone,true,'切换反馈不应等待账号列表或积分查询');
+ assert.equal(s.getState().switchingId,null);
+ assert.equal(s.getState().loading,false,'切换后的后台读回不会让账号列表重新进入加载状态');
+ assert.equal(s.getState().installation.currentAccountId,'a');
+ assert.equal(s.getState().installation.running,true);
+ resolveOldInstallation(installation);
+ await earlierDetection;
+ assert.equal(s.getState().installation.currentAccountId,'a','旧安装探测不能覆盖新账号');
+ assert.deepEqual(queried,[],'先读取切号后的凭证版本，再刷新积分');
+ resolveAccountList(savedAccounts);
+ await tick();
+ assert.deepEqual(queried,['a'],'仅刷新目标账号');
+ resolveBalance(status);await switching;await tick();
+ globalThis.__workbuddyTest.listWorkBuddyAccounts=async()=>savedAccounts;
+ globalThis.__workbuddyTest.switchWorkBuddyAccount=async()=>{throw new Error('客户端未退出，请从托盘退出')};
+ await s.getState().switchTo('a');
+ assert.equal(s.getState().switchingId,null);
+ assert.equal(s.getState().error,'客户端未退出，请从托盘退出');
+ const attempts=[];
+ globalThis.__workbuddyTest.switchWorkBuddyAccount=async(id,force=false)=>{
+   attempts.push([id,force]);
+   assert.equal(force,true,'主动切换应直接请求定向关闭');
+   return {accountId:id,forcedClose:true,githubSyncPending:true};
+ };
+ globalThis.__workbuddyTest.getWorkBuddyAccountStatus=async()=>status;
+ await s.getState().switchTo('a');
+ assert.deepEqual(attempts,[['a',true]]);
+ assert.equal(s.getState().switchingId,null);
+ assert.match(s.getState().notice,/残留进程已清理/);
+});
+
+test('豆包账号修改不重载模型目录或等待只读状态刷新',()=>{
+ const root=path.resolve(import.meta.dirname,'../..');
+ const source=fs.readFileSync(path.join(root,'src/components/doubao/DoubaoPoolPanel.tsx'),'utf8');
+ const body=source.slice(source.indexOf('const persistAccounts ='),source.indexOf('const addKey ='));
+ assert.match(body,/await invoke<KeySnapshot>\('save_doubao_pool_keys', \{ entries, expectedRevision: snapshot\.revision \}\)/);
+ assert.match(body,/void refreshStatus\(\)/);
+ assert.doesNotMatch(body,/await refreshStatus\(|loadModels\(|setSelected\(/);
 });

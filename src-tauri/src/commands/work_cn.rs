@@ -152,8 +152,14 @@ pub async fn switch_work_cn_account(
 ) -> Result<WorkCnSwitchResult, String> {
     use tauri::Emitter;
 
+    let started = std::time::Instant::now();
     let progress_account_id = account_id.clone();
     let on_progress = move |stage: &str| {
+        logger::log_info(&format!(
+            "[TRAE switch timing] stage={} elapsed_ms={}",
+            stage,
+            started.elapsed().as_millis()
+        ));
         let _ = app.emit(
             WORK_CN_SWITCH_PROGRESS_EVENT,
             WorkCnSwitchProgress {
@@ -162,9 +168,13 @@ pub async fn switch_work_cn_account(
             },
         );
     };
-    trae_account::switch_work_cn_account_with_progress(account_id, on_progress)
-        .await
-        .map_err(|error| command_error_to_string(&error))
+    let result = trae_account::switch_work_cn_account_with_progress(account_id, on_progress).await;
+    logger::log_info(&format!(
+        "[TRAE switch timing] completed={} elapsed_ms={}",
+        result.is_ok(),
+        started.elapsed().as_millis()
+    ));
+    result.map_err(|error| command_error_to_string(&error))
 }
 
 /// Query a saved Work CN account's credit balance. Query only — this never
@@ -200,8 +210,7 @@ pub async fn clear_work_cn_credentials() -> Result<(), String> {
         let github_config_path = data_dir.join("github.json");
 
         if accounts_dir.exists() {
-            std::fs::remove_dir_all(&accounts_dir)
-                .map_err(|e| format!("删除账号库失败: {}", e))?;
+            std::fs::remove_dir_all(&accounts_dir).map_err(|e| format!("删除账号库失败: {}", e))?;
         }
         if index_path.exists() {
             std::fs::remove_file(&index_path).map_err(|e| format!("删除账号索引失败: {}", e))?;
@@ -266,7 +275,9 @@ pub async fn update_work_cn_account_label(
     tauri::async_runtime::spawn_blocking(move || {
         let account = trae_account::update_work_cn_account_label(&account_id, label)?;
         let validation = trae_account::validate_work_cn_account_snapshot(&account);
-        Ok(trae_account::build_work_cn_account_view(&account, validation))
+        Ok(trae_account::build_work_cn_account_view(
+            &account, validation,
+        ))
     })
     .await
     .map_err(|e| format!("更新备注任务失败：{e}"))?

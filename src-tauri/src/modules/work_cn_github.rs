@@ -798,7 +798,8 @@ fn sync_account_secrets_with_context(
 
     let refresh_material = serde_json::to_string(
         &crate::modules::trae_account::build_cloud_refresh_material(account)?,
-    ).map_err(|_| "云端续期材料序列化失败".to_string())?;
+    )
+    .map_err(|_| "云端续期材料序列化失败".to_string())?;
 
     // 4) set every value through stdin only. Ordering is stable for tests and
     // makes the token failure short-circuit before any device metadata write.
@@ -908,7 +909,8 @@ pub fn set_slot_checkin_enabled_for_account(
 }
 
 /// Path to the persisted `github.json` (next to the account store, never a token).
-pub fn github_config_path() -> Result<PathBuf, String> {    let dir = crate::modules::account::get_data_dir()?;
+pub fn github_config_path() -> Result<PathBuf, String> {
+    let dir = crate::modules::account::get_data_dir()?;
     Ok(dir.join("github.json"))
 }
 
@@ -1072,18 +1074,34 @@ mod tests {
     #[test]
     fn work_cn_github_sync_includes_current_refresh_material() {
         let runner = FakeGitHubRunner::new();
-        let mut account = make_account("refresh-test", &jwt_with_exp(9_999_999_999), Some("1132918838145530"));
+        let mut account = make_account(
+            "refresh-test",
+            &jwt_with_exp(9_999_999_999),
+            Some("1132918838145530"),
+        );
         account.machine_id = Some("test-machine".into());
-        let slot = WorkCnGitHubSlot { slot: 1, account_id: account.id.clone(), checkin_enabled: true, token_secret: "TEST_TOKEN".into(), device_secret: "TEST_DEVICE_ID".into() };
+        let slot = WorkCnGitHubSlot {
+            slot: 1,
+            account_id: account.id.clone(),
+            checkin_enabled: true,
+            token_secret: "TEST_TOKEN".into(),
+            device_secret: "TEST_DEVICE_ID".into(),
+        };
         sync_account_secrets(&runner, &account, &slot, "o/r").unwrap();
         let calls = runner.recorded_calls();
-        let refresh = calls.iter().find(|c| c.args.get(2).map(String::as_str) == Some("TEST_REFRESH_JSON")).expect("cloud refresh material must be synced with access token");
-        let material: serde_json::Value = serde_json::from_str(refresh.stdin.as_ref().unwrap()).unwrap();
+        let refresh = calls
+            .iter()
+            .find(|c| c.args.get(2).map(String::as_str) == Some("TEST_REFRESH_JSON"))
+            .expect("cloud refresh material must be synced with access token");
+        let material: serde_json::Value =
+            serde_json::from_str(refresh.stdin.as_ref().unwrap()).unwrap();
         assert_eq!(material["refresh_token"], "rt");
         assert_eq!(material["device_id"], "1132918838145530");
         assert_eq!(material["machine_id"], "test-machine");
         assert_eq!(material["private_key_pem"], "private-key");
-        assert!(material["client_id"].as_str().is_some_and(|s| !s.is_empty()));
+        assert!(material["client_id"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()));
         assert_eq!(material["device_info"]["DeviceID"], "1132918838145530");
     }
 

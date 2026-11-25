@@ -3,6 +3,7 @@ use reqwest::header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE, ORIGIN, REFERER, USER
 use serde_json::{json, Value};
 use std::time::Instant;
 
+const CHECKIN_URL: &str = "https://copilot.tencent.com/v2/billing/meter/daily-checkin";
 const RESOURCE_URL: &str = "https://copilot.tencent.com/billing/meter/get-user-resource-summary";
 const ACTIVITY_URL: &str = "https://copilot.tencent.com/v2/billing/meter/checkin-activity-status";
 
@@ -80,7 +81,7 @@ fn network_error_message(label: &str, detail: impl std::fmt::Display) -> String 
     format!("{label}国内网络请求失败: {detail}")
 }
 
-async fn query_json(
+async fn request_json(
     client: &reqwest::Client,
     url: &str,
     token: &str,
@@ -125,14 +126,48 @@ async fn query_json(
     if !status.is_success() {
         return Err(format!("{label}返回 HTTP {}", status.as_u16()));
     }
-    let payload = response
+    response
         .json::<Value>()
         .await
-        .map_err(|_| format!("{label}返回数据无法解析"))?;
+        .map_err(|_| format!("{label}返回数据无法解析"))
+}
+
+async fn query_json(
+    client: &reqwest::Client,
+    url: &str,
+    token: &str,
+    label: &str,
+) -> Result<Value, String> {
+    let payload = request_json(client, url, token, label).await?;
     if let Some(error) = business_error(&payload) {
         return Err(format!("{label}失败: {error}"));
     }
     Ok(payload)
+}
+
+#[derive(Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum WorkBuddyCheckinOutcome {
+    Signed,
+    AlreadySigned,
+}
+
+fn parse_checkin_outcome(payload: &Value) -> Result<WorkBuddyCheckinOutcome, String> {
+    match integer(payload.get("code")) {
+        Some(0) => Ok(WorkBuddyCheckinOutcome::Signed),
+        Some(10001) => Ok(WorkBuddyCheckinOutcome::AlreadySigned),
+        Some(401 | 403) => Err("登录凭证被拒绝，请核对或手动恢复认证".to_string()),
+        Some(code) => Err(format!("签到失败（服务端代码 {code}）")),
+        None => Err("签到结果未确认：服务端响应缺少有效状态码".to_string()),
+    }
+}
+
+pub async fn checkin_account(
+    client: &reqwest::Client,
+    token: &str,
+) -> Result<WorkBuddyCheckinOutcome, String> {
+    let payload = request_json(client, CHECKIN_URL, token, "签到").await?;
+    parse_checkin_outcome(&payload)
 }
 
 fn is_auth_error(error: &str) -> bool {
@@ -200,6 +235,27 @@ pub async fn query_account_status(account_id: &str) -> Result<WorkBuddyAccountSt
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn checkin_requires_explicit_success_or_already_signed() {
+        use super::{parse_checkin_outcome, WorkBuddyCheckinOutcome};
+
+        assert_eq!(
+            parse_checkin_outcome(&serde_json::json!({"code": 0})),
+            Ok(WorkBuddyCheckinOutcome::Signed)
+        );
+        assert_eq!(
+            parse_checkin_outcome(&serde_json::json!({"code": "10001"})),
+            Ok(WorkBuddyCheckinOutcome::AlreadySigned)
+        );
+        for payload in [
+            serde_json::json!({"code": 401}),
+            serde_json::json!({"code": 500, "msg": "查询是否已签到失败"}),
+            serde_json::json!({"data": {}}),
+        ] {
+            assert!(parse_checkin_outcome(&payload).is_err());
+        }
+    }
+
     use super::{
         assemble_status, network_error_message, parse_activity, parse_available_credits,
         ACTIVITY_URL, RESOURCE_URL,

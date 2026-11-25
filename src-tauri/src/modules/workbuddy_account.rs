@@ -370,8 +370,12 @@ fn parse_snapshot_json(raw: &str) -> Result<ParsedSnapshot, String> {
         .or_else(|| object_string(auth, &["uid", "userId"]))
         .or_else(|| uid_from_token(&raw_token))
         .ok_or_else(|| "WorkBuddy 认证文件缺少账号 UID".to_string())?;
-    if let Some(subject)=uid_from_jwt(&normalize_access_token(&raw_token).unwrap_or_else(||raw_token.clone())) {
-        if subject!=uid{return Err("认证快照中的账号与凭证主体不一致，已停止导入".into());}
+    if let Some(subject) =
+        uid_from_jwt(&normalize_access_token(&raw_token).unwrap_or_else(|| raw_token.clone()))
+    {
+        if subject != uid {
+            return Err("认证快照中的账号与凭证主体不一致，已停止导入".into());
+        }
     }
     let uin = object_string(account, &["uin"]).or_else(|| object_string(Some(&value), &["uin"]));
     let nickname = sanitized_display_name(
@@ -573,7 +577,9 @@ fn load_record(account_id: &str) -> Result<WorkBuddyAccountRecord, String> {
     let content = fs::read_to_string(&path)
         .map_err(|error| format!("读取 WorkBuddy 账号详情失败: {}", error))?;
     let (record, needs_rewrite) =
-        crate::modules::secure_account_storage::deserialize_account_file_read_only(&path, &content)?;
+        crate::modules::secure_account_storage::deserialize_account_file_read_only(
+            &path, &content,
+        )?;
     if needs_rewrite {
         save_record(&record)?;
     }
@@ -584,8 +590,9 @@ fn load_record_read_only(account_id: &str) -> Result<WorkBuddyAccountRecord, Str
     let path = detail_path(account_id)?;
     let content = fs::read_to_string(&path)
         .map_err(|error| format!("读取 WorkBuddy 账号详情失败: {}", error))?;
-    let (record, _) =
-        crate::modules::secure_account_storage::deserialize_account_file_read_only(&path, &content)?;
+    let (record, _) = crate::modules::secure_account_storage::deserialize_account_file_read_only(
+        &path, &content,
+    )?;
     Ok(record)
 }
 
@@ -1438,10 +1445,18 @@ pub(crate) async fn refresh_account_auth(account_id: &str) -> Result<String, Str
             .await
             .map_err(|_| "当前会话同步失败")??;
         let after = access_token(account_id)?;
-        return if after != before { Ok(after) } else {
-            let live=read_stable_auth_file(&default_auth_file_path()?).ok().and_then(|r|parse_snapshot_json(&r).ok()).and_then(|p|snapshot_access_token(&p.value));
-            if live.as_deref()!=Some(before.as_str()) {Err("托管凭证与正在运行的客户端不同，未覆盖当前会话；请保存任务后使用“切换并打开”重新载入".into())}
-            else {Err("此账号正由官方客户端管理，未额外轮换凭证；请核对原客户端登录后重新导入".into())}
+        return if after != before {
+            Ok(after)
+        } else {
+            let live = read_stable_auth_file(&default_auth_file_path()?)
+                .ok()
+                .and_then(|r| parse_snapshot_json(&r).ok())
+                .and_then(|p| snapshot_access_token(&p.value));
+            if live.as_deref() != Some(before.as_str()) {
+                Err("托管凭证与正在运行的客户端不同，未覆盖当前会话；请保存任务后使用“切换并打开”重新载入".into())
+            } else {
+                Err("此账号正由官方客户端管理，未额外轮换凭证；请核对原客户端登录后重新导入".into())
+            }
         };
     }
     refresh_account_auth_in_transaction(account_id).await
@@ -1640,10 +1655,15 @@ mod tests {
             crate::modules::workbuddy_status::query_account_status(&id),
         );
         let github_sync = if std::env::var("WORKBUDDY_RECOVERY_SYNC_GITHUB").as_deref() == Ok("1")
-            && after_status.as_ref().ok().is_some_and(|s| s.credits_error.is_none())
+            && after_status
+                .as_ref()
+                .ok()
+                .is_some_and(|s| s.credits_error.is_none())
         {
             Some(tauri::async_runtime::block_on(
-                crate::modules::workbuddy_github::sync_background_now("verified account reauthorization"),
+                crate::modules::workbuddy_github::sync_background_now(
+                    "verified account reauthorization",
+                ),
             ))
         } else {
             None
@@ -1662,7 +1682,8 @@ mod tests {
             std::fs::write(
                 std::env::var("WORKBUDDY_RECOVERY_REPORT").unwrap(),
                 serde_json::to_string_pretty(&report).unwrap(),
-            ).unwrap();
+            )
+            .unwrap();
         }
         println!("Selected-account diagnostic recorded; see the explicit report (no credentials printed).");
     }
@@ -1803,7 +1824,12 @@ mod tests {
     fn verified_account_merge_can_fill_a_previously_unspecified_type() {
         for unspecified in [serde_json::json!(""), serde_json::json!("  "), Value::Null] {
             let previous = serde_json::json!({"account":{"uid":"fixture", "type":unspecified}, "auth":{"accessToken":"old"}});
-            let merged = merge_verified_account(&previous, serde_json::json!({"accessToken":"new"}), &serde_json::json!({"data":{"uid":"fixture", "type":"personal"}})).unwrap();
+            let merged = merge_verified_account(
+                &previous,
+                serde_json::json!({"accessToken":"new"}),
+                &serde_json::json!({"data":{"uid":"fixture", "type":"personal"}}),
+            )
+            .unwrap();
             assert_eq!(merged["account"]["type"], "personal");
         }
     }
@@ -1813,18 +1839,27 @@ mod tests {
     fn live_verify_pending_account_metadata_read_only() {
         let id = std::env::var("WORKBUDDY_COMPAT_ACCOUNT").expect("explicit account required");
         let previous = load_record_read_only(&id).unwrap().snapshot;
-        let pending = load_pending_refresh(&id, &previous).unwrap().expect("existing matching pending rotation required");
-        let auth = normalized_refresh_auth(&pending.payload, &previous, pending.received_at_ms).unwrap();
+        let pending = load_pending_refresh(&id, &previous)
+            .unwrap()
+            .expect("existing matching pending rotation required");
+        let auth =
+            normalized_refresh_auth(&pending.payload, &previous, pending.received_at_ms).unwrap();
         let host = trusted_auth_host(&previous).unwrap();
         let mut candidate = previous.clone();
         candidate["auth"] = auth.clone();
         let headers = build_auth_headers(&candidate, false).unwrap();
         let payload = tauri::async_runtime::block_on(async {
             let client = crate::utils::http::create_domestic_client(15, &host);
-            let response = client.get(format!("https://{host}/v2/plugin/account")).headers(headers).send().await.unwrap();
+            let response = client
+                .get(format!("https://{host}/v2/plugin/account"))
+                .headers(headers)
+                .send()
+                .await
+                .unwrap();
             checked_auth_json(response, "只读账号校验").await.unwrap()
         });
-        let merged = merge_verified_account(&previous, auth, &payload).expect("official verified identity must merge successfully");
+        let merged = merge_verified_account(&previous, auth, &payload)
+            .expect("official verified identity must merge successfully");
         assert!(snapshot_uid_from_value(&merged) == snapshot_uid_from_value(&previous));
         assert!(merged["auth"] == candidate["auth"]);
         println!("Official account verification and metadata merge passed; no refresh or credential writes performed.");
@@ -1838,16 +1873,29 @@ mod tests {
         });
         let auth = serde_json::json!({"accessToken":"new"});
         for (field, changed) in [
-            ("uid", "different-user"), ("type", "enterprise"),
+            ("uid", "different-user"),
+            ("type", "enterprise"),
             ("enterpriseId", "different-enterprise"),
-            ("oneidAccountId", "different-oneid"), ("idp", "different-provider")
+            ("oneidAccountId", "different-oneid"),
+            ("idp", "different-provider"),
         ] {
             let mut payload = serde_json::json!({"data":previous["account"].clone()});
             payload["data"][field] = serde_json::json!(changed);
-            assert!(merge_verified_account(&previous, auth.clone(), &payload).is_err(), "must reject changed {field}");
+            assert!(
+                merge_verified_account(&previous, auth.clone(), &payload).is_err(),
+                "must reject changed {field}"
+            );
         }
-        let foreign_token = format!("e30.{}.sig", base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"sub":"different-user"}"#));
-        assert!(merge_verified_account(&previous, serde_json::json!({"accessToken":foreign_token}), &serde_json::json!({"data":{"uid":"fixture", "type":""}})).is_err());
+        let foreign_token = format!(
+            "e30.{}.sig",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(br#"{"sub":"different-user"}"#)
+        );
+        assert!(merge_verified_account(
+            &previous,
+            serde_json::json!({"accessToken":foreign_token}),
+            &serde_json::json!({"data":{"uid":"fixture", "type":""}})
+        )
+        .is_err());
         assert_eq!(previous["auth"]["accessToken"], "old");
     }
 

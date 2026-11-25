@@ -111,6 +111,52 @@ pub async fn get_workbuddy_account_status(
     workbuddy_status::query_account_status(&account_id).await
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkBuddyLocalCheckinResult {
+    account_id: String,
+    display_name: String,
+    outcome: Result<workbuddy_status::WorkBuddyCheckinOutcome, String>,
+}
+
+#[tauri::command]
+pub async fn local_checkin_all_workbuddy_accounts() -> Result<Vec<WorkBuddyLocalCheckinResult>, String> {
+    static CHECKIN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    let _guard = CHECKIN_LOCK
+        .try_lock()
+        .map_err(|_| "WorkBuddy 本地签到正在运行".to_string())?;
+
+    let accounts = list_workbuddy_accounts().await?;
+    if accounts.is_empty() {
+        return Ok(Vec::new());
+    }
+    let client = tauri::async_runtime::spawn_blocking(|| {
+        crate::utils::http::create_domestic_client(30, "copilot.tencent.com")
+    })
+    .await
+    .map_err(|_| "本地签到网络初始化失败".to_string())?;
+
+    let mut results = Vec::with_capacity(accounts.len());
+    for account in accounts {
+        let account_id = account.id.clone();
+        let outcome = match tauri::async_runtime::spawn_blocking(move || {
+            workbuddy_account::access_token(&account_id)
+        })
+        .await
+        {
+            Ok(Ok(token)) => workbuddy_status::checkin_account(&client, &token).await,
+            Ok(Err(_)) => Err("无法读取保存的登录凭证，请核对账号或重新导入".to_string()),
+            Err(_) => Err("读取登录凭证失败".to_string()),
+        };
+        results.push(WorkBuddyLocalCheckinResult {
+            account_id: account.id,
+            display_name: account.display_name,
+            outcome,
+        });
+    }
+    Ok(results)
+}
+
 /// Explicit credential recovery; balance reads never invoke this command.
 #[tauri::command]
 pub async fn recover_workbuddy_auth(account_id: String) -> Result<WorkBuddyAccountView, String> {
@@ -164,6 +210,7 @@ pub async fn delete_workbuddy_account(account_id: String) -> Result<bool, String
 pub async fn switch_workbuddy_account(
     app: tauri::AppHandle,
     account_id: String,
+    force_close_confirmed: Option<bool>,
 ) -> Result<WorkBuddySwitchResult, String> {
     use tauri::Emitter;
 
@@ -178,7 +225,11 @@ pub async fn switch_workbuddy_account(
         );
     };
     tauri::async_runtime::spawn_blocking(move || {
-        switch_workbuddy_account_blocking(&account_id, on_progress)
+        switch_workbuddy_account_blocking(
+            &account_id,
+            force_close_confirmed.unwrap_or(false),
+            on_progress,
+        )
     })
     .await
     .map_err(|error| format!("切换 WorkBuddy 账号任务失败: {error}"))?
@@ -201,7 +252,7 @@ pub async fn switch_workbuddy_account(
 pub const WORKBUDDY_SWITCH_PROGRESS_EVENT: &str = "workbuddy-switch-progress";
 
 /// 切号进度事件载荷。stage 取值：validating / closing / refreshing /
-/// injecting / launching / syncing。
+/// injecting / launching / activating。
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WorkBuddySwitchProgress {
@@ -266,7 +317,7 @@ fn reopen_previous_if_needed(was_running: bool) -> Result<(), String> {
         return Ok(());
     }
     #[cfg(windows)]
-    if !process::collect_workbuddy_process_entries_checked()?.is_empty() {
+    if !process::collect_workbuddy_process_entries_for_switch()?.is_empty() {
         return Ok(());
     }
     #[cfg(not(windows))]
@@ -278,14 +329,19 @@ fn reopen_previous_if_needed(was_running: bool) -> Result<(), String> {
 
 fn switch_workbuddy_account_blocking(
     account_id: &str,
+    force_close_confirmed: bool,
     on_progress: impl Fn(&str),
 ) -> Result<WorkBuddySwitchResult, WorkBuddyCommandError> {
     let _switch = try_lock_workbuddy_switch()?;
     let _auth = workbuddy_account::try_begin_auth_transaction()
         .map_err(|e| WorkBuddyCommandError::new(WorkBuddyErrorCode::Busy, e))?;
     let tx = uuid::Uuid::new_v4().to_string();
+    let started = std::time::Instant::now();
     let on_progress = |stage: &str| {
-        crate::modules::logger::log_info(&format!("[WorkBuddy Switch] tx={tx} stage={stage}"));
+        crate::modules::logger::log_info(&format!(
+            "[WorkBuddy Switch] tx={tx} stage={stage} elapsed_ms={}",
+            started.elapsed().as_millis()
+        ));
         on_progress(stage);
     };
     on_progress("validating");
@@ -302,14 +358,17 @@ fn switch_workbuddy_account_blocking(
     let data_dir = process::get_default_workbuddy_user_data_dir()
         .map_err(|e| WorkBuddyCommandError::new(WorkBuddyErrorCode::ClientCloseFailed, e))?;
     #[cfg(windows)]
-    let was_running = !process::collect_workbuddy_process_entries_checked()
+    let was_running = !process::collect_workbuddy_process_entries_for_switch()
         .map_err(|e| WorkBuddyCommandError::new(WorkBuddyErrorCode::ClientCloseFailed, e))?
         .is_empty();
     #[cfg(not(windows))]
     let was_running = !process::collect_workbuddy_process_entries().is_empty();
     on_progress("closing");
-    process::close_workbuddy_instances(&[data_dir.to_string_lossy().into_owned()], 20)
-        .map_err(|e| WorkBuddyCommandError::new(WorkBuddyErrorCode::ClientCloseFailed, e))?;
+    let forced_close = process::close_workbuddy_instances(
+        &[data_dir.to_string_lossy().into_owned()],
+        20,
+        force_close_confirmed,
+    )?;
     // Last stable official state, not the pre-close state, is the recovery point.
     let current = workbuddy_account::refresh_current_managed_snapshot_in_transaction();
     let mut recovery = match ClientAuthRecovery::capture(&auth_path) {
@@ -359,7 +418,7 @@ fn switch_workbuddy_account_blocking(
             on_progress("injecting");
             // The official process must still be closed before a credential replacement.
             #[cfg(windows)]
-            if !process::collect_workbuddy_process_entries_checked()
+            if !process::collect_workbuddy_process_entries_for_switch()
                 .map_err(|e| WorkBuddyCommandError::new(WorkBuddyErrorCode::ClientCloseFailed, e))?
                 .is_empty()
             {
@@ -383,13 +442,17 @@ fn switch_workbuddy_account_blocking(
             spawn_workbuddy_post_launch_auth_checks(tx.clone(), auth_path.clone());
             let _ = workbuddy_account::mark_last_used(account_id);
             queue_workbuddy_github_sync("switch");
-            on_progress("syncing");
-            let _ = process::activate_workbuddy_window_for_pid(pid);
+            on_progress("activating");
+            if let Err(error) = process::activate_workbuddy_window_for_pid(pid) {
+                crate::modules::logger::log_warn(&format!(
+                    "[WorkBuddy Switch] tx={tx} focus_failed: {error}"
+                ));
+            }
             Ok(WorkBuddySwitchResult {
                 transaction_id: tx.clone(),
                 account_id: account_id.into(),
                 verified_uid: expected_uid,
-                forced_close: false,
+                forced_close,
                 github_sync_pending: true,
             })
         },
@@ -402,7 +465,10 @@ fn switch_workbuddy_account_blocking(
     });
     match result {
         Ok(value) => {
-            crate::modules::logger::log_info(&format!("[WorkBuddy Switch] tx={tx} completed"));
+            crate::modules::logger::log_info(&format!(
+                "[WorkBuddy Switch] tx={tx} completed elapsed_ms={}",
+                started.elapsed().as_millis()
+            ));
             Ok(value)
         }
         Err(mut error) => {
@@ -456,6 +522,29 @@ fn spawn_workbuddy_post_launch_auth_checks(transaction_id: String, auth_path: st
 #[tauri::command]
 pub async fn sync_workbuddy_github() -> Result<(), String> {
     workbuddy_github::sync_background_now("manual sync").await
+}
+
+/// Open/focus the normal desktop client for a user-initiated sign-in.
+/// This does not claim a reward, contact a check-in endpoint, change accounts,
+/// or terminate processes. The user completes the official UI interaction.
+#[tauri::command]
+pub async fn open_workbuddy_checkin_client(account_id: String) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let _switch = try_lock_workbuddy_switch()
+            .map_err(|_| "WorkBuddy 正在切换账号，请稍后再试".to_string())?;
+        if workbuddy_account::current_managed_account_id_checked()?.as_deref()
+            != Some(account_id.as_str())
+        {
+            return Err("此账号不是当前客户端账号，请先在官方客户端核对登录".to_string());
+        }
+        let pid = match process::resolve_workbuddy_pid(None, None) {
+            Some(pid) => pid,
+            None => process::start_workbuddy_default_with_args_with_new_window(&[], false)?,
+        };
+        process::activate_workbuddy_window_for_pid(pid)
+    })
+    .await
+    .map_err(|_| "打开 WorkBuddy 客户端失败".to_string())?
 }
 
 #[tauri::command]

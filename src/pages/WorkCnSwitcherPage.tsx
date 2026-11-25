@@ -8,7 +8,8 @@
 // - 云端签到：可折叠任务区（运行记录 + 触发验证）已抽为共享组件
 //   CloudCheckinPanel，WorkBuddy 页复用同一签到仓库的面板
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import traeCnIcon from '../assets/icons/trae-cn.png';
 import { getWorkCnInstallation, WORK_CN_SESSION_WATCH_EVENT } from '../services/workCnService';
@@ -20,11 +21,13 @@ import { WorkCnAddAccountDialog } from '../components/work-cn/WorkCnAddAccountDi
 import { WorkCnSettingsDialog } from '../components/work-cn/WorkCnSettingsDialog';
 import { WorkCnStatusBanner } from '../components/work-cn/WorkCnStatusBanner';
 import { TraePoolPanel } from '../components/work-cn/TraePoolPanel';
+import {
+  AccountManagementLayout, AccountList, AccountCardFrame, AccountCardActions, AccountStatusBanner,
+  LocalCheckinFeedback, type AccountCheckinResult,
+} from '../components/AccountManagementLayout';
 import { GhSetupDialog } from '../components/work-cn/GhSetupDialog';
 import type { WorkCnInstallation, WorkCnAccountView, WorkCnCreditsSummary, WorkCnGitHubSyncResult, WorkCnSessionWatchStatus } from '../types/workCn';
-import type { RefreshFlowState } from '../types/checkin';
-import { compactUid, formatTokenExpiryDate, tokenDaysLabel, tokenDaysLeft } from '../utils/accountCardPresentation';
-
+import type { LocalCheckinResult, RefreshFlowState } from '../types/checkin';
 // 快照字段中文名（与后端 WorkCnSnapshotValidation 对应），用于摘要明细。
 const SNAPSHOT_FIELDS: Array<[keyof WorkCnAccountView, string]> = [
   ['hasAccessToken', '访问令牌'],
@@ -90,20 +93,6 @@ function SnapshotSummary({ account }: { account: WorkCnAccountView }) {
   );
 }
 
-function formatCreditsValue(value: number): string {
-  // 接口用量带小数（如 864.63）；浮点累加会产生尾差，四舍五入到 2 位并去掉多余尾零。
-  const rounded = Math.round(value * 100) / 100;
-  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(2);
-}
-
-// —— 云端签到（自独立面板合并）—————————————————————————
-// token 剩余天数预警（tokenDaysLeft/tokenDaysLabel 为三页共享实现，
-// 阈值与 auto 刷新逻辑对齐：客户端剩 1/3 寿命时刷新）。
-
-// 切号各阶段文案（stage 与后端 WORK_CN_SWITCH_STAGE_* 常量一致）。
-
-// 切号各阶段文案（stage 与后端 WORK_CN_SWITCH_STAGE_* 常量一致）。
-// 切换全程最长约 50 秒（关闭 20s + 验证 30s），无阶段提示时用户只能干等。
 const SWITCH_STAGE_LABELS: Record<string, string> = {
   validating: '正在校验账号快照',
   closing: '正在关闭客户端（最长 20 秒）',
@@ -162,6 +151,7 @@ function AccountCard({
   credits,
   creditsError,
   switching,
+  switchInProgress,
   switchStage,
   deleting,
   refreshingCredits,
@@ -169,6 +159,7 @@ function AccountCard({
   githubSync,
   active,
   slotCheckinEnabled,
+  localCheckinBusy,
   onSwitch,
   onRefreshCredits,
   onDelete,
@@ -178,6 +169,7 @@ function AccountCard({
   credits: WorkCnCreditsSummary | null;
   creditsError: string | null;
   switching: boolean;
+  switchInProgress: boolean;
   switchStage: string | null;
   deleting: boolean;
   refreshingCredits: boolean;
@@ -186,6 +178,7 @@ function AccountCard({
   active: boolean;
   /** 绑定槽位的自动签到开关；null 表示该账号未绑定槽位（无云端签到）。 */
   slotCheckinEnabled: boolean | null;
+  localCheckinBusy: boolean;
   onSwitch: () => void;
   onRefreshCredits: () => void;
   onDelete: () => void;
@@ -210,21 +203,19 @@ function AccountCard({
     await renameAccount(account.id, value);
     setEditing(false);
   };
-  const canSwitch = account.validForSwitch && !switching;
-  const { tone: tokenTone, days: tokenDays } = tokenDaysLeft(account.tokenExpiresAt);
+  const canSwitch = account.validForSwitch && !switchInProgress && !localCheckinBusy;
   const flow = refreshFlow?.accountId === account.id ? refreshFlow : null;
-  const flowRunning = !!flow && flow.phase !== 'done' && flow.phase !== 'failed';
+  const restoring = !!refreshFlow && refreshFlow.phase !== 'done' && refreshFlow.phase !== 'failed';
   const localChecking = localCheckinState?.loading ?? false;
   const localResult = localCheckinState?.result ?? null;
-  const tokenLabel = tokenDaysLabel(tokenDays);
-
-  // 指标行数值（照抄 WorkBuddy 卡片的 wb-status-line 结构）。
-  const creditsLabel = credits?.unlimited
+  const [manualResult, setManualResult] = useState<LocalCheckinResult | null>(null);
+  const runAccountCheckin = async () => {
+    await localCheckin(account.id);
+    setManualResult(useCheckinStore.getState().localCheckinById[account.id]?.result ?? null);
+  };
+  const creditsLabel = refreshingCredits && !credits ? '查询中…' : credits?.unlimited
     ? '无限'
-    : credits?.total == null
-      ? '暂无数据'
-      : formatCreditsValue(credits.remaining ?? 0);
-
+    : credits?.remaining?.toLocaleString('zh-CN', { maximumFractionDigits: 2 }) ?? '未查询到';
   let githubLine = 'GitHub：未同步';
   let githubTone = '';
   if (!githubEnabled) {
@@ -240,152 +231,74 @@ function AccountCard({
     githubTone = ' wc-github-line--warn';
   }
 
+  const checkinFeedback = localResult && (
+    <div className={localResult.ok ? 'uac-checkin-hint' : 'wb-status-error'} role={localResult.ok ? 'status' : 'alert'}
+      title={`诊断详情：stage=${localResult.stage}${localResult.businessCode == null ? '' : ` code=${localResult.businessCode}`}${localResult.httpStatus == null ? '' : ` HTTP=${localResult.httpStatus}`}`}>
+      本地签到：{localCheckinOutcomeLabel(localResult)} · {localResult.message}
+    </div>
+  );
+  const inlineCheckinFeedback = localResult === manualResult ? checkinFeedback : null;
+
   return (
-    <div className={active ? 'wc-slot account-card account-card--compact wc-slot--active' : 'wc-slot account-card account-card--compact'}>
-      {active ? <span className="wc-slot-active-badge">当前账号</span> : null}
-      <div className="wc-slot-head account-card__head">
-        <div className="wb-account-title">
-          <div className="wc-slot-title" title={title}>{title}</div>
-        </div>
-        <SnapshotSummary account={account} />
-      </div>
-      <div className="wc-slot-sub account-card__identity" title={account.userId ?? undefined}>
-        {account.email ?? '未提供邮箱'} · UID {compactUid(account.userId)}
-      </div>
-      <div className="account-card__metrics">
-        <div className="wc-slot-sub">令牌到期 {formatTokenExpiryDate(account.tokenExpiresAt)}</div>
-      </div>
-      <div className="wb-status-block">
-        <div className="wb-status-line">
-          <span title="仅查询，绝不签到">剩余积分 <strong>{creditsLabel}</strong></span>
-          <span title={tokenDays != null && tokenDays <= 0 ? '云端签到将失败，请刷新凭证' : undefined}>
-            Token 剩余 <strong className={`wc-token-strong wc-token-strong--${tokenTone}`}>{tokenLabel}</strong>
-          </span>
-        </div>
-        {switching ? (
-          <div className="wc-slot-sub">{SWITCH_STAGE_LABELS[switchStage ?? ''] ?? '正在准备'}…</div>
-        ) : null}
-        {creditsError ? <div className="wb-status-error">{creditsError}</div> : null}
-      </div>
-      <div className="account-card__status account-card__status--toggle">
-        {slotCheckinEnabled != null ? (
-          <label
-            className="wb-checkin-toggle"
-            title="关闭后：云端 Actions 不再为该账号签到，该槽位的 GitHub Secrets 会被删除；重新开启后立即恢复同步"
-          >
-            <input
-              type="checkbox"
-              checked={slotCheckinEnabled}
-              disabled={switching || deleting}
-              onChange={(event) => onToggleCheckin(event.target.checked)}
-            />
-            <span>{slotCheckinEnabled ? '云端自动签到已开启' : '云端自动签到已关闭'}</span>
-          </label>
-        ) : null}
-        <div
-          className={`wc-github-line${githubTone}`}
-          title={[githubLine, ...account.warnings].join('；')}
-        >
-          {githubLine}{account.warnings.length ? ` · ${account.warnings.join('；')}` : ''}
-        </div>
+    <AccountCardFrame title={title} active={active}
+      contact={account.email} uid={account.userId} tokenExpiresAt={account.tokenExpiresAt}
+      credits={<>{creditsLabel}{refreshingCredits && credits && '（刷新中）'}</>}
+      creditsTitle="查询 TRAE 账户剩余积分"
+      alert={switching || creditsError || flow || account.warnings.length || githubSync?.error || !account.validForSwitch ? <>
+        {!account.validForSwitch ? <div className="wc-warning">登录快照不完整，请重新导入账号。</div> : null}
+        {switching ? <div className="wc-slot-sub">{SWITCH_STAGE_LABELS[switchStage ?? ''] ?? '正在准备'}…</div> : null}
+        {creditsError ? <div className="wb-status-error" role="alert">{creditsError}</div> : null}
+        {account.warnings.length ? <div className="wc-warning">{account.warnings.join('；')}</div> : null}
+        {githubSync?.error ? <div className="wb-status-error" role="alert">{githubLine}</div> : null}
         {flow ? <FlowLine flow={flow} accountLabel={title} /> : null}
-        {localResult ? (
-          <div
-            className={localResult.ok ? 'ck-flow-line ck-flow-line--done' : 'ck-flow-line ck-flow-line--failed'}
-            title={`诊断详情：stage=${localResult.stage}${localResult.businessCode == null ? '' : ` code=${localResult.businessCode}`}${localResult.httpStatus == null ? '' : ` HTTP=${localResult.httpStatus}`}`}
-          >
-            本地签到：{localCheckinOutcomeLabel(localResult)} · {localResult.message}
+      </> : undefined}
+      details={<>
+        <SnapshotSummary account={account} />
+        <div className="account-card__status account-card__status--toggle">
+          {slotCheckinEnabled != null ? <label className="wb-checkin-toggle"
+            title="关闭后，移除该槽位的 GitHub Secrets 并停止自动签到">
+            <input type="checkbox" checked={slotCheckinEnabled} disabled={switching || deleting}
+              onChange={(event) => onToggleCheckin(event.target.checked)} />
+            <span>{slotCheckinEnabled ? '云端自动签到已开启' : '云端自动签到已关闭'}</span>
+          </label> : null}
+          <div className={`wc-github-line${githubTone}`} title={[githubLine, ...account.warnings].join('；')}>
+            {githubLine}{account.warnings.length ? ` · ${account.warnings.join('；')}` : ''}
           </div>
-        ) : null}
-      </div>
+        </div>
+        {inlineCheckinFeedback ? null : checkinFeedback}
+      </>}
+      recovery={{
+        onClick: () => void startRefreshFlow(account.id), disabled: restoring || switchInProgress || localCheckinBusy,
+        label: flow && restoring ? '刷新中…' : undefined,
+        title: '打开该账号的 TRAE 客户端并恢复凭证，完成后同步 GitHub',
+      }}
+      cloudCheckin={{ title: '请在下方的云端签到任务中运行' }}>
+      {inlineCheckinFeedback}
       {editing ? <div className="wb-edit-name">
-        <input className="wc-input" value={name} maxLength={80} onChange={(event) => setName(event.target.value)} />
+        <input className="wc-input" aria-label="账号备注" value={name} maxLength={80} onChange={(event) => setName(event.target.value)} />
         <button type="button" className="wc-btn" onClick={() => void saveName()}>保存</button>
         <button type="button" className="wc-btn" onClick={() => { setName(title); setEditing(false); }}>取消</button>
       </div> : null}
-      <div className="wc-slot-actions account-card__actions">
-        <button
-          type="button"
-          className={account.validForSwitch ? 'wc-btn wc-btn-primary' : 'wc-btn'}
-          disabled={!canSwitch}
-          onClick={onSwitch}
-          title={
-            account.validForSwitch
-              ? '关闭当前客户端并注入该账号后打开'
-              : '设备密钥不完整，请重新登录并导入'
-          }
-        >
-          {switching ? '切换中…' : account.validForSwitch ? '切换并打开' : '快照不完整'}
-        </button>
-        <button
-          type="button"
-          className="wc-btn"
-          disabled={refreshingCredits || switching}
-          onClick={onRefreshCredits}
-          title="仅查询积分，绝不签到"
-        >
-          {refreshingCredits ? '查询中…' : '刷新积分'}
-        </button>
-        <button
-          type="button"
-          className={tokenTone === 'ok' || tokenTone === 'unknown' ? 'wc-btn' : 'wc-btn wc-btn-primary'}
-          disabled={flowRunning || switching}
-          onClick={() => void startRefreshFlow(account.id)}
-          title="切换到该账号并验证官方设备身份；有效 Token 直接同步，临近过期时等待客户端轮换"
-        >
-          {flowRunning ? '刷新中…' : '刷新凭证'}
-        </button>
-        <button
-          type="button"
-          className="wc-btn"
-          disabled={localChecking || flowRunning}
-          onClick={() => void localCheckin(account.id)}
-          title="从本机直接调用 TRAE 签到 API（诊断/补签）：与云端 Actions 形成对照，用于定位『操作太过频繁』的来源"
-        >
-          {localChecking ? '签到中…' : '本地签到'}
-        </button>
-        <button
-          type="button"
-          className="wc-btn"
-          disabled={switching}
-          onClick={() => setEditing((value) => !value)}
-          title="修改账号备注（显示名），不影响 GitHub 槽位绑定"
-        >
-          备注
-        </button>
-        {confirmingDelete ? (
-          <>
-            <button
-              type="button"
-              className="wc-btn wc-btn-danger"
-              disabled={deleting}
-              onClick={onDelete}
-              title="删除该账号槽位（不影响官方客户端登录态）"
-            >
-              {deleting ? '删除中…' : '确认删除'}
-            </button>
-            <button
-              type="button"
-              className="wc-btn"
-              disabled={deleting}
-              onClick={() => setConfirmingDelete(false)}
-            >
-              取消
-            </button>
-          </>
-        ) : (
-          <button
-            type="button"
-            className="wc-btn"
-            disabled={switching || deleting}
-            onClick={() => setConfirmingDelete(true)}
-            title="从账号库删除该账号槽位"
-          >
-            删除
-          </button>
-        )}
-      </div>
-    </div>
+      <AccountCardActions
+        switchAccount={{
+          onClick: onSwitch, disabled: !canSwitch, label: switching ? '切换中…' : undefined,
+          title: account.validForSwitch ? '切换到该账号并打开 TRAE' : '快照不完整，请重新登录并导入',
+        }}
+        checkin={{
+          onClick: () => void runAccountCheckin(),
+          disabled: localCheckinBusy || restoring || switchInProgress || deleting,
+          label: localChecking ? '签到中…' : undefined,
+          title: '使用 TRAE 已保存的登录状态发起本地签到',
+        }}
+        refresh={{ onClick: onRefreshCredits, disabled: refreshingCredits || switching, label: refreshingCredits ? '刷新中…' : undefined }}
+        rename={{ onClick: () => setEditing((value) => !value), disabled: switching }}
+        remove={{
+          onClick: confirmingDelete ? onDelete : () => setConfirmingDelete(true),
+          disabled: switchInProgress || deleting || localCheckinBusy, label: deleting ? '删除中…' : undefined,
+        }}
+        cancelRemove={confirmingDelete ? { onClick: () => setConfirmingDelete(false), disabled: deleting } : undefined}
+      />
+    </AccountCardFrame>
   );
 }
 
@@ -404,6 +317,71 @@ function StoreErrorBanner() {
       </button>
     </section>
   );
+}
+
+const TRAE_PATH_FIELDS = [
+  { key: 'trae_cn_app_path', label: 'TRAE 国行 EXE 路径' },
+  { key: 'trae_solo_cn_app_path', label: 'TRAE Work / SOLO CN EXE 路径' },
+] as const;
+
+type TraePaths = Record<(typeof TRAE_PATH_FIELDS)[number]['key'], string>;
+
+function TraePathSettingsDialog({ onClose, onSaved }: { onClose: () => void; onSaved: () => void }) {
+  const dialog = useRef<HTMLDialogElement>(null);
+  const [paths, setPaths] = useState<TraePaths | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    let cancelled = false;
+    if (!dialog.current?.open) dialog.current?.showModal();
+    void invoke<TraePaths>('get_general_config').then(config => {
+      if (!cancelled) setPaths({
+        trae_cn_app_path: config.trae_cn_app_path ?? '',
+        trae_solo_cn_app_path: config.trae_solo_cn_app_path ?? '',
+      });
+    }).catch((cause: unknown) => {
+      if (!cancelled) setError(String(cause));
+    });
+    return () => { cancelled = true; };
+  }, []);
+
+  const save = async () => {
+    if (!paths || saving) return;
+    setSaving(true);
+    setError('');
+    try {
+      await invoke('patch_general_config', { updates: {
+        trae_cn_app_path: paths.trae_cn_app_path.trim(),
+        trae_solo_cn_app_path: paths.trae_solo_cn_app_path.trim(),
+      } });
+      onSaved();
+      dialog.current?.close();
+    } catch (cause) {
+      setError(String(cause));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return <dialog ref={dialog} className="wc-dialog wb-settings-dialog uac-path-dialog"
+    aria-labelledby="trae-path-dialog-title" onClose={onClose} onCancel={event => { if (saving) event.preventDefault(); }}>
+    <h3 className="wc-dialog-title" id="trae-path-dialog-title">TRAE 路径设置</h3>
+    <p className="wc-dialog-note">按已安装的版本填写。留空时自动检测。</p>
+    {paths && TRAE_PATH_FIELDS.map(({ key, label }) => <label key={key} className="wc-row-label">
+      {label}
+      <input className="wc-input" value={paths[key]} disabled={saving}
+        onChange={event => setPaths({ ...paths, [key]: event.target.value })} />
+    </label>)}
+    {!paths && !error && <p className="wc-dialog-note" role="status">正在读取路径设置…</p>}
+    {error && <p className="wc-dialog-error" role="alert">{error}</p>}
+    <div className="wc-dialog-actions">
+      <button type="button" className="wc-btn" disabled={saving} onClick={() => dialog.current?.close()}>取消</button>
+      <button type="button" className="wc-btn wc-btn-primary" disabled={!paths || saving} onClick={() => void save()}>
+        {saving ? '保存中…' : '保存路径'}
+      </button>
+    </div>
+  </dialog>;
 }
 
 export function WorkCnSwitcherPage() {
@@ -443,6 +421,15 @@ export function WorkCnSwitcherPage() {
   // 运行记录 + 手动触发验证。日常签到由 GitHub Actions 北京时间 04:00 自动执行。
   // 触发条件沿用本页逻辑：gh CLI 可用且 GitHub 同步已启用。
   const [setupOpen, setSetupOpen] = useState(false);
+  const [pathsOpen, setPathsOpen] = useState(false);
+  const [detectionVersion, setDetectionVersion] = useState(0);
+  const [localCheckingIn, setLocalCheckingIn] = useState(false);
+  const [localCheckinResults, setLocalCheckinResults] = useState<AccountCheckinResult[] | null>(null);
+  const accountCheckingIn = useCheckinStore((state) => Object.values(state.localCheckinById).some(result => result.loading));
+  const restoring = useCheckinStore((state) => state.refreshFlow != null
+    && state.refreshFlow.phase !== 'done' && state.refreshFlow.phase !== 'failed');
+  const localCheckinBusy = localCheckingIn || accountCheckingIn;
+  const detect = () => setDetectionVersion(value => value + 1);
 
   useEffect(() => {
     let cancelled = false;
@@ -464,13 +451,15 @@ export function WorkCnSwitcherPage() {
           setLoading(false);
         }
       });
-    void ensureAccountsLoaded();
-    void loadGitHubConfig();
     return () => {
       cancelled = true;
     };
-  }, [ensureAccountsLoaded, loadGitHubConfig]);
+  }, [detectionVersion]);
 
+  useEffect(() => {
+    void ensureAccountsLoaded();
+    void loadGitHubConfig();
+  }, [ensureAccountsLoaded, loadGitHubConfig]);
   useEffect(() => {
     void loadSessionWatchStatus();
     let disposed = false;
@@ -520,65 +509,57 @@ export function WorkCnSwitcherPage() {
       ? accounts.reduce((latest, a) => (a.lastUsed > latest.lastUsed ? a : latest)).id
       : null);
 
-  return (
-    <div className="wc-page work-cn-page">
-      <header className="wc-header">
-        <h1 className="wc-title">
-          <img className="wc-title-icon" src={traeCnIcon} alt="TRAE" />
-          切换应用 · TRAE
-        </h1>
-        <div className="wc-header-actions">
-          <button
-            type="button"
-            className="wc-btn wc-btn-primary"
-            onClick={() => setDialogOpen(true)}
-            disabled={!installation?.installed}
-            title={installation?.installed ? '' : '请先安装并登录 TRAE'}
-          >
-            导入当前账号
-          </button>
-          <button
-            type="button"
-            className="wc-btn"
-            onClick={handleSyncAll}
-            disabled={syncingAllGithub}
-            title="把所有已绑定槽位账号的最新凭证（按账号槽位名命名的 *_TOKEN / *_DEVICE_ID）一键同步到 GitHub Secrets，供 daily-checkin 工作流签到使用；条件未就绪时点击可查看引导"
-          >
-            {syncingAllGithub && syncAllProgress
-              ? `同步中 ${syncAllProgress.done}/${syncAllProgress.total}…`
-              : '同步全部 GitHub'}
-          </button>
-          <button
-            type="button"
-            className="wc-btn"
-            onClick={() => setSettingsOpen(true)}
-          >
-            设置
-          </button>
-          <button
-            type="button"
-            className="wc-btn"
-            onClick={() => void openLogs()}
-            title="在系统文件管理器中打开日志目录"
-          >
-            日志
-          </button>
-        </div>
-      </header>
+  const runLocalCheckin = async () => {
+    if (localCheckinBusy || Object.values(useCheckinStore.getState().localCheckinById).some(result => result.loading)) return;
+    setLocalCheckingIn(true);
+    setLocalCheckinResults(null);
+    const results: AccountCheckinResult[] = [];
+    try {
+      for (const account of accounts) {
+        await useCheckinStore.getState().localCheckin(account.id);
+        const result = useCheckinStore.getState().localCheckinById[account.id]?.result;
+        results.push({
+          accountId: account.id,
+          displayName: account.tags?.[0] ?? account.nickname ?? account.email ?? account.userId ?? account.id,
+          outcome: result?.ok
+            ? { Ok: result.alreadyCheckedIn ? 'alreadySigned' : 'signed' }
+            : { Err: result?.message || '未收到签到结果' },
+        });
+        if (result?.ok) void refreshCredits(account.id, true);
+      }
+    } finally {
+      setLocalCheckinResults(results);
+      setLocalCheckingIn(false);
+    }
+  };
 
-      <section className={`wc-status${status.tone ? ` ${status.tone}` : ''}`}>
-        <span className={`wc-status-dot${status.tone === 'wc-status--ok' ? ' wc-status-dot--ok' : status.tone === 'wc-status--error' ? ' wc-status-dot--error' : ''}`} />
-        <div>
-          <div>{status.line}</div>
-          {status.detail ? (
-            <div className="wc-status-detail">
-              {status.detail.split('\n').map((line, index) => (
-                <div key={index}>{line}</div>
-              ))}
-            </div>
-          ) : null}
-        </div>
-      </section>
+  return (
+    <AccountManagementLayout app="TRAE" icon={traeCnIcon} actions={{
+      importAccount: {
+        onClick: () => setDialogOpen(true), disabled: !installation?.installed,
+        title: installation?.installed ? undefined : '请先安装并登录 TRAE',
+      },
+      sync: {
+        onClick: handleSyncAll, disabled: syncingAllGithub,
+        label: syncingAllGithub && syncAllProgress ? `同步中 ${syncAllProgress.done}/${syncAllProgress.total}…` : undefined,
+        title: '将已绑定槽位的凭证同步到 GitHub Secrets',
+      },
+      refresh: {
+        onClick: () => void Promise.all(accounts.map(account => refreshCredits(account.id, true))),
+        disabled: !accounts.length || Object.values(refreshingCreditsIds).some(Boolean),
+      },
+      checkin: {
+        onClick: () => void runLocalCheckin(),
+        disabled: !accounts.length || storeLoading || localCheckinBusy || restoring || switchingId != null || deletingId != null,
+        label: localCheckingIn ? '签到中…' : undefined, title: '依次为已保存的 TRAE 账号发起本地签到',
+      },
+      settings: { onClick: () => setPathsOpen(true) },
+      detect: { onClick: detect, disabled: loading },
+    }}>
+      <AccountStatusBanner tone={status.tone}
+        detail={status.detail?.split('\n').map((line, index) => <div key={index}>{line}</div>)}>
+        {status.line}
+      </AccountStatusBanner>
 
       {lastImportWarning ? (
         <section className="wc-status wc-status--warn">{lastImportWarning}</section>
@@ -588,14 +569,10 @@ export function WorkCnSwitcherPage() {
 
       <StoreErrorBanner />
 
-      <TraePoolPanel accountId={activeAccountId} />
+      <LocalCheckinFeedback running={localCheckingIn} results={localCheckinResults} />
 
-      <section>
-        <h2 className="wc-section-title">
-          账号槽位（{accounts.length}，数量不限）
-          {storeLoading ? ' · 加载中…' : ''}
-        </h2>
-        <div className="wc-slots wb-slots">
+      <TraePoolPanel accountId={activeAccountId} />
+      <AccountList count={accounts.length} loading={storeLoading} emptyHint="先登录官方 TRAE 客户端，再导入当前账号">
           {accounts.map((account) => (
             <AccountCard
               key={account.id}
@@ -603,6 +580,7 @@ export function WorkCnSwitcherPage() {
               credits={creditsById[account.id] ?? null}
               creditsError={creditsErrorById[account.id] ?? null}
               switching={switchingId === account.id}
+              switchInProgress={switchingId !== null}
               switchStage={switchingId === account.id ? switchStage : null}
               deleting={deletingId === account.id}
               refreshingCredits={!!refreshingCreditsIds[account.id]}
@@ -612,26 +590,25 @@ export function WorkCnSwitcherPage() {
               slotCheckinEnabled={
                 githubConfig.slots.find((slot) => slot.accountId === account.id)?.checkinEnabled ?? null
               }
+              localCheckinBusy={localCheckinBusy}
               onSwitch={() => void switchTo(account.id)}
               onRefreshCredits={() => void refreshCredits(account.id, true)}
               onDelete={() => void deleteAccount(account.id)}
               onToggleCheckin={(enabled) => void setSlotCheckin(account.id, enabled)}
             />
           ))}
-          <div className="wc-slot wc-slot--empty">
-            <span className="wc-slot-empty-icon">＋</span>
-            <span className="wc-slot-empty-hint">新增槽位 · 点击右上「导入当前账号」按顺序追加</span>
-          </div>
-        </div>
-      </section>
+      </AccountList>
 
-      {/* 云端签到任务（共享组件）：低频诊断区，默认收起。
-          日常签到由 GitHub Actions 北京时间 04:00 自动执行。 */}
+      <div className="wc-slot-actions uac-platform-actions" role="group" aria-label="TRAE 更多操作">
+        <button type="button" className="wc-btn" onClick={() => setSettingsOpen(true)}>GitHub 设置</button>
+        <button type="button" className="wc-btn" onClick={() => void openLogs()} title="打开日志目录">日志</button>
+      </div>
       <CloudCheckinPanel canTrigger={ghReady && githubConfig.enabled} />
 
       <WorkCnAddAccountDialog open={dialogOpen} onClose={() => setDialogOpen(false)} />
       <WorkCnSettingsDialog open={settingsOpen} onClose={() => setSettingsOpen(false)} />
+      {pathsOpen && <TraePathSettingsDialog onClose={() => setPathsOpen(false)} onSaved={detect} />}
       <GhSetupDialog open={setupOpen} onClose={() => setSetupOpen(false)} />
-    </div>
+    </AccountManagementLayout>
   );
 }

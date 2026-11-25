@@ -298,10 +298,11 @@ mod tests {
         let first = pool_dir_name("trae_64787fb5f684a3226422ad03c3bb2314");
         assert_eq!(first, "pool-c3bb2314");
         assert!(first.starts_with("pool-"));
-        assert!(first
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-'));
-        assert_ne!(first, pool_dir_name("trae_9bf38a69c2ed98437167b198974692e1"));
+        assert!(first.chars().all(|c| c.is_ascii_alphanumeric() || c == '-'));
+        assert_ne!(
+            first,
+            pool_dir_name("trae_9bf38a69c2ed98437167b198974692e1")
+        );
         // 少于 8 位时不应 panic。
         assert_eq!(pool_dir_name("ab"), "pool-ab");
     }
@@ -345,7 +346,8 @@ mod tests {
             "publicKeyPEM": "public", "privateKeyPEM": "private"
         }}));
         assert!(switchability(&snapshot).0);
-        snapshot.trae_auth_raw.as_mut().unwrap()["deviceKeyPair"]["privateKeyPEM"] = serde_json::json!("");
+        snapshot.trae_auth_raw.as_mut().unwrap()["deviceKeyPair"]["privateKeyPEM"] =
+            serde_json::json!("");
         assert!(!switchability(&snapshot).0);
     }
 }

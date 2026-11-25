@@ -1,4 +1,5 @@
 use reqwest::Client;
+use std::collections::HashMap;
 use std::error::Error;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{LazyLock, Mutex};
@@ -68,26 +69,81 @@ pub fn create_domestic_client(timeout_secs: u64, host: &str) -> Client {
 }
 
 /// Same route and proxy policy as domestic status queries, for loopback relay workers.
+#[derive(Clone)]
+struct CachedDomesticBlockingClient {
+    route: Option<(Ipv4Addr, Vec<Ipv4Addr>)>,
+    client: reqwest::blocking::Client,
+}
+
+static DOMESTIC_BLOCKING_CLIENTS: LazyLock<
+    Mutex<HashMap<(String, u64), CachedDomesticBlockingClient>>,
+> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+fn get_or_create_domestic_blocking_client<F>(
+    host: &str,
+    timeout_secs: u64,
+    route: Option<(Ipv4Addr, Vec<Ipv4Addr>)>,
+    build: F,
+) -> Result<reqwest::blocking::Client, String>
+where
+    F: FnOnce() -> Result<reqwest::blocking::Client, String>,
+{
+    let key = (host.to_string(), timeout_secs);
+    if let Ok(cache) = DOMESTIC_BLOCKING_CLIENTS.lock() {
+        if let Some(entry) = cache.get(&key).filter(|entry| entry.route == route) {
+            return Ok(entry.client.clone());
+        }
+    }
+    let client = build()?;
+    if let Ok(mut cache) = DOMESTIC_BLOCKING_CLIENTS.lock() {
+        cache.insert(
+            key,
+            CachedDomesticBlockingClient {
+                route,
+                client: client.clone(),
+            },
+        );
+        while cache.len() > 32 {
+            let Some(oldest_key) = cache.keys().next().cloned() else {
+                break;
+            };
+            cache.remove(&oldest_key);
+        }
+    }
+    Ok(client)
+}
+
 pub(crate) fn create_domestic_blocking_client(
     timeout_secs: u64,
     host: &str,
 ) -> Result<reqwest::blocking::Client, String> {
-    let mut builder = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(timeout_secs))
-        .connect_timeout(Duration::from_secs(15))
-        .no_proxy();
     #[cfg(windows)]
-    if !host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback()) {
-        if let Some((ip, addresses)) = resolve_domestic_route(host) {
-            builder = builder.local_address(IpAddr::V4(ip));
+    let route = if host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback()) {
+        None
+    } else {
+        resolve_domestic_route(host)
+    };
+    #[cfg(not(windows))]
+    let route: Option<(Ipv4Addr, Vec<Ipv4Addr>)> = None;
+    #[cfg(windows)]
+    let build_route = route.clone();
+
+    get_or_create_domestic_blocking_client(host, timeout_secs, route, move || {
+        let mut builder = reqwest::blocking::Client::builder()
+            .timeout(Duration::from_secs(timeout_secs))
+            .connect_timeout(Duration::from_secs(15))
+            .no_proxy();
+        #[cfg(windows)]
+        if let Some((ip, addresses)) = build_route.as_ref() {
+            builder = builder.local_address(IpAddr::V4(*ip));
             if let Some(address) = addresses.first() {
                 builder = builder.resolve(host, SocketAddr::new(IpAddr::V4(*address), 443));
             }
         }
-    }
-    builder
-        .build()
-        .map_err(|_| "国内网络客户端初始化失败".into())
+        builder
+            .build()
+            .map_err(|_| "国内网络客户端初始化失败".into())
+    })
 }
 
 pub(crate) fn format_request_error(label: &str, error: &dyn Error) -> String {
@@ -142,24 +198,14 @@ fn select_preferred_ipv4(addresses: &[IpAddr]) -> Option<Ipv4Addr> {
 #[cfg(windows)]
 fn resolve_domestic_route(host: &str) -> Option<(Ipv4Addr, Vec<Ipv4Addr>)> {
     static PROBE: Mutex<()> = Mutex::new(());
-    static FAILED: LazyLock<Mutex<Option<(String, Instant)>>> = LazyLock::new(|| Mutex::new(None));
-    let _single_flight = PROBE.lock().ok()?;
-    if FAILED
-        .lock()
-        .ok()?
-        .as_ref()
-        .is_some_and(|(name, until)| name == host && *until > Instant::now())
-    {
-        return None;
+    // Cache hits never wait behind another host's DNS probe.
+    if let Some(value) = cached_domestic_route(host) {
+        return value;
     }
-
-    if let Ok(cache) = DOMESTIC_ROUTE_CACHE.lock() {
-        if let Some(entry) = cache
-            .as_ref()
-            .filter(|entry| entry.host == host && entry.expires_at > Instant::now())
-        {
-            return Some((entry.local_ip, entry.addresses.clone()));
-        }
+    let _single_flight = PROBE.lock().ok()?;
+    // Double check after acquiring the probe lock, in case another caller filled the entry.
+    if let Some(value) = cached_domestic_route(host) {
+        return value;
     }
 
     let (local_ip, gateway) = discover_non_mihomo_route()?;
@@ -199,38 +245,65 @@ fn resolve_domestic_route(host: &str) -> Option<(Ipv4Addr, Vec<Ipv4Addr>)> {
         .into_iter()
         .filter(|value| select_preferred_ipv4(&[IpAddr::V4(*value)]).is_some())
         .collect::<Vec<_>>();
-    if addresses.is_empty() {
-        if let Ok(mut failed) = FAILED.lock() {
-            *failed = Some((host.into(), Instant::now() + Duration::from_secs(15)));
-        }
-        return None;
-    }
-    if let Ok(mut failed) = FAILED.lock() {
-        *failed = None;
-    }
+    let route = if addresses.is_empty() {
+        None
+    } else {
+        Some((local_ip, addresses))
+    };
+    let ttl = if route.is_some() {
+        Duration::from_secs(30)
+    } else {
+        Duration::from_secs(15)
+    };
     if let Ok(mut cache) = DOMESTIC_ROUTE_CACHE.lock() {
-        *cache = Some(CachedDomesticRoute {
-            host: host.to_string(),
-            local_ip,
-            addresses: addresses.clone(),
-            expires_at: Instant::now() + Duration::from_secs(30),
-        });
+        cache.insert(host, route.clone(), Instant::now() + ttl);
     }
-    Some((local_ip, addresses))
+    route
 }
 
 #[cfg(windows)]
-#[derive(Clone)]
-struct CachedDomesticRoute {
-    host: String,
-    local_ip: Ipv4Addr,
-    addresses: Vec<Ipv4Addr>,
-    expires_at: Instant,
+type DomesticRoute = (Ipv4Addr, Vec<Ipv4Addr>);
+
+#[cfg(windows)]
+#[derive(Default)]
+struct DomesticRouteCache {
+    entries: HashMap<String, (Option<DomesticRoute>, Instant)>,
 }
 
 #[cfg(windows)]
-static DOMESTIC_ROUTE_CACHE: LazyLock<Mutex<Option<CachedDomesticRoute>>> =
-    LazyLock::new(|| Mutex::new(None));
+impl DomesticRouteCache {
+    fn get(&self, host: &str, now: Instant) -> Option<Option<DomesticRoute>> {
+        self.entries
+            .get(host)
+            .filter(|(_, until)| *until > now)
+            .map(|(route, _)| route.clone())
+    }
+
+    fn insert(&mut self, host: &str, route: Option<DomesticRoute>, until: Instant) {
+        self.entries
+            .retain(|_, (_, expires)| *expires > Instant::now());
+        if self.entries.len() >= 32 && !self.entries.contains_key(host) {
+            if let Some(oldest) = self
+                .entries
+                .iter()
+                .min_by_key(|(_, (_, expires))| *expires)
+                .map(|(key, _)| key.clone())
+            {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.entries.insert(host.to_owned(), (route, until));
+    }
+}
+
+#[cfg(windows)]
+static DOMESTIC_ROUTE_CACHE: LazyLock<Mutex<DomesticRouteCache>> =
+    LazyLock::new(|| Mutex::new(DomesticRouteCache::default()));
+
+#[cfg(windows)]
+fn cached_domestic_route(host: &str) -> Option<Option<DomesticRoute>> {
+    DOMESTIC_ROUTE_CACHE.lock().ok()?.get(host, Instant::now())
+}
 
 #[cfg(windows)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -516,10 +589,89 @@ fn skip_dns_name(packet: &[u8], mut offset: usize) -> Result<usize, String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        create_client_with_mode, format_request_error, select_preferred_ipv4, HttpProxyMode,
+        create_client_with_mode, format_request_error, get_or_create_domestic_blocking_client,
+        select_preferred_ipv4, HttpProxyMode,
     };
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
     use std::time::Duration;
+
+    #[test]
+    fn domestic_blocking_client_is_reused_until_route_or_timeout_changes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let host = format!("client-cache-test-{}", uuid::Uuid::new_v4());
+        let builds = AtomicUsize::new(0);
+        let first = get_or_create_domestic_blocking_client(&host, 17, None, || {
+            builds.fetch_add(1, Ordering::SeqCst);
+            reqwest::blocking::Client::builder()
+                .build()
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        let second = get_or_create_domestic_blocking_client(&host, 17, None, || {
+            builds.fetch_add(1, Ordering::SeqCst);
+            reqwest::blocking::Client::builder()
+                .build()
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        drop((first, second));
+
+        let route = Some((
+            Ipv4Addr::new(192, 0, 2, 10),
+            vec![Ipv4Addr::new(192, 0, 2, 20)],
+        ));
+        get_or_create_domestic_blocking_client(&host, 17, route.clone(), || {
+            builds.fetch_add(1, Ordering::SeqCst);
+            reqwest::blocking::Client::builder()
+                .build()
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        get_or_create_domestic_blocking_client(&host, 18, route, || {
+            builds.fetch_add(1, Ordering::SeqCst);
+            reqwest::blocking::Client::builder()
+                .build()
+                .map_err(|e| e.to_string())
+        })
+        .unwrap();
+        assert_eq!(builds.load(Ordering::SeqCst), 3);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn domestic_route_cache_keeps_hosts_and_expirations_independent() {
+        use std::time::Instant;
+        let now = Instant::now();
+        let mut cache = super::DomesticRouteCache::default();
+        let route = (
+            Ipv4Addr::new(192, 0, 2, 10),
+            vec![Ipv4Addr::new(192, 0, 2, 20)],
+        );
+        cache.insert(
+            "one.test",
+            Some(route.clone()),
+            now + Duration::from_secs(30),
+        );
+        cache.insert("two.test", None, now + Duration::from_secs(15));
+        assert_eq!(cache.get("one.test", now), Some(Some(route.clone())));
+        assert_eq!(cache.get("two.test", now), Some(None));
+        assert_eq!(cache.get("two.test", now + Duration::from_secs(16)), None);
+        assert_eq!(
+            cache.get("one.test", now + Duration::from_secs(16)),
+            Some(Some(route))
+        );
+        assert_eq!(cache.get("one.test", now + Duration::from_secs(31)), None);
+        assert_eq!(cache.get("unknown.test", now), None);
+        for i in 0..40 {
+            cache.insert(
+                &format!("host-{i}.test"),
+                None,
+                now + Duration::from_secs(30),
+            );
+        }
+        assert!(cache.entries.len() <= 32);
+    }
 
     #[test]
     fn domestic_route_probe_does_not_spawn_ipconfig() {

@@ -6,6 +6,9 @@
 // 页签为前端 state，不引入路由库。
 
 import './App.css';
+import { Bot, Cable } from 'lucide-react';
+import { HarnessPage } from './pages/HarnessPage';
+import { DoubaoPoolPanel } from './components/doubao/DoubaoPoolPanel';
 import { useEffect, useState } from 'react';
 import traeCnIcon from './assets/icons/trae-cn.png';
 import workBuddyIcon from './assets/icons/workbuddy.png';
@@ -14,7 +17,7 @@ import { WorkBuddyPage } from './pages/WorkBuddyPage';
 import { useWorkCnStore } from './stores/useWorkCnStore';
 import { useWorkBuddyStore } from './stores/useWorkBuddyStore';
 
-type PageKey = 'switcher' | 'workbuddy';
+type PageKey = 'switcher' | 'workbuddy' | 'doubao' | 'harness';
 
 export default function App() {
   const [page, setPage] = useState<PageKey>('switcher');
@@ -49,9 +52,13 @@ export default function App() {
             <h1>切换应用</h1>
           </div>
         </div>
-        <nav className="sidebar-nav">
+        <nav className="sidebar-nav" aria-label="主导航">
+          <div className="sidebar-group-label">切换应用</div>
           <button
             type="button"
+            title="WorkBuddy"
+            aria-label="WorkBuddy"
+            aria-current={page === 'workbuddy' ? 'page' : undefined}
             className={page === 'workbuddy' ? 'nav-item active' : 'nav-item'}
             onClick={() => setPage('workbuddy')}
           >
@@ -60,11 +67,29 @@ export default function App() {
           </button>
           <button
             type="button"
+            title="TRAE"
+            aria-label="TRAE"
+            aria-current={page === 'switcher' ? 'page' : undefined}
             className={page === 'switcher' ? 'nav-item active' : 'nav-item'}
             onClick={() => setPage('switcher')}
           >
             <img src={traeCnIcon} alt="" width={17} height={17} />
             <span>TRAE</span>
+          </button>
+          <button
+            type="button"
+            title="豆包"
+            aria-label="豆包"
+            aria-current={page === 'doubao' ? 'page' : undefined}
+            className={page === 'doubao' ? 'nav-item active' : 'nav-item'}
+            onClick={() => setPage('doubao')}
+          >
+            <Bot size={17} />
+            <span>豆包</span>
+          </button>
+          <div className="sidebar-group-label">模型服务</div>
+          <button type="button" title="DeepSeek Harness" aria-label="DeepSeek Harness" aria-current={page === 'harness' ? 'page' : undefined} className={page === 'harness' ? 'nav-item harness-nav active' : 'nav-item harness-nav'} onClick={() => setPage('harness')}>
+            <Cable size={17} /><span>DeepSeek Harness</span>
           </button>
         </nav>
         <div className="sidebar-footer">
@@ -75,7 +100,7 @@ export default function App() {
         </div>
       </aside>
       <main className="main-wrapper">
-        {page === 'switcher' ? <WorkCnSwitcherPage /> : <WorkBuddyPage />}
+        {page === 'harness' ? <HarnessPage /> : page === 'switcher' ? <WorkCnSwitcherPage /> : page === 'doubao' ? <DoubaoPoolPanel /> : <WorkBuddyPage />}
       </main>
     </div>
   );

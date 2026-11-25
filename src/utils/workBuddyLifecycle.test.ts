@@ -17,7 +17,7 @@ test('WorkBuddy 监测由页面显式启动，定时刷新只查询余额', () =
 
   assert.equal(lib.includes('workbuddy_session_watcher::ensure_started();'), false);
   assert.equal(commands.includes('start_workbuddy_session_watcher'), true);
-  const refreshEffect = page.slice(page.indexOf('const refreshIfStale ='), page.indexOf('}, [refreshAllStatuses])'));
+  const refreshEffect = page.slice(page.indexOf('const refreshIfStale ='), page.indexOf('}, [refreshAllStatuses, accounts]);'));
   assert.ok(refreshEffect.length > 0);
   assert.match(refreshEffect, /refreshAllStatuses\(\)/);
   assert.match(refreshEffect, /document\.visibilityState/);
@@ -50,13 +50,20 @@ test('WorkBuddy 真实积分、今日奖励和连续签到状态应支持只读�
   assert.match(models, /WorkBuddyAccountStatus/);
   assert.match(service, /getWorkBuddyAccountStatus/);
   assert.match(store, /statusById|refreshAccountStatus|refreshAllStatuses/);
-  assert.match(page, /可用积分/);
-  assert.match(page, /今日奖励/);
-  assert.match(page, /连续签到/);
-  assert.match(page, /刷新全部积分/);
+  assert.match(page, /credits=\{statusLoading[\s\S]*status\?\.credits/);
+  assert.match(page, /todayReward=\{status\?\.todayReward/);
+  assert.match(page, /streakDays=\{status\?\.streakDays/);
+  assert.match(page, /refresh: \{ onClick: \(\) => void refreshAllStatuses\(\)/);
   assert.match(statusModule, /get-user-resource/);
   assert.match(statusModule, /checkin-activity-status/);
-  assert.doesNotMatch(statusModule, /daily-checkin/);
+  assert.match(commands, /fn get_workbuddy_account_status\([^)]*\)[^{]*\{\s*workbuddy_status::query_account_status\(&account_id\)\.await\s*\}/);
+  const query = statusModule.slice(statusModule.indexOf('async fn query_both('), statusModule.indexOf('fn assemble_status('));
+  assert.match(query, /query_json\(client, RESOURCE_URL, token,/);
+  assert.match(query, /query_json\(client, ACTIVITY_URL, token,/);
+  assert.doesNotMatch(query, /daily-checkin|CHECKIN_URL|checkin_account\(/);
+  const readOnly = statusModule.slice(statusModule.indexOf('pub async fn query_account_status('), statusModule.indexOf('#[cfg(test)]'));
+  assert.match(readOnly, /query_both\(&client, &token\)\.await/);
+  assert.doesNotMatch(readOnly, /daily-checkin|CHECKIN_URL|checkin_account\(/);
 });
 
 test('WorkBuddy 安装检测不得在 Tauri 命令线程同步扫描进程', () => {

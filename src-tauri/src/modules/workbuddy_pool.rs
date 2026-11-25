@@ -153,6 +153,8 @@ struct Catalog {
 struct PoolState {
     preferred: Option<String>,
     cooldowns: HashMap<String, Instant>,
+    slots: super::pool_dispatch::AccountSlots,
+    admission: super::pool_dispatch::AdmissionQueue,
     requests: u64,
     rotations: u64,
 }
@@ -168,6 +170,7 @@ pub struct PoolStatus {
     rotations: u64,
     cooling_accounts: usize,
     model_count: usize,
+    selected_model_ids: Vec<String>,
     catalog_source: String,
 }
 
@@ -193,6 +196,17 @@ pub fn get_workbuddy_pool_status() -> Result<PoolStatus, String> {
                 .models
                 .len(),
             None => load_selection()?.model_ids.len(),
+        },
+        selected_model_ids: match service.as_ref() {
+            Some(pool) => pool
+                .catalog
+                .lock()
+                .map_err(|_| "模型目录锁异常")?
+                .models
+                .iter()
+                .filter_map(|model| model["id"].as_str().map(str::to_string))
+                .collect(),
+            None => load_selection()?.model_ids,
         },
         catalog_source: service
             .as_ref()
@@ -381,7 +395,7 @@ fn reconciled_models(mut models: Vec<Value>, catalog: &Catalog, key: &str) -> Ve
     models
 }
 
-fn load_pool_key() -> Result<String, String> {
+pub(crate) fn load_pool_key() -> Result<String, String> {
     let path = super::config::get_data_dir()?.join("workbuddy-pool-local.key");
     match std::fs::read_to_string(&path) {
         Ok(key) if uuid::Uuid::parse_str(key.trim()).is_ok() => Ok(key.trim().into()),
@@ -484,7 +498,15 @@ pub async fn save_workbuddy_pool_models(model_ids: Vec<String>) -> Result<PoolMo
 
 #[tauri::command]
 pub async fn start_workbuddy_pool() -> Result<PoolStatus, String> {
-    tauri::async_runtime::spawn_blocking(|| {
+    start_pool(true).await
+}
+
+pub async fn start_model_service() -> Result<PoolStatus, String> {
+    start_pool(false).await
+}
+
+async fn start_pool(register_desktop: bool) -> Result<PoolStatus, String> {
+    tauri::async_runtime::spawn_blocking(move || {
         let _config = MODEL_CONFIG_LOCK.lock().map_err(|_| "模型配置锁异常")?;
         let selection = load_selection()?;
         if selection.model_ids.is_empty() {
@@ -497,24 +519,40 @@ pub async fn start_workbuddy_pool() -> Result<PoolStatus, String> {
             if pool.stopping.load(Ordering::SeqCst) {
                 return Err("账号池正在等待在途请求结束，端口释放后可重新启动".into());
             }
-            register_model(&pool.key, &catalog)?;
+            if register_desktop {
+                register_model(&pool.key, &catalog)?;
+            }
             *pool.catalog.lock().map_err(|_| "模型目录锁异常")? = catalog;
             return Ok(());
         }
         if super::workbuddy_account::list_workbuddy_accounts()?.is_empty() {
             return Err("请先导入 WorkBuddy 账号".to_string());
         }
-        let server = Server::http(("127.0.0.1", PORT))
+        #[cfg(test)]
+        let bind_port = std::env::var("QIEHUAN_TEST_POOL_PORT")
+            .ok()
+            .and_then(|s| s.parse::<u16>().ok())
+            .unwrap_or(PORT);
+        #[cfg(not(test))]
+        let bind_port = PORT;
+        let server = Server::http(("127.0.0.1", bind_port))
             .map_err(|_| format!("本地端口 {PORT} 已被占用，未修改配置"))?;
         let key = load_pool_key()?;
         let pool = Arc::new(Pool {
             server,
             key,
             stopping: AtomicBool::new(false),
-            state: Mutex::new(PoolState::default()),
+            state: Mutex::new(PoolState {
+                // 十个上游账号可支撑多于默认 3 个租约；单客户端上限设 5 是为浏览器
+                // 每主机 6 条 HTTP/1.1 连接留出 1 个控制通道位，避免准入轮询排队。
+                admission: super::pool_dispatch::AdmissionQueue::with_caps(8, 5),
+                ..PoolState::default()
+            }),
             catalog: Mutex::new(catalog),
         });
-        register_model(&pool.key, &pool.catalog.lock().unwrap())?;
+        if register_desktop {
+            register_model(&pool.key, &pool.catalog.lock().unwrap())?;
+        }
         let saved = ModelSelection {
             version: 1,
             model_ids: selection.model_ids,
@@ -526,16 +564,23 @@ pub async fn start_workbuddy_pool() -> Result<PoolStatus, String> {
         )?;
         let worker = pool.clone();
         let join = std::thread::spawn(move || {
-            for request in worker.server.incoming_requests() {
-                if worker.stopping.load(Ordering::SeqCst) {
-                    reply(request, 503, "账号池正在停止，未发起新的上游请求");
-                    break;
-                }
-                handle(request, &worker);
-                if worker.stopping.load(Ordering::SeqCst) {
-                    break;
-                }
-            }
+            super::pool_dispatch::dispatch_observed(
+                &worker.server,
+                &worker.stopping,
+                |request| handle(request, &worker),
+                |status| {
+                    super::model_service::record(
+                        "workbuddy-pool-",
+                        false,
+                        status,
+                        if status == 429 {
+                            super::model_service::RESULT_ENTRY_REJECTED
+                        } else {
+                            super::model_service::RESULT_STOPPING
+                        },
+                    )
+                },
+            );
         });
         *service = Some(PoolService { pool: pool.clone() });
         monitor_worker(pool, join);
@@ -604,13 +649,71 @@ pub(crate) async fn restore_workbuddy_pool() {
     }
 }
 
+fn debug_log(line: &str) {
+    // 测试构建下仅在显式隔离了数据目录时才写日志，防止 cargo test 污染真实日志。
+    if cfg!(test) && std::env::var_os("QIEHUAN_YINGYONG_TEST_DATA_DIR").is_none() {
+        return;
+    }
+    use std::io::Write;
+    let Ok(dir) = super::config::get_data_dir().map(|d| d.join("logs")) else {
+        return;
+    };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("workbuddy-pool-debug.log"))
+    {
+        let _ = writeln!(file, "{stamp} {line}");
+    }
+}
+
 fn reply(request: Request, status: u16, message: &str) {
-    let body = json!({"error": {"message": message, "type": "workbuddy_pool_error"}}).to_string();
-    let _ = request.respond(
-        Response::from_string(body)
-            .with_status_code(StatusCode(status))
-            .with_header(Header::from_bytes("Content-Type", "application/json").unwrap()),
+    super::model_service::record(
+        "workbuddy-pool-",
+        false,
+        status,
+        super::model_service::RESULT_FAILED,
     );
+    let code = match (status, message) {
+        (429, "可用账号正在处理其他请求，请稍后重试") => "local_accounts_busy",
+        (429, _) => "rate_limited",
+        (503, _) => "service_unavailable",
+        _ => "request_failed",
+    };
+    debug_log(&format!("reply status={status} code={code}"));
+    let body = json!({"error": {"message": message, "type": "workbuddy_pool_error", "code": code}})
+        .to_string();
+    let mut response = Response::from_string(body)
+        .with_status_code(StatusCode(status))
+        .with_header(Header::from_bytes("Content-Type", "application/json").unwrap());
+    if status == 429 {
+        let delay = if code == "rate_limited" { "60" } else { "15" };
+        response.add_header(Header::from_bytes("Retry-After", delay).unwrap());
+    }
+    let _ = request.respond(response);
+}
+
+// Expose a bounded numeric diagnostic without copying upstream text or credentials.
+fn upstream_rejection(body: &str) -> String {
+    let code = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| value.get("code").and_then(Value::as_i64));
+    match code {
+        Some(11128) => {
+            "上游渠道校验拒绝请求（代码 11128）；完整 Harness Agent 请求暂不可用，未自动重试".into()
+        }
+        Some(code) if (0..=99999999).contains(&code) => {
+            format!("上游拒绝请求（代码 {code}），未换号重放；请检查模型和上下文")
+        }
+        _ => "上游拒绝请求，未换号重放；请检查模型和上下文".into(),
+    }
 }
 
 // Retry only explicit account failures before any response bytes have reached the client.
@@ -663,6 +766,17 @@ fn handle(mut request: Request, pool: &Pool) {
         reply(request, 401, "本地账号池 API Key 无效");
         return;
     }
+    let admission = pool
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .admission
+        .clone();
+    let Some(next_request) = super::pool_dispatch::admission_route(request, &admission) else {
+        return;
+    };
+    request = next_request;
+
     if request.method() == &Method::Get && request.url() == "/v1/models" {
         let data: Vec<Value> = pool.catalog.lock().unwrap().models.iter().filter(|model| is_chat_model(model)).map(|model| json!({"id":format!("workbuddy-pool-{}",model["id"].as_str().unwrap()),"object":"model","owned_by":"local"})).collect();
         let _ = request.respond(
@@ -675,6 +789,13 @@ fn handle(mut request: Request, pool: &Pool) {
         reply(request, 404, "接口不存在");
         return;
     }
+    let Some((next_request, _admission_lease)) =
+        super::pool_dispatch::admission_enter(request, &admission)
+    else {
+        return;
+    };
+    request = next_request;
+
     let mut bytes = Vec::new();
     if request
         .as_reader()
@@ -702,10 +823,14 @@ fn handle(mut request: Request, pool: &Pool) {
         .and_then(model_id)
         .map(str::to_string);
     if upstream_model.is_none()
-        || body.get("stream").and_then(Value::as_bool) != Some(true)
+        || body.get("stream").is_some_and(|v| !v.is_boolean())
         || !body.get("messages").is_some_and(Value::is_array)
     {
-        reply(request, 400, "请使用 workbuddy-pool- 模型 ID 和流式会话");
+        reply(
+            request,
+            400,
+            "请使用 workbuddy-pool- 模型 ID、messages 数组及布尔 stream",
+        );
         return;
     }
     let upstream_model = upstream_model.unwrap();
@@ -760,9 +885,26 @@ fn relay(
         &dyn Fn(&crate::models::workbuddy::WorkBuddyAccountView) -> Result<String, String>,
     >,
 ) {
+    let relay_started = std::time::Instant::now();
+    let streaming = body["stream"].as_bool().unwrap_or(false);
+    let mut body = body;
+    body["stream"] = json!(true);
+    let requested_model = format!(
+        "workbuddy-pool-{}",
+        body["model"].as_str().unwrap_or("unknown")
+    );
     let preferred = pool.state.lock().unwrap().preferred.clone();
     accounts.sort_by_key(|a| preferred.as_deref() != Some(&a.id));
     pool.state.lock().unwrap().requests += 1;
+    debug_log(&format!(
+        "chat path=/v1/chat/completions bytes={} stream={streaming}",
+        body.to_string().len()
+    ));
+    debug_log(&format!(
+        "forward model={} candidates={}",
+        body["model"].as_str().unwrap_or("unknown"),
+        accounts.len()
+    ));
     let host = url::Url::parse(upstream)
         .ok()
         .and_then(|u| u.host_str().map(str::to_string))
@@ -774,124 +916,213 @@ fn relay(
             return;
         }
     };
-    'accounts: for account in accounts {
-        if pool
-            .state
-            .lock()
-            .unwrap()
-            .cooldowns
-            .get(&account.id)
-            .is_some_and(|until| *until > Instant::now())
-        {
-            continue;
-        }
-        let mut token = match token_for(&account) {
-            Ok(t) => t,
-            Err(_) => {
-                pool.state.lock().unwrap().cooldowns.insert(
-                    account.id.clone(),
-                    Instant::now() + Duration::from_secs(300),
-                );
+    let slots = pool.state.lock().unwrap().slots.clone();
+    let mut busy_account = false;
+    // Contended accounts queue briefly instead of failing the request; the
+    // scan repeats after a bounded wait for any slot release.
+    loop {
+        busy_account = false;
+        'accounts: for account in &accounts {
+            // Cheap eligibility first: never wait on a slot for a cooled account.
+            if pool
+                .state
+                .lock()
+                .unwrap()
+                .cooldowns
+                .get(&account.id)
+                .is_some_and(|until| *until > Instant::now())
+            {
                 continue;
             }
-        };
-        for attempt in 0..2 {
-            let response = client
-                .post(upstream)
-                .bearer_auth(&token)
-                .header("Accept", "application/json, text/event-stream")
-                .header("X-User-Id", &account.uid)
-                .header("X-No-Enterprise-Id", "1")
-                .header("X-No-Department-Info", "1")
-                .header("X-Product", "SaaS")
-                .header("X-CodeBuddy-Request", "1")
-                .header("X-Agent-Purpose", "conversation")
-                .header("Origin", "https://copilot.tencent.com")
-                .header("Referer", "https://copilot.tencent.com/")
-                .json(&body)
-                .send();
-            let response = match response {
-                Ok(r) => r,
+            let Some(_lease) = slots.try_acquire(&account.id) else {
+                busy_account = true;
+                continue;
+            };
+            // The account may have entered cooldown while waiting for this scan.
+            if pool
+                .state
+                .lock()
+                .unwrap()
+                .cooldowns
+                .get(&account.id)
+                .is_some_and(|until| *until > Instant::now())
+            {
+                continue;
+            }
+            let mut token = match token_for(account) {
+                Ok(t) => t,
                 Err(_) => {
-                    reply(request, 502, "上游连接中断，请手动重试；未自动重放请求");
-                    return;
+                    pool.state.lock().unwrap().cooldowns.insert(
+                        account.id.clone(),
+                        Instant::now() + Duration::from_secs(300),
+                    );
+                    continue;
                 }
             };
-            let status = response.status().as_u16();
-            if status == 401 && attempt == 0 {
-                if let Some(recover) = recover {
-                    if let Ok(fresh) = recover(&account) {
-                        if fresh != token {
-                            token = fresh;
-                            continue;
+            for attempt in 0..2 {
+                let response = client
+                    .post(upstream)
+                    .bearer_auth(&token)
+                    .header("Accept", "application/json, text/event-stream")
+                    .header("X-User-Id", &account.uid)
+                    .header("X-No-Enterprise-Id", "1")
+                    .header("X-No-Department-Info", "1")
+                    .header("X-Product", "SaaS")
+                    .header("X-CodeBuddy-Request", "1")
+                    .header("X-Agent-Purpose", "conversation")
+                    .header("Origin", "https://copilot.tencent.com")
+                    .header("Referer", "https://copilot.tencent.com/")
+                    .json(&body)
+                    .send();
+                let response = match response {
+                    Ok(r) => r,
+                    Err(_) => {
+                        reply(request, 502, "上游连接中断，请手动重试；未自动重放请求");
+                        return;
+                    }
+                };
+                let status = response.status().as_u16();
+                if status == 401 && attempt == 0 {
+                    if let Some(recover) = recover {
+                        if let Ok(fresh) = recover(account) {
+                            if fresh != token {
+                                debug_log(&format!(
+                                    "auth_refresh account={} changed=true",
+                                    account.id.chars().take(16).collect::<String>()
+                                ));
+                                token = fresh;
+                                continue;
+                            }
                         }
                     }
                 }
-            }
-            if !(200..300).contains(&status) {
-                let mut error = String::new();
-                let _ = response.take(64 * 1024).read_to_string(&mut error);
-                if let Some(delay) = cooldown(status, &error) {
-                    let mut state = pool.state.lock().unwrap();
-                    state
-                        .cooldowns
-                        .insert(account.id.clone(), Instant::now() + delay);
-                    state.rotations += 1;
-                    continue 'accounts;
-                }
-                reply(
-                    request,
-                    status,
-                    "上游拒绝请求，未换号重放；请检查模型和上下文",
-                );
-                return;
-            }
-            let mut reader = BufReader::new(response);
-            let prefix = match first_event(&mut reader) {
-                Ok(p) => p,
-                Err(_) => {
-                    reply(request, 502, "上游未返回有效流式首帧，未自动重放");
+                if !(200..300).contains(&status) {
+                    let mut error = String::new();
+                    let _ = response.take(64 * 1024).read_to_string(&mut error);
+                    if let Some(delay) = cooldown(status, &error) {
+                        debug_log(&format!(
+                            "rotate account={} status={status} reason=upstream_status",
+                            account.id.chars().take(16).collect::<String>()
+                        ));
+                        let mut state = pool.state.lock().unwrap();
+                        state
+                            .cooldowns
+                            .insert(account.id.clone(), Instant::now() + delay);
+                        state.rotations += 1;
+                        continue 'accounts;
+                    }
+                    debug_log(&format!(
+                        "upstream_reject account={} status={status} detail={}",
+                        account.id.chars().take(16).collect::<String>(),
+                        upstream_rejection(&error)
+                    ));
+                    reply(request, status, &upstream_rejection(&error));
                     return;
                 }
-            };
-            // A successful HTTP status can still carry a quota error as its first SSE event.
-            let text = String::from_utf8_lossy(&prefix);
-            let error_event = text
-                .lines()
-                .filter_map(|l| l.strip_prefix("data:"))
-                .filter_map(|s| serde_json::from_str::<Value>(s).ok())
-                .any(|v| {
-                    v.get("error").is_some()
-                        || v.get("code")
-                            .and_then(Value::as_i64)
-                            .is_some_and(|c| c != 0)
-                });
-            if error_event {
-                if let Some(delay) = cooldown(status, &text) {
-                    let mut state = pool.state.lock().unwrap();
-                    state
-                        .cooldowns
-                        .insert(account.id.clone(), Instant::now() + delay);
-                    state.rotations += 1;
-                    continue 'accounts;
+                let mut reader = BufReader::new(response);
+                let prefix = match first_event(&mut reader) {
+                    Ok(p) => p,
+                    Err(_) => {
+                        debug_log(&format!(
+                            "first_frame_invalid account={}",
+                            account.id.chars().take(16).collect::<String>()
+                        ));
+                        reply(request, 502, "上游未返回有效流式首帧，未自动重放");
+                        return;
+                    }
+                };
+                // A successful HTTP status can still carry a quota error as its first SSE event.
+                let text = String::from_utf8_lossy(&prefix);
+                let error_event = text
+                    .lines()
+                    .filter_map(|l| l.strip_prefix("data:"))
+                    .filter_map(|s| serde_json::from_str::<Value>(s).ok())
+                    .any(|v| {
+                        v.get("error").is_some()
+                            || v.get("code")
+                                .and_then(Value::as_i64)
+                                .is_some_and(|c| c != 0)
+                    });
+                if error_event {
+                    debug_log(&format!(
+                        "first_frame_error account={} status={status}",
+                        account.id.chars().take(16).collect::<String>()
+                    ));
+                    if let Some(delay) = cooldown(status, &text) {
+                        let mut state = pool.state.lock().unwrap();
+                        state
+                            .cooldowns
+                            .insert(account.id.clone(), Instant::now() + delay);
+                        state.rotations += 1;
+                        continue 'accounts;
+                    }
+                    reply(request, 502, "上游流式首帧返回错误，未重放");
+                    return;
                 }
-                reply(request, 502, "上游流式首帧返回错误，未重放");
-                return;
+                pool.state.lock().unwrap().preferred = Some(account.id.clone());
+                let stream = std::io::Cursor::new(prefix).chain(reader);
+                if !streaming {
+                    match super::model_service::collect_completion(BufReader::new(stream)) {
+                        Ok(value) => {
+                            let result = request.respond(
+                                Response::from_string(value.to_string()).with_header(
+                                    Header::from_bytes("Content-Type", "application/json").unwrap(),
+                                ),
+                            );
+                            super::model_service::record_timed(
+                                &requested_model,
+                                false,
+                                if result.is_ok() { 200 } else { 502 },
+                                if result.is_ok() {
+                                    super::model_service::RESULT_COMPLETE
+                                } else {
+                                    super::model_service::RESULT_SEND_FAILED
+                                },
+                                Some(relay_started.elapsed().as_millis() as u64),
+                            );
+                        }
+                        Err(error) => reply(request, 502, &error),
+                    }
+                    return;
+                }
+                let result = request.respond(Response::new(
+                    StatusCode(200),
+                    vec![
+                        Header::from_bytes("Content-Type", "text/event-stream").unwrap(),
+                        Header::from_bytes("Cache-Control", "no-cache").unwrap(),
+                    ],
+                    stream,
+                    None,
+                    None,
+                ));
+                super::model_service::record_timed(
+                    &requested_model,
+                    true,
+                    if result.is_ok() { 200 } else { 502 },
+                    super::model_service::RESULT_STREAM_ENDED,
+                    Some(relay_started.elapsed().as_millis() as u64),
+                );
+                return; // Never retry once response streaming has started, including disconnects.
             }
-            pool.state.lock().unwrap().preferred = Some(account.id);
-            let stream = std::io::Cursor::new(prefix).chain(reader);
-            let _ = request.respond(Response::new(
-                StatusCode(200),
-                vec![
-                    Header::from_bytes("Content-Type", "text/event-stream").unwrap(),
-                    Header::from_bytes("Cache-Control", "no-cache").unwrap(),
-                ],
-                stream,
-                None,
-                None,
-            ));
-            return; // Never retry once response streaming has started, including disconnects.
         }
+        if !busy_account {
+            break;
+        }
+        if pool.stopping.load(Ordering::SeqCst) {
+            reply(request, 503, "账号池正在停止，未继续轮换");
+            return;
+        }
+        if !slots.wait_any_release(&pool.stopping, super::pool_dispatch::SLOT_WAIT_MAX) {
+            break;
+        }
+    }
+    if busy_account {
+        if pool.stopping.load(Ordering::SeqCst) {
+            reply(request, 503, "账号池正在停止，未继续轮换");
+            return;
+        }
+        reply(request, 429, "可用账号正在处理其他请求，请稍后重试");
+        return;
     }
     reply(
         request,
@@ -904,6 +1135,35 @@ fn relay(
 mod tests {
     use super::*;
 
+    #[test]
+    fn rejected_channel_has_bounded_diagnostic() {
+        assert!(upstream_rejection(r#"{"code":11128,"msg":"secret"}"#).contains("11128"));
+        assert!(!upstream_rejection(r#"{"code":11128,"msg":"secret"}"#).contains("secret"));
+        assert!(!upstream_rejection("not json secret").contains("secret"));
+    }
+    #[test]
+    fn status_exposes_saved_model_selection_without_upstream() {
+        let _guard = crate::modules::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("pool-status-models-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let previous = std::env::var_os("COCKPIT_TOOLS_TEST_DATA_DIR");
+        std::env::set_var("COCKPIT_TOOLS_TEST_DATA_DIR", &dir);
+        std::fs::write(
+            dir.join("workbuddy-pool-selection.json"),
+            r#"{"version":1,"modelIds":["alpha","beta"],"enabled":false}"#,
+        )
+        .unwrap();
+        let result = get_workbuddy_pool_status().unwrap();
+        assert_eq!(result.selected_model_ids, vec!["alpha", "beta"]);
+        assert_eq!(result.model_count, 2);
+        match previous {
+            Some(value) => std::env::set_var("COCKPIT_TOOLS_TEST_DATA_DIR", value),
+            None => std::env::remove_var("COCKPIT_TOOLS_TEST_DATA_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
     #[test]
     fn stopping_is_visible_until_worker_and_listener_finish() {
         use std::io::{Read, Write};
@@ -1380,6 +1640,71 @@ mod tests {
         assert!(tauri::async_runtime::block_on(start_workbuddy_pool()).is_err());
         assert!(!get_workbuddy_pool_status().unwrap().running);
     }
+    #[test]
+    #[ignore = "One live upstream request using an already imported account; no model-selection changes"]
+    fn live_single_model_low_latency_smoke_read_only() {
+        let accounts = crate::modules::workbuddy_account::list_workbuddy_accounts()
+            .expect("read WorkBuddy account pool");
+        assert!(
+            !accounts.is_empty(),
+            "no authenticated WorkBuddy account available"
+        );
+        let catalog = read_catalog_cache()
+            .or_else(|_| load_catalog())
+            .expect("WorkBuddy model directory is unavailable");
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| is_chat_model(model))
+            .and_then(|m| m["id"].as_str())
+            .expect("no available WorkBuddy chat model")
+            .to_string();
+        let pool = Arc::new(Pool {
+            server: Server::http("127.0.0.1:0").unwrap(),
+            key: "fixture-key".into(),
+            stopping: AtomicBool::new(false),
+            state: Mutex::new(PoolState::default()),
+            catalog: Mutex::new(catalog),
+        });
+        let endpoint = format!("http://{}/v1/chat/completions", pool.server.server_addr());
+        let worker_pool = pool.clone();
+        let worker = std::thread::spawn(move || {
+            let request = worker_pool
+                .server
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap();
+            handle(request, &worker_pool);
+        });
+        let started = Instant::now();
+        let response = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(120))
+            .build()
+            .unwrap()
+            .post(endpoint)
+            .bearer_auth("fixture-key")
+            .json(
+                &json!({"model":format!("workbuddy-pool-{model}"),"stream":true,
+                "max_tokens":16,"messages":[{"role":"user","content":"Reply with OK."}]}),
+            )
+            .send()
+            .expect("local relay request");
+        let first_response_ms = started.elapsed().as_millis();
+        let status = response.status();
+        let body = response.text().expect("read stream");
+        let total_ms = started.elapsed().as_millis();
+        worker.join().unwrap();
+        println!("WORKBUDDY_REAL_PROVIDER_SMOKE status={} first_response_ms={} full_stream_ms={} complete={}",
+            status.as_u16(), first_response_ms, total_ms, body.contains("[DONE]"));
+        assert!(
+            status.is_success(),
+            "WorkBuddy live provider rejected request: HTTP {}",
+            status
+        );
+        assert!(body.contains("choices") && body.contains("[DONE]"));
+    }
+
     #[test]
     #[ignore = "Uses real account quota for saved selections; run explicitly"]
     fn live_pool_round_trip() {

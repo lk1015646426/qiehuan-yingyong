@@ -2,6 +2,12 @@
 //! The official client owns conversation history and executes its own tools.
 use super::trae_pool_protocol::{self as protocol, FrameAction, StreamGuard};
 use crate::models::trae::TraeAccount;
+use aes_gcm::{
+    aead::{Aead, Payload},
+    Aes256Gcm, KeyInit, Nonce,
+};
+use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -21,6 +27,18 @@ const BODY_LIMIT: usize = 64 * 1024 * 1024;
 static SERVICE: LazyLock<Mutex<Option<Arc<Pool>>>> = LazyLock::new(|| Mutex::new(None));
 static CONFIG_LOCK: Mutex<()> = Mutex::new(());
 static LAST_ERROR: Mutex<Option<String>> = Mutex::new(None);
+
+const ACCOUNT_MODEL_CATALOG_CACHE_TTL: Duration = Duration::from_secs(300);
+const ACCOUNT_MODEL_CATALOG_CACHE_MAX_ENTRIES: usize = 128;
+
+#[derive(Clone)]
+struct CachedAccountModelCatalog {
+    models: Vec<Model>,
+    expires_at: Instant,
+}
+
+static ACCOUNT_MODEL_CATALOG_CACHE: LazyLock<Mutex<HashMap<String, CachedAccountModelCatalog>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -57,7 +75,60 @@ pub struct RegistrationResult {
     pub endpoint: String,
 }
 
-fn registration_payload(model: &Model, local_key: &str) -> Value {
+// Model credentials use the llm-client AEAD envelope, not the unrelated
+// storage.json byte-crypto envelope. These constants describe the public wire
+// format; the user's local API key is never used as the encryption key.
+fn native_model_cipher() -> Result<Aes256Gcm, String> {
+    let mut material = *b"f4gh7jk9lkln0qs2tuxyjk9ln0qs2tu5";
+    for i in 0..8 {
+        material[i] ^= b"qs2tu5vw"[i];
+    }
+    Aes256Gcm::new_from_slice(&material).map_err(|_| "TRAE 模型密钥封装初始化失败".into())
+}
+
+fn seal_model_key(local_key: &str) -> Result<String, String> {
+    if local_key.trim().is_empty() {
+        return Err("本地模型连接密钥为空，未注册".into());
+    }
+    let mut nonce = [0u8; 12];
+    rand::rngs::OsRng.fill_bytes(&mut nonce);
+    let encrypted = native_model_cipher()?
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: local_key.as_bytes(),
+                aad: b"1741255278",
+            },
+        )
+        .map_err(|_| "TRAE 模型密钥封装失败，未回退到明文".to_string())?;
+    let mut wire = nonce.to_vec();
+    wire.extend(encrypted);
+    Ok(B64.encode(wire))
+}
+
+fn open_model_key(encoded: &str) -> Result<String, String> {
+    if encoded.len() > 8192 {
+        return Err("TRAE 模型密钥封装过大".into());
+    }
+    let raw = B64
+        .decode(encoded)
+        .map_err(|_| "TRAE 模型密钥不是有效封装")?;
+    if raw.len() < 28 {
+        return Err("TRAE 模型密钥封装不完整".into());
+    }
+    let decoded = native_model_cipher()?
+        .decrypt(
+            Nonce::from_slice(&raw[..12]),
+            Payload {
+                msg: &raw[12..],
+                aad: b"1741255278",
+            },
+        )
+        .map_err(|_| "TRAE 模型密钥封装认证失败")?;
+    String::from_utf8(decoded).map_err(|_| "TRAE 模型密钥内容无效".into())
+}
+
+fn registration_payload(model: &Model, local_key: &str) -> Result<Value, String> {
     let mut limits = serde_json::Map::new();
     if let Some(n) = model.input_limit.filter(|n| *n > 0) {
         limits.insert("prompt_max_tokens".into(), json!(n));
@@ -65,9 +136,18 @@ fn registration_payload(model: &Model, local_key: &str) -> Value {
     if let Some(n) = model.output_limit.filter(|n| *n > 0) {
         limits.insert("max_tokens".into(), json!(n));
     }
-    json!({"provider":"custom_openai_compatible","model_name":format!("{PREFIX}{}",model.id),"is_custom":true,"auth_type":0,"ak":local_key,
+    Ok(
+        json!({"provider":"custom_openai_compatible","model_name":format!("{PREFIX}{}",model.id),"is_custom":true,"auth_type":0,"ak":seal_model_key(local_key)?,
         "base_url":format!("http://127.0.0.1:{PORT}/v1/chat/completions"),"display_name":format!("TRAE 账号池 · {}",model.name),
-        "config_detail":{"multimodal":model.multimodal,"model_hyper_params":limits,"max_turn":500}})
+        "config_detail":{"multimodal":model.multimodal,"model_hyper_params":limits,"max_turn":500}}),
+    )
+}
+
+fn registration_fingerprint(payload: &Value, local_key: &str) -> String {
+    let mut logical = payload.clone();
+    logical["ak"] = json!(format!("{:x}", Sha256::digest(local_key.as_bytes())));
+    logical["credential_encoding"] = json!("trae-llm-aead-v1");
+    format!("{:x}", Sha256::digest(logical.to_string().as_bytes()))
 }
 
 fn manager_models(
@@ -160,12 +240,17 @@ pub fn register_models(account_id: &str) -> Result<RegistrationResult, String> {
             .iter()
             .find(|m| m.id == id)
             .ok_or("所选模型不属于当前注册账号，请刷新目录")?;
-        let mut payload = registration_payload(model, &local_key);
-        let digest = format!("{:x}", Sha256::digest(payload.to_string().as_bytes()));
+        let mut payload = registration_payload(model, &local_key)?;
+        let digest = registration_fingerprint(&payload, &local_key);
         let receipt_key = format!("{}:{id}", account.id);
         let wire_name = format!("{PREFIX}{id}");
         let path = if let Some(existing) = remote.get(&wire_name) {
-            if receipts.get(&receipt_key) == Some(&digest) {
+            let key_confirmed = existing
+                .get("ak")
+                .and_then(Value::as_str)
+                .and_then(|s| open_model_key(s).ok())
+                .is_some_and(|s| s == local_key);
+            if receipts.get(&receipt_key) == Some(&digest) && key_confirmed {
                 result.already_registered.push(id);
                 continue;
             }
@@ -216,6 +301,15 @@ pub fn register_models(account_id: &str) -> Result<RegistrationResult, String> {
         if !remote.contains_key(&wire_name) {
             return Err("注册请求已提交，但云端模型列表尚未确认该条目，请稍后刷新后重试".into());
         }
+        let confirmed = remote
+            .get(&wire_name)
+            .and_then(|v| v.get("ak"))
+            .and_then(Value::as_str)
+            .and_then(|s| open_model_key(s).ok())
+            .is_some_and(|s| s == local_key);
+        if !confirmed {
+            return Err("模型已保存，但原生密钥封装尚未验证，未记为注册成功".into());
+        }
         receipts.insert(receipt_key, digest);
         super::atomic_write::write_string_atomic(
             &receipt_path,
@@ -246,6 +340,8 @@ struct Runtime {
     rotations: u64,
     preferred: Option<String>,
     cooldowns: HashMap<String, Instant>,
+    slots: super::pool_dispatch::AccountSlots,
+    admission: super::pool_dispatch::AdmissionQueue,
     last_error: Option<String>,
 }
 
@@ -282,7 +378,7 @@ fn save_selection(value: &Selection) -> Result<(), String> {
         &serde_json::to_string_pretty(value).map_err(|_| "账号池设置序列化失败")?,
     )
 }
-fn key() -> Result<String, String> {
+pub(crate) fn key() -> Result<String, String> {
     let path = data_path("trae-model-pool.key")?;
     match std::fs::read_to_string(&path) {
         Ok(value) if uuid::Uuid::parse_str(value.trim()).is_ok() => Ok(value.trim().into()),
@@ -451,11 +547,65 @@ fn account_models(
     parse_models(&data)
 }
 
+fn account_model_cache_key(account: &TraeAccount, origin: &str) -> String {
+    let token_fingerprint = format!("{:x}", Sha256::digest(account.access_token.as_bytes()));
+    format!("{origin}:{}:{token_fingerprint}", account.id)
+}
+
+fn cached_account_models(
+    account: &TraeAccount,
+    http: &reqwest::blocking::Client,
+    origin: &str,
+    force_refresh: bool,
+) -> Result<(Vec<Model>, bool), String> {
+    let key = account_model_cache_key(account, origin);
+    if !force_refresh {
+        if let Ok(mut cache) = ACCOUNT_MODEL_CATALOG_CACHE.lock() {
+            let now = Instant::now();
+            cache.retain(|_, entry| entry.expires_at > now);
+            if let Some(entry) = cache.get(&key) {
+                return Ok((entry.models.clone(), true));
+            }
+        }
+    }
+
+    // Cache successful catalogs only; transient failures must remain retryable.
+    let models = account_models(account, http, origin)?;
+    if let Ok(mut cache) = ACCOUNT_MODEL_CATALOG_CACHE.lock() {
+        let now = Instant::now();
+        cache.retain(|_, entry| entry.expires_at > now);
+        if cache.len() >= ACCOUNT_MODEL_CATALOG_CACHE_MAX_ENTRIES && !cache.contains_key(&key) {
+            if let Some(oldest_key) = cache
+                .iter()
+                .min_by_key(|(_, entry)| entry.expires_at)
+                .map(|(key, _)| key.clone())
+            {
+                cache.remove(&oldest_key);
+            }
+        }
+        cache.insert(
+            key,
+            CachedAccountModelCatalog {
+                models: models.clone(),
+                expires_at: now + ACCOUNT_MODEL_CATALOG_CACHE_TTL,
+            },
+        );
+    }
+    Ok((models, false))
+}
+
+fn invalidate_account_model_cache(account: &TraeAccount, origin: &str) {
+    if let Ok(mut cache) = ACCOUNT_MODEL_CATALOG_CACHE.lock() {
+        cache.remove(&account_model_cache_key(account, origin));
+    }
+}
+
 pub fn models() -> Result<ModelsView, String> {
     let http = client()?;
     let mut found = Vec::<Model>::new();
     for account in accounts()? {
         if let Ok(items) = account_models(&account, &http, ORIGIN) {
+            invalidate_account_model_cache(&account, ORIGIN);
             for item in items {
                 if !found.iter().any(|m| m.id == item.id) {
                     found.push(item)
@@ -534,13 +684,14 @@ pub fn status() -> Result<Status, String> {
 }
 
 fn debug_log(line: &str) {
+    // 测试构建下仅在显式隔离了数据目录时才写日志，防止 cargo test 污染真实日志。
+    if cfg!(test) && std::env::var_os("QIEHUAN_YINGYONG_TEST_DATA_DIR").is_none() {
+        return;
+    }
     use std::io::Write;
-    let Some(home) = std::env::var_os("USERPROFILE") else {
+    let Ok(dir) = data_path("logs") else {
         return;
     };
-    let dir = std::path::Path::new(&home)
-        .join(".qiehuan_yingyong")
-        .join("logs");
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
@@ -557,16 +708,39 @@ fn debug_log(line: &str) {
     }
 }
 
+fn respond_error(request: Request, status: u16, message: &str) {
+    let code = match (status, message) {
+        (429, "本地账号池并发已满，请稍后重试") => "local_pool_busy",
+        (429, "可用账号正在处理其他请求，请稍后重试") => "local_accounts_busy",
+        (429, _) => "rate_limited",
+        (503, _) => "service_unavailable",
+        _ => "request_failed",
+    };
+    debug_log(&format!("reply status={status} code={code}"));
+    let mut response = Response::from_string(
+        json!({"error":{"type":"trae_pool_error","message":message,"code":code}}).to_string(),
+    )
+    .with_status_code(StatusCode(status))
+    .with_header(Header::from_bytes("Content-Type", "application/json").expect("static header"));
+    if status == 429 {
+        let delay = if code == "rate_limited" { "60" } else { "15" };
+        response.add_header(Header::from_bytes("Retry-After", delay).expect("static header"));
+    }
+    let _ = request.respond(response);
+}
+
+// Rejection kind is passed explicitly: never classify by comparing the human-readable message.
+fn reply_classified(request: Request, status: u16, message: &str, result: &str) {
+    super::model_service::record(PREFIX, false, status, result);
+    respond_error(request, status, message);
+}
+
 fn reply(request: Request, status: u16, message: &str) {
-    debug_log(&format!("reply status={status} message={message}"));
-    let _ = request.respond(
-        Response::from_string(
-            json!({"error":{"type":"trae_pool_error","message":message}}).to_string(),
-        )
-        .with_status_code(StatusCode(status))
-        .with_header(
-            Header::from_bytes("Content-Type", "application/json").expect("static header"),
-        ),
+    reply_classified(
+        request,
+        status,
+        message,
+        super::model_service::RESULT_FAILED,
     );
 }
 
@@ -608,46 +782,41 @@ pub fn start() -> Result<Status, String> {
     let dispatcher = std::thread::Builder::new()
         .name("trae-model-pool".into())
         .spawn(move || {
-            while !pool.stopping.load(Ordering::SeqCst) {
-                match pool.server.recv_timeout(Duration::from_millis(250)) {
-                    Ok(Some(request)) => {
-                        if pool.stopping.load(Ordering::SeqCst) {
-                            reply(request, 503, "账号池正在停止");
-                            break;
+            // Shared bounded dispatch: identical worker cap, backpressure, and
+            // scoped-shutdown semantics as the workbuddy and doubao pools.
+            super::pool_dispatch::dispatch_observed(
+                &pool.server,
+                &pool.stopping,
+                |request| {
+                    pool.active.fetch_add(1, Ordering::SeqCst);
+                    let _active = ActiveRequest(pool.clone());
+                    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        handle(request, &pool)
+                    }));
+                    if outcome.is_err() {
+                        if let Ok(mut state) = pool.state.lock() {
+                            state.last_error = Some("请求处理异常，未自动重放".into());
                         }
-                        if pool.active.load(Ordering::SeqCst) >= 8 {
-                            reply(request, 429, "本地账号池并发已满，请稍后重试");
-                            continue;
-                        }
-                        pool.active.fetch_add(1, Ordering::SeqCst);
-                        let worker = pool.clone();
-                        let active = ActiveRequest(pool.clone());
-                        let _ = std::thread::Builder::new()
-                            .name("trae-model-request".into())
-                            .spawn(move || {
-                                let _active = active;
-                                let outcome =
-                                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                                        handle(request, &worker)
-                                    }));
-                                if outcome.is_err() {
-                                    if let Ok(mut state) = worker.state.lock() {
-                                        state.last_error = Some("请求处理异常，未自动重放".into());
-                                    }
-                                }
-                            });
                     }
-                    Ok(None) => {}
-                    Err(_) => {
-                        if let Ok(mut error) = LAST_ERROR.lock() {
-                            *error = Some("账号池监听退出，请重新启动".into());
-                        }
-                        break;
-                    }
+                },
+                |status| {
+                    debug_log(&format!("entry rejected status={status}"));
+                    super::model_service::record(
+                        PREFIX,
+                        false,
+                        status,
+                        if status == 429 {
+                            super::model_service::RESULT_ENTRY_REJECTED
+                        } else {
+                            super::model_service::RESULT_STOPPING
+                        },
+                    );
+                },
+            );
+            if !pool.stopping.load(Ordering::SeqCst) {
+                if let Ok(mut error) = LAST_ERROR.lock() {
+                    *error = Some("账号池监听退出，请重新启动".into());
                 }
-            }
-            while pool.active.load(Ordering::SeqCst) > 0 {
-                std::thread::sleep(Duration::from_millis(100));
             }
             if let Ok(mut slot) = SERVICE.lock() {
                 if slot.as_ref().is_some_and(|p| Arc::ptr_eq(p, &pool)) {
@@ -699,6 +868,17 @@ fn handle(mut request: Request, pool: &Pool) {
         reply(request, 401, "本地账号池密钥无效");
         return;
     }
+    let admission = pool
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .admission
+        .clone();
+    let Some(next_request) = super::pool_dispatch::admission_route(request, &admission) else {
+        return;
+    };
+    request = next_request;
+
     if request.method() == &Method::Get && matches!(request.url(), "/v1/models" | "/models") {
         let ids = match pool.selected.lock() {
             Ok(s) => s.clone(),
@@ -721,6 +901,13 @@ fn handle(mut request: Request, pool: &Pool) {
         reply(request, 404, "接口不存在");
         return;
     }
+    let Some((next_request, _admission_lease)) =
+        super::pool_dispatch::admission_enter(request, &admission)
+    else {
+        return;
+    };
+    request = next_request;
+
     let mut bytes = Vec::new();
     if request
         .as_reader()
@@ -742,16 +929,22 @@ fn handle(mut request: Request, pool: &Pool) {
             return;
         }
     };
-    let requested = input.get("model").and_then(Value::as_str).unwrap_or_default();
+    let requested = input
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
     debug_log(&format!(
-        "chat path={} bytes={} model={} stream={} body={}",
+        "chat path={} bytes={} stream={}",
         request.url(),
         bytes.len(),
-        requested,
-        input.get("stream").and_then(Value::as_bool).unwrap_or(false),
-        String::from_utf8_lossy(&bytes[..bytes.len().min(3000)])
+        input
+            .get("stream")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
     ));
-    let normalized = requested.rsplit_once("//").map_or(requested, |(_, tail)| tail);
+    let normalized = requested
+        .rsplit_once("//")
+        .map_or(requested, |(_, tail)| tail);
     let Some(model) = normalized.strip_prefix(PREFIX).map(str::to_owned) else {
         reply(
             request,
@@ -794,6 +987,7 @@ fn relay(
     mut candidates: Vec<TraeAccount>,
     origin: &str,
 ) {
+    let relay_started = std::time::Instant::now();
     let http = match client_for(origin) {
         Ok(c) => c,
         Err(_) => {
@@ -806,149 +1000,230 @@ fn relay(
     if let Ok(mut s) = pool.state.lock() {
         s.requests += 1;
     }
-    for account in candidates {
+    let slots = pool.state.lock().unwrap().slots.clone();
+    let mut busy_account = false;
+    // Contended accounts queue briefly instead of failing the request: a slow
+    // upstream stream must hand its slot to the next caller, not kill it. The
+    // scan repeats after a bounded wait, so a freed or newly usable account is
+    // picked up again in preference order.
+    loop {
+        busy_account = false;
+        for account in &candidates {
+            // Cheap eligibility first: never wait on a slot for an account that
+            // cooldown or token expiry would skip anyway.
+            if pool.state.lock().is_ok_and(|s| {
+                s.cooldowns
+                    .get(&account.id)
+                    .is_some_and(|t| *t > Instant::now())
+            }) {
+                continue;
+            }
+            if crate::utils::jwt::parse_jwt_exp(&account.access_token)
+                .is_some_and(|exp| exp <= chrono::Utc::now().timestamp())
+            {
+                continue;
+            }
+            let Some(_lease) = slots.try_acquire(&account.id) else {
+                busy_account = true;
+                continue;
+            };
+            if pool.stopping.load(Ordering::SeqCst) {
+                reply(request, 503, "账号池正在停止，未继续轮换");
+                return;
+            }
+            // The account may have entered cooldown while this request waited.
+            if pool.state.lock().is_ok_and(|s| {
+                s.cooldowns
+                    .get(&account.id)
+                    .is_some_and(|t| *t > Instant::now())
+            }) {
+                continue;
+            }
+            let (mut catalog, cache_hit) =
+                match cached_account_models(account, &http, origin, false) {
+                    Ok(value) => value,
+                    Err(_) => continue,
+                };
+            // If a cached catalog misses the requested model, refresh once before skipping this account.
+            if cache_hit && !catalog.iter().any(|m| m.id == model) {
+                catalog = match cached_account_models(account, &http, origin, true) {
+                    Ok((fresh, _)) => fresh,
+                    Err(_) => continue,
+                };
+            }
+            let Some(capability) = catalog.iter().find(|m| m.id == model) else {
+                continue;
+            };
+            if capability.tools == Some(false)
+                && input
+                    .get("tools")
+                    .and_then(Value::as_array)
+                    .is_some_and(|a| !a.is_empty())
+            {
+                continue;
+            }
+            let response = match http
+                .post(format!("{origin}{CHAT_PATH}"))
+                .headers(match headers(account, true) {
+                    Ok(h) => h,
+                    Err(_) => continue,
+                })
+                .json(&body)
+                .send()
+            {
+                Ok(r) => r,
+                Err(_) => {
+                    reply(request, 502, "上游连接失败，未自动重放可能已处理的请求");
+                    return;
+                }
+            };
+            let status = response.status().as_u16();
+            if status == 401 || status == 402 || status == 429 {
+                invalidate_account_model_cache(&account, origin);
+                debug_log(&format!(
+                    "rotate account={} status={status} reason=upstream_status",
+                    account.id.chars().take(16).collect::<String>()
+                ));
+                cool(pool, &account.id, if status == 429 { 60 } else { 300 });
+                continue;
+            }
+            if !response.status().is_success() {
+                if matches!(status, 400 | 404 | 422) {
+                    // A stale model capability is possible. Refresh on the next request, never replay this one.
+                    invalidate_account_model_cache(&account, origin);
+                }
+                reply(request, status, "上游拒绝请求，未换号重放");
+                return;
+            }
+            let mut reader = BufReader::new(response);
+            let mut guard = StreamGuard::default();
+            let mut prefix = None;
+            let mut blocked = false;
+            loop {
+                let frame = match protocol::read_frame(&mut reader) {
+                    Ok(Some(f)) => f,
+                    Ok(None) => {
+                        reply(request, 502, "上游未输出内容就已断流，未重放");
+                        return;
+                    }
+                    Err(e) => {
+                        reply(request, 502, &e);
+                        return;
+                    }
+                };
+                match guard.inspect(&frame) {
+                    Ok(FrameAction::Rotate) => {
+                        debug_log(&format!(
+                            "rotate account={} reason=quota_first_frame",
+                            account.id.chars().take(16).collect::<String>()
+                        ));
+                        cool(pool, &account.id, 6 * 3600);
+                        blocked = true;
+                        break;
+                    }
+                    Ok(FrameAction::Reject) => {
+                        reply(
+                            request,
+                            502,
+                            "TRAE 返回模型或请求错误，未自动换号；请刷新模型目录",
+                        );
+                        return;
+                    }
+                    Ok(FrameAction::Output(v)) => {
+                        prefix = Some(v);
+                        break;
+                    }
+                    Ok(FrameAction::Done(_)) => {
+                        reply(request, 502, "上游返回空结果，未伪装成功或自动重放");
+                        return;
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        reply(request, 502, &e);
+                        return;
+                    }
+                }
+            }
+            if blocked {
+                continue;
+            }
+            if let Ok(mut s) = pool.state.lock() {
+                s.preferred = Some(account.id.clone());
+                s.last_error = None;
+            }
+            let stream = SoloReader::new(
+                reader,
+                guard,
+                format!("{PREFIX}{model}"),
+                prefix.unwrap_or(Value::Null),
+                input.get("stream").and_then(Value::as_bool) != Some(true)
+                    || input
+                        .pointer("/stream_options/include_usage")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+            );
+            if input.get("stream").and_then(Value::as_bool) == Some(true) {
+                let result = request.respond(Response::new(
+                    StatusCode(200),
+                    vec![
+                        Header::from_bytes("Content-Type", "text/event-stream")
+                            .expect("static header"),
+                        Header::from_bytes("Cache-Control", "no-cache").expect("static header"),
+                    ],
+                    stream,
+                    None,
+                    None,
+                ));
+                super::model_service::record_timed(
+                    &format!("{PREFIX}{model}"),
+                    true,
+                    if result.is_ok() { 200 } else { 502 },
+                    super::model_service::RESULT_STREAM_ENDED,
+                    Some(relay_started.elapsed().as_millis() as u64),
+                );
+            } else {
+                match collect(stream) {
+                    Ok(body) => {
+                        let result = request.respond(
+                            Response::from_string(body.to_string()).with_header(
+                                Header::from_bytes("Content-Type", "application/json")
+                                    .expect("static header"),
+                            ),
+                        );
+                        super::model_service::record_timed(
+                            &format!("{PREFIX}{model}"),
+                            false,
+                            if result.is_ok() { 200 } else { 502 },
+                            if result.is_ok() {
+                                super::model_service::RESULT_COMPLETE
+                            } else {
+                                super::model_service::RESULT_SEND_FAILED
+                            },
+                            Some(relay_started.elapsed().as_millis() as u64),
+                        );
+                    }
+                    Err(e) => reply(request, 502, &e),
+                }
+            }
+            return;
+        }
+        if !busy_account {
+            break;
+        }
         if pool.stopping.load(Ordering::SeqCst) {
             reply(request, 503, "账号池正在停止，未继续轮换");
             return;
         }
-        if pool.state.lock().is_ok_and(|s| {
-            s.cooldowns
-                .get(&account.id)
-                .is_some_and(|t| *t > Instant::now())
-        }) {
-            continue;
+        if !slots.wait_any_release(&pool.stopping, super::pool_dispatch::SLOT_WAIT_MAX) {
+            break;
         }
-        if crate::utils::jwt::parse_jwt_exp(&account.access_token)
-            .is_some_and(|exp| exp <= chrono::Utc::now().timestamp())
-        {
-            continue;
-        }
-        let catalog = match account_models(&account, &http, origin) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let Some(capability) = catalog.iter().find(|m| m.id == model) else {
-            continue;
-        };
-        if capability.tools == Some(false)
-            && input
-                .get("tools")
-                .and_then(Value::as_array)
-                .is_some_and(|a| !a.is_empty())
-        {
-            continue;
-        }
-        let response = match http
-            .post(format!("{origin}{CHAT_PATH}"))
-            .headers(match headers(&account, true) {
-                Ok(h) => h,
-                Err(_) => continue,
-            })
-            .json(&body)
-            .send()
-        {
-            Ok(r) => r,
-            Err(_) => {
-                reply(request, 502, "上游连接失败，未自动重放可能已处理的请求");
-                return;
-            }
-        };
-        let status = response.status().as_u16();
-        if status == 401 || status == 402 || status == 429 {
-            cool(pool, &account.id, if status == 429 { 60 } else { 300 });
-            continue;
-        }
-        if !response.status().is_success() {
-            reply(request, status, "上游拒绝请求，未换号重放");
+    }
+    if busy_account {
+        if pool.stopping.load(Ordering::SeqCst) {
+            reply(request, 503, "账号池正在停止，未继续轮换");
             return;
         }
-        let mut reader = BufReader::new(response);
-        let mut guard = StreamGuard::default();
-        let mut prefix = None;
-        let mut blocked = false;
-        loop {
-            let frame = match protocol::read_frame(&mut reader) {
-                Ok(Some(f)) => f,
-                Ok(None) => {
-                    reply(request, 502, "上游未输出内容就已断流，未重放");
-                    return;
-                }
-                Err(e) => {
-                    reply(request, 502, &e);
-                    return;
-                }
-            };
-            match guard.inspect(&frame) {
-                Ok(FrameAction::Rotate) => {
-                    cool(pool, &account.id, 6 * 3600);
-                    blocked = true;
-                    break;
-                }
-                Ok(FrameAction::Reject) => {
-                    reply(
-                        request,
-                        502,
-                        "TRAE 返回模型或请求错误，未自动换号；请刷新模型目录",
-                    );
-                    return;
-                }
-                Ok(FrameAction::Output(v)) => {
-                    prefix = Some(v);
-                    break;
-                }
-                Ok(FrameAction::Done(_)) => {
-                    reply(request, 502, "上游返回空结果，未伪装成功或自动重放");
-                    return;
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    reply(request, 502, &e);
-                    return;
-                }
-            }
-        }
-        if blocked {
-            continue;
-        }
-        if let Ok(mut s) = pool.state.lock() {
-            s.preferred = Some(account.id.clone());
-            s.last_error = None;
-        }
-        let stream = SoloReader::new(
-            reader,
-            guard,
-            format!("{PREFIX}{model}"),
-            prefix.unwrap_or(Value::Null),
-            input.get("stream").and_then(Value::as_bool) != Some(true)
-                || input
-                    .pointer("/stream_options/include_usage")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-        );
-        if input.get("stream").and_then(Value::as_bool) == Some(true) {
-            let _ = request.respond(Response::new(
-                StatusCode(200),
-                vec![
-                    Header::from_bytes("Content-Type", "text/event-stream").expect("static header"),
-                    Header::from_bytes("Cache-Control", "no-cache").expect("static header"),
-                ],
-                stream,
-                None,
-                None,
-            ));
-        } else {
-            match collect(stream) {
-                Ok(body) => {
-                    let _ = request.respond(
-                        Response::from_string(body.to_string()).with_header(
-                            Header::from_bytes("Content-Type", "application/json")
-                                .expect("static header"),
-                        ),
-                    );
-                }
-                Err(e) => reply(request, 502, &e),
-            }
-        }
+        reply(request, 429, "可用账号正在处理其他请求，请稍后重试");
         return;
     }
     if let Ok(mut s) = pool.state.lock() {
@@ -975,6 +1250,7 @@ struct SoloReader<R: std::io::BufRead> {
     model: String,
     id: String,
     created: i64,
+    started: std::time::Instant,
     pending: std::io::Cursor<Vec<u8>>,
     finished: bool,
     failed: bool,
@@ -996,6 +1272,7 @@ impl<R: std::io::BufRead> SoloReader<R> {
             model,
             id: format!("chatcmpl-{}", uuid::Uuid::new_v4().simple()),
             created: chrono::Utc::now().timestamp(),
+            started: std::time::Instant::now(),
             pending: std::io::Cursor::new(Vec::new()),
             finished: false,
             failed: false,
@@ -1011,6 +1288,10 @@ impl<R: std::io::BufRead> SoloReader<R> {
             }
             Err(_) => {
                 s.failed = true;
+                debug_log(&format!(
+                    "stream_abort model={} elapsed_s=0 reason=first_delta",
+                    s.model
+                ));
             }
         }
         s.pending = std::io::Cursor::new(initial);
@@ -1122,6 +1403,11 @@ impl<R: std::io::BufRead> Read for SoloReader<R> {
                 Ok(bytes) => self.pending = std::io::Cursor::new(bytes),
                 Err(_) => {
                     self.failed = true;
+                    debug_log(&format!(
+                        "stream_abort model={} elapsed_s={}",
+                        self.model,
+                        self.started.elapsed().as_secs()
+                    ));
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
                         "TRAE stream failed; request was not replayed",
@@ -1226,7 +1512,12 @@ mod tests {
             input_limit: Some(32000),
             output_limit: Some(4096),
         };
-        let payload = registration_payload(&model, "local-key-fixture");
+        let payload = registration_payload(&model, "local-key-fixture").unwrap();
+        assert_ne!(payload["ak"], "local-key-fixture");
+        assert_eq!(
+            open_model_key(payload["ak"].as_str().unwrap()).unwrap(),
+            "local-key-fixture"
+        );
         assert_eq!(payload["model_name"], "trae-pool-example/Model");
         assert_eq!(
             payload["base_url"],
@@ -1238,6 +1529,73 @@ mod tests {
         );
         assert!(payload.get("access_token").is_none());
         assert_eq!(payload["provider"], "custom_openai_compatible");
+    }
+
+    #[test]
+    fn native_model_credential_matches_independent_aead_fixture() {
+        let fixture = "AAECAwQFBgcICQoLkwWArMNkg7wccds6a9vBriDUnmFfh35NiZWUu3DFtQ==";
+        assert_eq!(open_model_key(fixture).unwrap(), "fixture-api-key");
+        let mut corrupt = B64.decode(fixture).unwrap();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(open_model_key(&B64.encode(corrupt)).is_err());
+        assert!(open_model_key("local-plaintext-key").is_err());
+        assert!(seal_model_key("").is_err());
+    }
+
+    #[test]
+    fn registration_fingerprint_is_stable_across_randomized_native_envelopes() {
+        let model = Model {
+            id: "a".into(),
+            name: "A".into(),
+            multimodal: false,
+            tools: Some(true),
+            input_limit: None,
+            output_limit: None,
+        };
+        let first = registration_payload(&model, "fixture-key").unwrap();
+        let second = registration_payload(&model, "fixture-key").unwrap();
+        assert_ne!(first["ak"], second["ak"]);
+        assert_eq!(
+            registration_fingerprint(&first, "fixture-key"),
+            registration_fingerprint(&second, "fixture-key")
+        );
+        assert_ne!(
+            registration_fingerprint(&first, "fixture-key"),
+            registration_fingerprint(&first, "another-key")
+        );
+        let old = format!("{:x}", Sha256::digest(first.to_string().as_bytes()));
+        assert_ne!(old, registration_fingerprint(&first, "fixture-key"));
+    }
+
+    #[test]
+    fn authenticated_requests_never_log_conversation_text_or_connection_key() {
+        let _env = crate::modules::test_support::env_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!("trae-pool-log-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = std::env::var_os("QIEHUAN_YINGYONG_TEST_DATA_DIR");
+        std::env::set_var("QIEHUAN_YINGYONG_TEST_DATA_DIR", &dir);
+        let pool = fixture_pool();
+        let endpoint = format!("http://{}/v1/chat/completions", pool.server.server_addr());
+        let worker = pool.clone();
+        let server = std::thread::spawn(move || {
+            let request = worker.server.recv().unwrap();
+            handle(request, &worker);
+        });
+        let response=reqwest::blocking::Client::builder().no_proxy().build().unwrap().post(endpoint)
+            .bearer_auth("fixture-key").json(&json!({"model":"trae-pool-model","messages":[{"role":"user","content":"PRIVATE_CONVERSATION_SENTINEL"}]})).send().unwrap();
+        assert!(!response.status().is_success());
+        server.join().unwrap();
+        let log = std::fs::read_to_string(dir.join("logs/trae-pool-debug.log")).unwrap();
+        assert!(!log.contains("PRIVATE_CONVERSATION_SENTINEL"));
+        assert!(!log.contains("fixture-key"));
+        assert!(log.contains("chat path="));
+        match old {
+            Some(v) => std::env::set_var("QIEHUAN_YINGYONG_TEST_DATA_DIR", v),
+            None => std::env::remove_var("QIEHUAN_YINGYONG_TEST_DATA_DIR"),
+        };
+        std::fs::remove_dir_all(dir).unwrap();
     }
     #[test]
     fn streamed_utf8_text_usage_and_finish_are_valid_openai() {
@@ -1300,6 +1658,186 @@ mod tests {
     }
     fn fixture_catalog() -> Value {
         json!({"config_info_list":[{"config_name":"model","display_config":{"display_name":"Model"}}]})
+    }
+
+    #[test]
+    fn account_model_catalog_cache_skips_network_until_refresh_or_token_rotation() {
+        let account = fixture_account("catalog-cache-test-account");
+        let upstream = Server::http("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", upstream.server_addr());
+        let worker = std::thread::spawn(move || {
+            for _ in 0..4 {
+                let mut request = upstream
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(request.url(), CATALOG_PATH);
+                let mut body = String::new();
+                request.as_reader().read_to_string(&mut body).unwrap();
+                request
+                    .respond(Response::from_string(fixture_catalog().to_string()))
+                    .unwrap();
+            }
+        });
+        let http = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+
+        let (first, first_hit) = cached_account_models(&account, &http, &origin, false).unwrap();
+        assert!(!first_hit);
+        assert_eq!(first.first().map(|model| model.id.as_str()), Some("model"));
+        let (second, second_hit) = cached_account_models(&account, &http, &origin, false).unwrap();
+        assert!(second_hit);
+        assert_eq!(second.first().map(|model| model.id.as_str()), Some("model"));
+
+        let mut rotated = account.clone();
+        rotated.access_token.push_str("-rotated");
+        let (_, rotated_hit) = cached_account_models(&rotated, &http, &origin, false).unwrap();
+        assert!(!rotated_hit);
+        let (_, refresh_hit) = cached_account_models(&rotated, &http, &origin, true).unwrap();
+        assert!(!refresh_hit);
+        invalidate_account_model_cache(&rotated, &origin);
+        let (_, invalidated_hit) = cached_account_models(&rotated, &http, &origin, false).unwrap();
+        assert!(!invalidated_hit);
+
+        worker.join().unwrap();
+    }
+
+    #[test]
+    #[ignore = "One live upstream request using an already imported account; no setting changes"]
+    fn live_single_model_low_latency_smoke_read_only() {
+        let chosen_account = accounts()
+            .expect("read TRAE account pool")
+            .into_iter()
+            .find(|a| {
+                !a.access_token.is_empty()
+                    && !crate::utils::jwt::parse_jwt_exp(&a.access_token)
+                        .is_some_and(|exp| exp <= chrono::Utc::now().timestamp())
+            })
+            .expect("no authenticated TRAE account available");
+        let client = client().expect("create live client");
+        let direct_started = Instant::now();
+        let models = account_models(&chosen_account, &client, ORIGIN)
+            .expect("TRAE upstream did not return model catalog");
+        let direct_catalog_ms = direct_started.elapsed().as_millis();
+        cached_account_models(&chosen_account, &client, ORIGIN, true)
+            .expect("warm TRAE catalog cache");
+        let cache_started = Instant::now();
+        let (cached_models, was_cached) =
+            cached_account_models(&chosen_account, &client, ORIGIN, false)
+                .expect("read cached TRAE model catalog");
+        let cached_catalog_ms = cache_started.elapsed().as_millis();
+        assert!(was_cached);
+        assert_eq!(
+            models.iter().map(|m| &m.id).collect::<Vec<_>>(),
+            cached_models.iter().map(|m| &m.id).collect::<Vec<_>>()
+        );
+        println!(
+            "TRAE_REAL_CATALOG_SPEED direct_request_ms={} cached_hit_ms={}",
+            direct_catalog_ms, cached_catalog_ms
+        );
+        let model = models
+            .iter()
+            .find(|m| m.tools != Some(false))
+            .or_else(|| models.first())
+            .expect("no available TRAE chat model")
+            .id
+            .clone();
+        let pool = fixture_pool();
+        *pool.selected.lock().unwrap() = vec![model.clone()];
+        let endpoint = format!("http://{}/v1/chat/completions", pool.server.server_addr());
+        let worker_pool = pool.clone();
+        let worker = std::thread::spawn(move || {
+            let req = worker_pool
+                .server
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap()
+                .unwrap();
+            handle(req, &worker_pool);
+        });
+        let started = Instant::now();
+        let response = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(120))
+            .build()
+            .unwrap()
+            .post(endpoint)
+            .bearer_auth("fixture-key")
+            .json(
+                &json!({"model":format!("{PREFIX}{model}"), "stream":true, "max_tokens":16,
+                "messages":[{"role":"user","content":"Reply with OK."}]}),
+            )
+            .send()
+            .expect("local relay request");
+        let first_response_ms = started.elapsed().as_millis();
+        let status = response.status();
+        let body = response.text().expect("read stream");
+        let total_ms = started.elapsed().as_millis();
+        worker.join().unwrap();
+        println!(
+            "TRAE_REAL_PROVIDER_SMOKE status={} first_response_ms={} full_stream_ms={} complete={}",
+            status.as_u16(),
+            first_response_ms,
+            total_ms,
+            body.contains("[DONE]")
+        );
+        assert!(
+            status.is_success(),
+            "TRAE live provider rejected request: HTTP {}",
+            status
+        );
+        assert!(body.contains("choices") && body.contains("[DONE]"));
+    }
+
+    #[test]
+    fn account_model_catalog_cache_real_http_latency_comparison() {
+        const N: usize = 5;
+        let account = fixture_account("catalog-latency-test");
+        let upstream = Server::http("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", upstream.server_addr());
+        let worker = std::thread::spawn(move || {
+            // Uncached: N catalog requests. Cached: only one catalog request.
+            for _ in 0..(N + 1) {
+                let request = upstream
+                    .recv_timeout(Duration::from_secs(5))
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(request.url(), CATALOG_PATH);
+                std::thread::sleep(Duration::from_millis(60));
+                request
+                    .respond(Response::from_string(fixture_catalog().to_string()))
+                    .unwrap();
+            }
+        });
+        let client = reqwest::blocking::Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap();
+        let before_direct = Instant::now();
+        for _ in 0..N {
+            assert_eq!(account_models(&account, &client, &origin).unwrap().len(), 1);
+        }
+        let direct_ms = before_direct.elapsed().as_millis();
+
+        let before_cached = Instant::now();
+        for _ in 0..N {
+            assert_eq!(
+                cached_account_models(&account, &client, &origin, false)
+                    .unwrap()
+                    .0
+                    .len(),
+                1
+            );
+        }
+        let cached_ms = before_cached.elapsed().as_millis();
+        worker.join().unwrap();
+        println!("REAL_LOCAL_HTTP_BENCH uncached_5_requests_ms={direct_ms} cached_5_requests_ms={cached_ms} catalog_network_calls_before={N} catalog_network_calls_after=1");
+        // Controlled upstream adds 60 ms RTT; avoid flaky ratio thresholds on busy Windows hosts.
+        assert!(
+            cached_ms < direct_ms,
+            "cache should avoid repeated catalog network round trips"
+        );
     }
 
     #[test]

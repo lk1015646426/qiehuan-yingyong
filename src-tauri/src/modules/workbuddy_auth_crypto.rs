@@ -190,10 +190,7 @@ fn run_key_command(command: Command, timeout: Duration) -> Result<OfficialKey, S
         let mut child = command
             .spawn()
             .map_err(|_| "无法读取 WorkBuddy 官方密钥，请检查客户端安装路径".to_string())?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| INVALID.to_string())?;
+        let stdout = child.stdout.take().ok_or_else(|| INVALID.to_string())?;
         tokio::time::timeout(timeout, async {
             let read = async {
                 let mut output = Vec::new();

@@ -2269,15 +2269,22 @@ fn is_unified_trae_cn_product(product: &Value) -> bool {
     if product.get("applicationName").and_then(Value::as_str) != Some("trae-cn") {
         return false;
     }
-    let parts = product.get("appVersion").and_then(Value::as_str).unwrap_or("")
-        .split('.').take(3).map(str::parse::<u32>).collect::<Result<Vec<_>, _>>();
+    let parts = product
+        .get("appVersion")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .split('.')
+        .take(3)
+        .map(str::parse::<u32>)
+        .collect::<Result<Vec<_>, _>>();
     matches!(parts, Ok(ref v) if v.len() == 3 && (v[0], v[1], v[2]) >= (3, 4, 1))
 }
 
 /// 官方 3.4.1 起 Work 与 Code 合并；安装身份、数据目录及启动平台一起选择。
 pub(crate) fn is_unified_trae_cn_executable(exe: &Path) -> bool {
     exe.parent().is_some_and(|base| {
-        build_trae_product_file_candidates(base).iter()
+        build_trae_product_file_candidates(base)
+            .iter()
             .filter_map(|path| parse_json_file(path))
             .any(|product| is_unified_trae_cn_product(&product))
     })
@@ -2287,7 +2294,9 @@ pub(crate) fn resolve_work_cn_client_platform() -> TraePlatformKind {
     if work_cn_switch_storage_path_override().is_some() {
         return TraePlatformKind::TraeSoloCn;
     }
-    if let Ok(exe) = crate::modules::process::resolve_trae_launch_path_for_platform(TraePlatformKind::TraeCn) {
+    if let Ok(exe) =
+        crate::modules::process::resolve_trae_launch_path_for_platform(TraePlatformKind::TraeCn)
+    {
         if is_unified_trae_cn_executable(&exe) {
             return TraePlatformKind::TraeCn;
         }
@@ -2298,13 +2307,16 @@ pub(crate) fn resolve_work_cn_client_platform() -> TraePlatformKind {
 #[cfg(target_os = "windows")]
 pub(crate) fn trae_platform_for_executable(exe: &Path) -> Option<TraePlatformKind> {
     let base = exe.parent()?;
-    for product in build_trae_product_file_candidates(base).iter().filter_map(|path| parse_json_file(path)) {
+    for product in build_trae_product_file_candidates(base)
+        .iter()
+        .filter_map(|path| parse_json_file(path))
+    {
         match product.get("applicationName").and_then(Value::as_str) {
             Some("trae-cn") => return Some(TraePlatformKind::TraeCn),
             Some("trae") => return Some(TraePlatformKind::Trae),
             Some("trae-solo-cn" | "trae-work-cn") => return Some(TraePlatformKind::TraeSoloCn),
             Some("trae-solo" | "trae-work") => return Some(TraePlatformKind::TraeSolo),
-            _ => {},
+            _ => {}
         }
     }
     None
@@ -2315,10 +2327,18 @@ mod unified_client_tests {
     use super::*;
     #[test]
     fn merged_client_requires_cn_identity_and_official_merge_version() {
-        assert!(is_unified_trae_cn_product(&serde_json::json!({"applicationName":"trae-cn", "appVersion":"3.4.3"})));
-        assert!(!is_unified_trae_cn_product(&serde_json::json!({"applicationName":"trae-cn", "appVersion":"3.3.50"})));
-        assert!(!is_unified_trae_cn_product(&serde_json::json!({"applicationName":"trae", "appVersion":"3.4.3"})));
-        assert!(!is_unified_trae_cn_product(&serde_json::json!({"applicationName":"trae-cn", "version":"1.107.1"})));
+        assert!(is_unified_trae_cn_product(
+            &serde_json::json!({"applicationName":"trae-cn", "appVersion":"3.4.3"})
+        ));
+        assert!(!is_unified_trae_cn_product(
+            &serde_json::json!({"applicationName":"trae-cn", "appVersion":"3.3.50"})
+        ));
+        assert!(!is_unified_trae_cn_product(
+            &serde_json::json!({"applicationName":"trae", "appVersion":"3.4.3"})
+        ));
+        assert!(!is_unified_trae_cn_product(
+            &serde_json::json!({"applicationName":"trae-cn", "version":"1.107.1"})
+        ));
     }
 
     #[test]
@@ -2328,9 +2348,12 @@ mod unified_client_tests {
         let exe = crate::modules::process::resolve_trae_launch_path_for_platform(platform).unwrap();
         let storage = get_default_trae_storage_path_for_platform(platform).unwrap();
         let login = read_local_trae_auth_for_platform(platform).unwrap();
-        println!("{}", serde_json::json!({"platform":platform.provider_key(), "exe":exe,
+        println!(
+            "{}",
+            serde_json::json!({"platform":platform.provider_key(), "exe":exe,
             "version":detect_trae_product_version_for_exe(&exe), "storage":storage,
-            "has_login":login.is_some()}));
+            "has_login":login.is_some()})
+        );
         assert_eq!(platform, TraePlatformKind::TraeCn);
         assert!(exe.is_file());
         assert!(storage.to_string_lossy().contains("Trae CN"));
@@ -2348,7 +2371,11 @@ fn detect_trae_product_version_uncached(exe_path: &Path) -> Option<String> {
         let Some(json) = parse_json_file(&candidate) else {
             continue;
         };
-        if let Some(version) = json.get("appVersion").or_else(|| json.get("version")).and_then(Value::as_str) {
+        if let Some(version) = json
+            .get("appVersion")
+            .or_else(|| json.get("version"))
+            .and_then(Value::as_str)
+        {
             let version = version.trim();
             if !version.is_empty() {
                 return Some(version.to_string());
@@ -4878,11 +4905,10 @@ pub async fn switch_work_cn_account_with_progress(
         });
     }
 
-    // 步骤 5：正常关闭官方客户端（不默认强杀）。最长等待 20 秒。
+    // 步骤 5：主动切换时定向关闭目标客户端，确认退出后才写入。
     on_progress(WORK_CN_SWITCH_STAGE_CLOSING);
     if !work_cn_switch_skip_process() {
-        if let Err(error) = crate::modules::process::close_trae_platform_default(platform.provider_key(), 20)
-        {
+        if let Err(error) = crate::modules::process::force_close_trae_default_for_switch(platform) {
             return Err(
                 WorkCnCommandError::new(WorkCnErrorCode::ClientCloseFailed, error)
                     .with_detail("关闭失败，未写入 storage.json"),
@@ -5353,8 +5379,12 @@ pub(crate) fn build_cloud_refresh_material(account: &TraeAccount) -> Result<Valu
     let device_id = resolve_official_checkin_device_id(account)?;
     let mut info = build_refresh_device_info(account, &pair.public_key_pem);
     info["DeviceID"] = serde_json::json!(device_id);
-    let machine_id = account.machine_id.as_deref()
-        .or_else(|| info.get("MachineID").and_then(Value::as_str)).unwrap_or("").to_string();
+    let machine_id = account
+        .machine_id
+        .as_deref()
+        .or_else(|| info.get("MachineID").and_then(Value::as_str))
+        .unwrap_or("")
+        .to_string();
     info["MachineID"] = serde_json::json!(machine_id);
     Ok(serde_json::json!({
         "refresh_token": refresh,

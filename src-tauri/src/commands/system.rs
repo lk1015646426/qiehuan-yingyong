@@ -752,10 +752,7 @@ fn get_app_auto_launch_enabled(_app: &tauri::AppHandle) -> Result<bool, String> 
     Ok(false)
 }
 
-fn apply_app_auto_launch_enabled(
-    _app: &tauri::AppHandle,
-    _enabled: bool,
-) -> Result<(), String> {
+fn apply_app_auto_launch_enabled(_app: &tauri::AppHandle, _enabled: bool) -> Result<(), String> {
     Ok(())
 }
 

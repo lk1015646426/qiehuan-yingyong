@@ -94,14 +94,20 @@ pub fn deserialize_account_file<T: DeserializeOwned>(
     path: &Path,
     content: &str,
 ) -> Result<(T, bool), String> {
-    deserialize_account_file_impl(path,content,true)
+    deserialize_account_file_impl(path, content, true)
 }
 
-pub fn deserialize_account_file_read_only<T: DeserializeOwned>(path:&Path,content:&str)->Result<(T,bool),String>{
-    deserialize_account_file_impl(path,content,false)
+pub fn deserialize_account_file_read_only<T: DeserializeOwned>(
+    path: &Path,
+    content: &str,
+) -> Result<(T, bool), String> {
+    deserialize_account_file_impl(path, content, false)
 }
-fn deserialize_account_file_impl<T:DeserializeOwned>(path:&Path,content:&str,allow_restore:bool)->Result<(T,bool),String>{
-
+fn deserialize_account_file_impl<T: DeserializeOwned>(
+    path: &Path,
+    content: &str,
+    allow_restore: bool,
+) -> Result<(T, bool), String> {
     if let Ok(envelope) = serde_json::from_str::<SecureAccountEnvelope>(content) {
         if envelope.version != VERSION {
             return Err("账号详情加密版本不受支持".to_string());
@@ -126,10 +132,11 @@ fn deserialize_account_file_impl<T:DeserializeOwned>(path:&Path,content:&str,all
     }
 
     let value = if allow_restore {
-        crate::modules::atomic_write::parse_json_with_auto_restore::<T>(path,content)
-    }else{
-        serde_json::from_str::<T>(content).map_err(|e|e.to_string())
-    }.map_err(|e|format!("解析账号详情失败，未自动回滚认证凭证：{e}"))?;
+        crate::modules::atomic_write::parse_json_with_auto_restore::<T>(path, content)
+    } else {
+        serde_json::from_str::<T>(content).map_err(|e| e.to_string())
+    }
+    .map_err(|e| format!("解析账号详情失败，未自动回滚认证凭证：{e}"))?;
     Ok((value, true))
 }
 
@@ -148,9 +155,18 @@ mod tests {
     }
 
     #[test]
-    fn read_only_parse_never_restores_an_older_account_backup(){
-        let dir=std::env::temp_dir().join(format!("readonly-backup-{}",uuid::Uuid::new_v4()));fs::create_dir_all(&dir).unwrap();let file=dir.join("account.json");fs::write(&file,b"broken-current").unwrap();fs::write(dir.join("account.json.bak"),b"{\"token\":\"older-token\"}").unwrap();
-        assert!(deserialize_account_file_read_only::<serde_json::Value>(&file,"broken-current").is_err());assert_eq!(fs::read(&file).unwrap(),b"broken-current");let _=fs::remove_dir_all(dir);
+    fn read_only_parse_never_restores_an_older_account_backup() {
+        let dir = std::env::temp_dir().join(format!("readonly-backup-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("account.json");
+        fs::write(&file, b"broken-current").unwrap();
+        fs::write(dir.join("account.json.bak"), b"{\"token\":\"older-token\"}").unwrap();
+        assert!(
+            deserialize_account_file_read_only::<serde_json::Value>(&file, "broken-current")
+                .is_err()
+        );
+        assert_eq!(fs::read(&file).unwrap(), b"broken-current");
+        let _ = fs::remove_dir_all(dir);
     }
     #[test]
     fn encrypted_read_does_not_create_replacement_key() {

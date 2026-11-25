@@ -1,3 +1,4 @@
+pub mod doubao_pool;
 pub mod system;
 pub mod trae_instance;
 pub mod trae_pool;

@@ -275,6 +275,7 @@ pub fn run() {
             modules::work_cn_session_watcher::ensure_started(app.handle().clone());
             tauri::async_runtime::spawn(modules::workbuddy_pool::restore_workbuddy_pool());
             tauri::async_runtime::spawn(modules::trae_model_pool::restore());
+            tauri::async_runtime::spawn(modules::doubao_pool::restore_doubao_pool());
 
             #[cfg(target_os = "macos")]
             apply_macos_activation_policy(&app.handle());
@@ -419,6 +420,12 @@ pub fn run() {
             modules::workbuddy_activities::save_workbuddy_activity_settings,
             modules::workbuddy_activities::get_workbuddy_activity_overview,
             commands::workbuddy::get_workbuddy_installation,
+            modules::model_service::get_harness_model_service,
+            modules::model_service::get_pool_connection_key,
+            modules::model_service::start_harness_model_service,
+            modules::model_service::configure_harness_model_service,
+            modules::model_service::test_harness_model_service,
+            modules::model_service::test_harness_tool_roundtrip,
             modules::workbuddy_pool::get_workbuddy_pool_status,
             modules::workbuddy_pool::get_workbuddy_pool_models,
             modules::workbuddy_pool::save_workbuddy_pool_models,
@@ -430,12 +437,14 @@ pub fn run() {
             commands::workbuddy::start_workbuddy_session_watcher,
             commands::workbuddy::import_current_workbuddy_account,
             commands::workbuddy::list_workbuddy_accounts,
+            commands::workbuddy::local_checkin_all_workbuddy_accounts,
             commands::workbuddy::get_workbuddy_account_status,
             commands::workbuddy::recover_workbuddy_auth,
             commands::workbuddy::update_workbuddy_account,
             commands::workbuddy::delete_workbuddy_account,
             commands::workbuddy::switch_workbuddy_account,
             commands::workbuddy::sync_workbuddy_github,
+            commands::workbuddy::open_workbuddy_checkin_client,
             commands::workbuddy::trigger_workbuddy_checkin,
             // Trae Instance Commands
             // TRAE 账号池：每账号一个隔离实例，启动走既有切换事务
@@ -457,6 +466,19 @@ pub fn run() {
             commands::trae_instance::trae_stop_instance,
             commands::trae_instance::trae_open_instance_window,
             commands::trae_instance::trae_close_all_instances,
+            // Doubao (Volcengine Ark) Pool Commands
+            commands::doubao_pool::get_doubao_pool_status,
+            commands::doubao_pool::open_doubao_login,
+            commands::doubao_pool::import_doubao_login,
+            commands::doubao_pool::import_doubao_desktop,
+            commands::doubao_pool::close_doubao_login,
+            commands::doubao_pool::get_doubao_pool_keys,
+            commands::doubao_pool::get_doubao_account_quota,
+            commands::doubao_pool::save_doubao_pool_keys,
+            commands::doubao_pool::get_doubao_pool_catalog,
+            commands::doubao_pool::save_doubao_pool_models,
+            commands::doubao_pool::start_doubao_pool,
+            commands::doubao_pool::stop_doubao_pool,
             // System Commands
             commands::system::open_data_folder,
             commands::system::open_local_path,

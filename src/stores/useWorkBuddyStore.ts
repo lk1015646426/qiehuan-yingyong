@@ -36,7 +36,7 @@ interface WorkBuddyState {
   loading: boolean;
   importing: boolean;
   switchingId: string | null;
-  // 当前切号所处的阶段（validating/closing/refreshing/injecting/launching/syncing），
+  // 当前切号所处的阶段（validating/closing/refreshing/injecting/launching/activating），
   // 由后端 workbuddy-switch-progress 事件驱动（与 TRAE 页 switchStage 对齐）。
   switchStage: WorkBuddySwitchProgress['stage'] | null;
   updatingId: string | null;
@@ -48,10 +48,10 @@ interface WorkBuddyState {
   sessionWatchStatus: WorkBuddySessionWatchStatus | null;
   error: string | null;
   notice: string | null;
-  loadAccounts: (refreshStatuses?: boolean) => Promise<void>;
+  loadAccounts: (refreshStatuses?: boolean, background?: boolean) => Promise<void>;
   recoverCredentials: (accountId: string) => Promise<void>;
   ensureAccountsLoaded: () => Promise<void>;
-  refreshInstallation: () => Promise<void>;
+  refreshInstallation: (afterSwitch?: boolean) => Promise<void>;
   ensureInstallationLoaded: () => Promise<void>;
   ensureMonitoringStarted: () => Promise<void>;
   importCurrent: (displayName?: string | null) => Promise<boolean>;
@@ -68,6 +68,7 @@ interface WorkBuddyState {
 }
 
 let accountsRequest = 0;
+let installationRequest = 0;
 const statusGeneration: Record<string, number> = {};
 function invalidateStatus(id: string) { statusGeneration[id] = (statusGeneration[id] ?? 0) + 1; }
 
@@ -77,13 +78,17 @@ export const useWorkBuddyStore = create<WorkBuddyState>((set, get) => ({
   switchingId: null, switchStage: null, updatingId: null, deletingId: null,
   syncing: false, checkingInId: null, statusById: {}, statusLoadingById: {}, sessionWatchStatus: null, error: null, notice: null,
 
-  async loadAccounts(refreshStatuses = true) {
+  async loadAccounts(refreshStatuses = true, background = false) {
+    const previous = get().accounts;
     const generation = ++accountsRequest;
-    set({ loading: true });
+    if (!background) set({ loading: true });
     try {
       const accounts = await listWorkBuddyAccounts();
       if (generation !== accountsRequest) return;
-      const previous = get().accounts;
+      if (get().accounts !== previous) {
+        set({ loading: false });
+        return;
+      }
       const statusById = { ...get().statusById };
       const statusLoadingById = { ...get().statusLoadingById };
       for (const account of accounts) {
@@ -95,9 +100,9 @@ export const useWorkBuddyStore = create<WorkBuddyState>((set, get) => ({
       for (const account of previous) if (!accounts.some(value => value.id === account.id)) {
         invalidateStatus(account.id); delete statusById[account.id]; delete statusLoadingById[account.id];
       }
-      set({ accounts, accountsLoaded: true, statusById, statusLoadingById, error: null, loading: false });
+      set({ accounts, accountsLoaded: true, statusById, statusLoadingById, ...(background ? {} : { error: null }), loading: false });
       if (refreshStatuses) await get().refreshAllStatuses();
-    } catch (error) { if (generation === accountsRequest) set({ error: messageOf(error), loading: false }); }
+    } catch (error) { if (generation === accountsRequest) set({ ...(background ? {} : { error: messageOf(error) }), loading: false }); }
   },
   async recoverCredentials(accountId) {
     if (get().updatingId !== null || get().switchingId !== null) return;
@@ -118,17 +123,22 @@ export const useWorkBuddyStore = create<WorkBuddyState>((set, get) => ({
       await state.loadAccounts();
     }
   },
-  async refreshInstallation() {
-    if (get().installationLoading) return;
-    set({ installationLoading: true });
+  async refreshInstallation(afterSwitch = false) {
+    if (!afterSwitch && get().installationLoading) return;
+    const request = ++installationRequest;
+    set({ installationLoading: !afterSwitch });
     try {
+      const installation = await getWorkBuddyInstallation();
+      if (request !== installationRequest) return;
+      // 安装查询先返回路径与账号，进程探测结果由后端事件补发。
       set({
-        installation: await getWorkBuddyInstallation(),
+        installation: { ...installation, running: installation.installed && (installation.running || get().installation?.running === true) },
         installationLoaded: true,
         installationLoading: false,
       });
     } catch (error) {
-      set({ installationLoading: false, error: messageOf(error) });
+      if (request !== installationRequest) return;
+      set({ installationLoading: false, ...(afterSwitch ? {} : { error: messageOf(error) }) });
     }
   },
   async ensureInstallationLoaded() {
@@ -204,6 +214,8 @@ export const useWorkBuddyStore = create<WorkBuddyState>((set, get) => ({
     } catch (error) { set({ deletingId: null, error: messageOf(error) }); }
   },
   async switchTo(accountId) {
+    if (get().switchingId !== null) return;
+    const started = performance.now();
     set({ switchingId: accountId, switchStage: null, error: null, notice: null });
     // 先注册进度监听再发起调用，确保第一阶段事件不丢失（与 TRAE 页对齐）。
     let unlisten: (() => void) | undefined;
@@ -211,24 +223,35 @@ export const useWorkBuddyStore = create<WorkBuddyState>((set, get) => ({
       unlisten = await listen<WorkBuddySwitchProgress>(
         WORKBUDDY_SWITCH_PROGRESS_EVENT,
         (event) => {
-          if (event.payload.accountId === accountId) {
+          if (event.payload.accountId === accountId && get().switchingId === accountId) {
             set({ switchStage: event.payload.stage });
           }
         },
       );
-      const result = await switchWorkBuddyAccount(accountId);
-      await get().loadAccounts();
-      set({
+      const requestStarted = performance.now();
+      const result = await switchWorkBuddyAccount(accountId, true);
+      const switchMs = Math.round(performance.now() - requestStarted);
+      console.info('[WorkBuddy switch timing] backend_ms=%d ui_ms=%d', switchMs, Math.round(performance.now() - started));
+      set(state => ({
         switchingId: null,
         switchStage: null,
-        notice: result.githubSyncPending
+        installation: state.installation && { ...state.installation, currentAccountId: result.accountId, running: true },
+        notice: (result.forcedClose ? '残留进程已清理；' : '') + (result.githubSyncPending
           ? '已切换并打开 WorkBuddy，GitHub 自动签到待同步'
-          : '已切换并打开 WorkBuddy，GitHub 自动签到已同步',
+          : '已切换并打开 WorkBuddy，GitHub 自动签到已同步'),
+      }));
+      void get().refreshInstallation(true);
+      // 先读回最新凭证版本，随后再刷新目标账号的积分。
+      void get().loadAccounts(false, true).then(() => {
+        const state = get();
+        if (state.switchingId === null && (!state.installation || state.installation.currentAccountId === result.accountId)) {
+          void state.refreshAccountStatus(result.accountId);
+        }
       });
-      void get().refreshInstallation();
     } catch (error) {
       set({ switchingId: null, switchStage: null, error: messageOf(error) });
-      await Promise.allSettled([get().loadAccounts(), get().refreshInstallation()]);
+      void get().loadAccounts(false, true);
+      void get().refreshInstallation(true);
     } finally {
       unlisten?.();
     }

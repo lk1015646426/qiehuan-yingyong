@@ -183,6 +183,7 @@ export const useWorkCnStore = create<WorkCnState>((set, get) => ({
     }
   },
   async switchTo(accountId) {
+    if (get().switchingId !== null) return;
     set({ switchingId: accountId, switchStage: null, error: null, lastSwitchResult: null });
     // 先注册进度监听再发起调用，确保第一阶段事件不丢失。
     let unlisten: (() => void) | undefined;

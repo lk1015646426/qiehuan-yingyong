@@ -123,9 +123,7 @@ fn migrate_legacy_data_dirs(home: &Path, target: &Path) {
         "legacy data dir migration checked at {}\n",
         chrono::Utc::now().to_rfc3339()
     );
-    if let Err(error) =
-        crate::modules::atomic_write::write_string_atomic(&marker, &content)
-    {
+    if let Err(error) = crate::modules::atomic_write::write_string_atomic(&marker, &content) {
         eprintln!(
             "切换应用旧数据迁移标记写入失败（下次启动将重新扫描）: path={}, error={}",
             marker.display(),

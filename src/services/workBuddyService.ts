@@ -24,7 +24,7 @@ export interface WorkBuddySwitchProgress {
     | 'refreshing'
     | 'injecting'
     | 'launching'
-    | 'syncing';
+    | 'activating';
 }
 
 export function parseWorkBuddyCommandError(error: unknown): Error & { code?: string } {
@@ -86,9 +86,9 @@ export function deleteWorkBuddyAccount(accountId: string): Promise<boolean> {
   return invoke('delete_workbuddy_account', { accountId });
 }
 
-export async function switchWorkBuddyAccount(accountId: string): Promise<WorkBuddySwitchResult> {
+export async function switchWorkBuddyAccount(accountId: string, forceCloseConfirmed = false): Promise<WorkBuddySwitchResult> {
   try {
-    return await invoke('switch_workbuddy_account', { accountId });
+    return await invoke('switch_workbuddy_account', { accountId, forceCloseConfirmed });
   } catch (error) {
     throw parseWorkBuddyCommandError(error);
   }

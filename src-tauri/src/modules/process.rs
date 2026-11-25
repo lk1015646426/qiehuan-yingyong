@@ -74,8 +74,9 @@ const TRAE_PROCESS_PROBE_MIN_INTERVAL: Duration = Duration::from_millis(800);
 /// 800ms 窗口内复用上次结果。空结果仅在 PowerShell 复核确认后缓存；
 /// send_close_signal 主动清空。
 #[cfg(target_os = "windows")]
-static WORKBUDDY_PROCESS_PROBE_CACHE: LazyLock<Mutex<Option<(Instant, Vec<(u32, Option<String>)>)>>> =
-    LazyLock::new(|| Mutex::new(None));
+static WORKBUDDY_PROCESS_PROBE_CACHE: LazyLock<
+    Mutex<Option<(Instant, Vec<(u32, Option<String>)>)>>,
+> = LazyLock::new(|| Mutex::new(None));
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AppLaunchCandidate {
@@ -2859,14 +2860,25 @@ fn detect_trae_exec_path_for_platform(
         }
         // 非默认路径：沿用上游多来源探测思路，优先接收正在运行的官方主程序。
         if let Ok(running) = scan_windows_app_launch_targets(platform.provider_key(), None) {
-            if let Some(candidate) = running.into_iter().map(|v| std::path::PathBuf::from(v.target))
-                .find(|path| path.is_file() && windows_trae_candidate_matches_platform(path, platform)) {
+            if let Some(candidate) = running
+                .into_iter()
+                .map(|v| std::path::PathBuf::from(v.target))
+                .find(|path| {
+                    path.is_file() && windows_trae_candidate_matches_platform(path, platform)
+                })
+            {
                 return Some(candidate);
             }
         }
         if let Some(candidate) = detect_windows_exec_path_by_signatures(
-            platform.display_name(), exe_names, app_dirs, app_dirs, app_dirs,
-        ).filter(|path| windows_trae_candidate_matches_platform(path, platform)) {
+            platform.display_name(),
+            exe_names,
+            app_dirs,
+            app_dirs,
+            app_dirs,
+        )
+        .filter(|path| windows_trae_candidate_matches_platform(path, platform))
+        {
             return Some(candidate);
         }
     }
@@ -4426,8 +4438,7 @@ fn trae_configured_app_scan_roots(
 pub(crate) fn resolve_trae_launch_path_for_platform(
     platform: crate::modules::trae_account::TraePlatformKind,
 ) -> Result<std::path::PathBuf, String> {
-    let configured =
-        trae_configured_app_path(&config::get_user_config(), platform).to_string();
+    let configured = trae_configured_app_path(&config::get_user_config(), platform).to_string();
     let key = (platform.provider_key().to_string(), configured);
 
     if let Some((at, cached)) = TRAE_LAUNCH_PATH_CACHE
@@ -4459,20 +4470,26 @@ fn resolve_trae_launch_path_uncached(
     let configured = normalize_custom_path(Some(trae_configured_app_path(&current, platform)));
     resolve_trae_custom_or_detected_path(configured.as_deref(), || {
         if configured.is_some() {
-            crate::modules::logger::log_info(&format!("[Path Detect] {} 原启动路径已失效，重新自动检测", platform.display_name()));
+            crate::modules::logger::log_info(&format!(
+                "[Path Detect] {} 原启动路径已失效，重新自动检测",
+                platform.display_name()
+            ));
         }
         detect_trae_exec_path_for_platform(platform)
-    }).ok_or_else(|| app_path_missing_error(platform.provider_key()))
+    })
+    .ok_or_else(|| app_path_missing_error(platform.provider_key()))
 }
 
 fn resolve_trae_custom_or_detected_path(
     configured: Option<&str>,
     detect: impl FnOnce() -> Option<std::path::PathBuf>,
 ) -> Option<std::path::PathBuf> {
-    configured.and_then(resolve_trae_macos_exec_path).or_else(|| {
-        let detected = detect()?;
-        resolve_trae_macos_exec_path(&detected.to_string_lossy())
-    })
+    configured
+        .and_then(resolve_trae_macos_exec_path)
+        .or_else(|| {
+            let detected = detect()?;
+            resolve_trae_macos_exec_path(&detected.to_string_lossy())
+        })
 }
 
 /// WorkBuddy 安装路径解析缓存（键：两处配置路径）。与 TRAE 同策略：
@@ -6612,6 +6629,9 @@ pub fn activate_workbuddy_window() -> Result<(), String> {
 
 #[cfg(target_os = "windows")]
 pub(crate) fn activate_workbuddy_window_for_pid(pid: u32) -> Result<(), String> {
+    use std::os::windows::io::{FromRawHandle, OwnedHandle};
+    use windows::Win32::Foundation::{WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows::Win32::System::Threading::{OpenProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE};
     use windows::Win32::UI::WindowsAndMessaging::{
         BringWindowToTop, GetForegroundWindow, GetWindowThreadProcessId, IsIconic, IsWindow,
         IsWindowVisible, SetForegroundWindow, ShowWindowAsync, SW_RESTORE,
@@ -6621,16 +6641,20 @@ pub(crate) fn activate_workbuddy_window_for_pid(pid: u32) -> Result<(), String> 
         return Err("WorkBuddy 启动 PID 无效".to_string());
     }
 
+    // Keep a handle to this process so a recycled PID cannot redirect activation.
+    let handle = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, false, pid) }
+        .map_err(|error| format!("无法等待本次启动的 WorkBuddy 进程：{error}"))?;
+    let _process = unsafe { OwnedHandle::from_raw_handle(handle.0) };
     let started = Instant::now();
     let timeout = Duration::from_secs(15);
     let target_pids = HashSet::from([pid]);
     let mut last_detail = "未找到本次启动实例的可见顶层窗口".to_string();
 
     while started.elapsed() < timeout {
-        if !is_pid_running(pid) {
-            last_detail = "本次启动的 WorkBuddy 进程已退出".to_string();
-            thread::sleep(Duration::from_millis(180));
-            continue;
+        match unsafe { WaitForSingleObject(handle, 0) } {
+            WAIT_TIMEOUT => {}
+            WAIT_OBJECT_0 => return Err("本次启动的 WorkBuddy 进程已退出".to_string()),
+            _ => return Err("无法读取本次启动的 WorkBuddy 进程状态".to_string()),
         }
 
         let handles = enumerate_workbuddy_windows(&target_pids)?;
@@ -8099,7 +8123,13 @@ pub fn collect_trae_process_entries_for_platform(
         if let Ok(mut cache) = TRAE_PROCESS_PROBE_CACHE.lock() {
             cache.insert(probe_key, (Instant::now(), entries.clone()));
         }
-        log_trae_slow_probe(probe_started, sysinfo_ms, ps_ms, "ps-confirm", entries.len());
+        log_trae_slow_probe(
+            probe_started,
+            sysinfo_ms,
+            ps_ms,
+            "ps-confirm",
+            entries.len(),
+        );
         entries
     }
 
@@ -8162,7 +8192,8 @@ fn resolve_workbuddy_probe_result(
 }
 
 #[cfg(target_os = "windows")]
-pub(crate) fn collect_workbuddy_process_entries_checked() -> Result<Vec<(u32, Option<String>)>, String> {
+pub(crate) fn collect_workbuddy_process_entries_checked(
+) -> Result<Vec<(u32, Option<String>)>, String> {
     let probe_started = Instant::now();
     // 节流：800ms 内复用上次结果（含 PowerShell 复核确认后的空结果），
     // 见 WORKBUDDY_PROCESS_PROBE_CACHE 注释。
@@ -8199,7 +8230,13 @@ pub(crate) fn collect_workbuddy_process_entries_checked() -> Result<Vec<(u32, Op
         }
     }
     let result_entries = result.as_ref().map(|e| e.clone()).unwrap_or_default();
-    log_workbuddy_slow_probe(probe_started, sysinfo_ms, ps_ms, "ps-confirm", &result_entries);
+    log_workbuddy_slow_probe(
+        probe_started,
+        sysinfo_ms,
+        ps_ms,
+        "ps-confirm",
+        &result_entries,
+    );
     result
 }
 
@@ -8950,6 +8987,50 @@ pub fn close_trae_instances(user_data_dirs: &[String], timeout_secs: u64) -> Res
     )
 }
 
+/// Explicit desktop account switch only. Ordinary stop/restart retains its normal shutdown policy.
+pub fn force_close_trae_default_for_switch(
+    platform: crate::modules::trae_account::TraePlatformKind,
+) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let expected = resolve_trae_launch_path_for_platform(platform)?;
+        let default_dir = get_default_trae_user_data_dir_for_platform_for_os(platform)
+            .ok_or_else(|| "无法获取 TRAE 默认数据目录".to_string())?;
+        let default_dir = normalize_path_for_compare(&default_dir);
+        let targets = HashSet::from([default_dir.clone()]);
+        let fresh = || -> Result<Vec<(u32, Option<String>)>, String> {
+            Ok(filter_entries_by_target_dirs(
+                collect_exact_switch_entries(&expected, &default_dir)?,
+                &targets,
+                Some(&default_dir),
+            ))
+        };
+        let entries = fresh()?;
+        if entries.is_empty() {
+            return Ok(());
+        }
+        force_close_exact_switch_processes(
+            &entries,
+            &targets,
+            Some(&default_dir),
+            &expected,
+            "TRAE",
+        )?;
+        let _ = wait_pids_exit(&collect_remaining_pids(&entries), 5);
+        if let Ok(mut cache) = TRAE_PROCESS_PROBE_CACHE.lock() {
+            cache.clear();
+        }
+        if !fresh()?.is_empty() {
+            return Err("TRAE 目标进程未完全退出或客户端重新启动，已停止切换".into());
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        close_trae_platform_default(platform.provider_key(), 20)
+    }
+}
+
 pub fn close_trae_platform_default(platform_id: &str, timeout_secs: u64) -> Result<(), String> {
     let platform = crate::modules::trae_account::TraePlatformKind::parse(Some(platform_id))?;
     let default_dir = get_default_trae_user_data_dir_for_platform_for_os(platform)
@@ -9225,62 +9306,372 @@ pub fn close_trae_platform_instances(
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+fn request_workbuddy_window_close(pids: &HashSet<u32>) -> Result<usize, String> {
+    use windows::Win32::Foundation::{LPARAM, WPARAM};
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowThreadProcessId, IsWindow, IsWindowVisible, PostMessageW, WM_CLOSE,
+    };
+    let mut sent = 0;
+    for hwnd in enumerate_workbuddy_windows(pids)? {
+        // Recheck ownership immediately before posting; avoid stale or recycled HWNDs.
+        let mut owner = 0;
+        unsafe {
+            if !IsWindow(hwnd).as_bool()
+                || !IsWindowVisible(hwnd).as_bool()
+                || GetWindowThreadProcessId(hwnd, Some(&mut owner)) == 0
+                || !pids.contains(&owner)
+            {
+                continue;
+            }
+            match PostMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)) {
+                Ok(()) => sent += 1,
+                Err(error) => crate::modules::logger::log_warn(&format!(
+                    "[WorkBuddy Close] WM_CLOSE failed pid={} error={}",
+                    owner, error
+                )),
+            }
+        }
+    }
+    crate::modules::logger::log_info(&format!(
+        "[WorkBuddy Close] normal window close requests={sent}"
+    ));
+    Ok(sent)
+}
+
+#[cfg(target_os = "windows")]
+pub(crate) fn collect_workbuddy_process_entries_for_switch(
+) -> Result<Vec<(u32, Option<String>)>, String> {
+    let expected = resolve_workbuddy_launch_path()?;
+    let default_dir = get_default_workbuddy_user_data_dir_for_os()
+        .ok_or_else(|| "无法获取 WorkBuddy 默认数据目录".to_string())?;
+    collect_exact_switch_entries(&expected, &default_dir)
+}
+
+/// Fresh exact-installation scan, including Electron helpers. Do not use the
+/// UI's cached main-process-only probe for credential replacement.
+#[cfg(target_os = "windows")]
+fn collect_exact_switch_entries(
+    expected: &Path,
+    default_dir: &str,
+) -> Result<Vec<(u32, Option<String>)>, String> {
+    let expected_path = normalize_path_for_compare(&expected.to_string_lossy());
+    let expected_name = expected.file_name().ok_or("目标客户端路径无效")?;
+    let default_dir = normalize_path_for_compare(default_dir);
+    if expected_path.is_empty() || default_dir.is_empty() {
+        return Err("目标客户端范围无效".into());
+    }
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing()
+            .with_exe(UpdateKind::OnlyIfNotSet)
+            .with_cmd(UpdateKind::OnlyIfNotSet),
+    );
+    // pid -> (parent pid, explicit profile, helper)
+    let mut rows: HashMap<u32, (Option<u32>, Option<String>, bool)> = HashMap::new();
+    for (pid, process) in system.processes() {
+        if pid.as_u32() == std::process::id() {
+            continue;
+        }
+        let name_matches = process.name().eq_ignore_ascii_case(expected_name);
+        let Some(exe) = process.exe() else {
+            if name_matches {
+                return Err("无法核实同名客户端进程路径，已停止切换".into());
+            }
+            continue;
+        };
+        if normalize_path_for_compare(&exe.to_string_lossy()) != expected_path {
+            continue;
+        }
+        if process.cmd().is_empty() {
+            return Err("无法核实目标客户端进程数据目录，已停止切换".into());
+        }
+        let dir = extract_user_data_dir(process.cmd())
+            .map(|d| normalize_path_for_compare(&d))
+            .filter(|d| !d.is_empty());
+        let has_profile_flag = process.cmd().iter().any(|a| {
+            let a = a.to_string_lossy();
+            a == "--user-data-dir" || a.starts_with("--user-data-dir=")
+        });
+        if has_profile_flag && dir.is_none() {
+            return Err("目标客户端数据目录参数不完整，已停止切换".into());
+        }
+        let args = process
+            .cmd()
+            .iter()
+            .map(|a| a.to_string_lossy().to_lowercase())
+            .collect::<Vec<_>>()
+            .join(" ");
+        rows.insert(
+            pid.as_u32(),
+            (
+                process.parent().map(|p| p.as_u32()),
+                dir,
+                is_helper_command_line(&args),
+            ),
+        );
+    }
+    resolve_exact_switch_profiles(&rows, &default_dir)
+}
+
+#[cfg(target_os = "windows")]
+fn resolve_exact_switch_profiles(
+    rows: &HashMap<u32, (Option<u32>, Option<String>, bool)>,
+    default_dir: &str,
+) -> Result<Vec<(u32, Option<String>)>, String> {
+    let has_other_profile = rows
+        .values()
+        .any(|(_, dir, _)| dir.as_deref().is_some_and(|d| d != default_dir));
+    let mut result = Vec::new();
+    for (&pid, (_, explicit, helper)) in rows {
+        let mut dir = explicit.clone();
+        if dir.is_none() && *helper {
+            let mut current = pid;
+            for _ in 0..rows.len() {
+                let Some(parent) = rows.get(&current).and_then(|row| row.0) else {
+                    break;
+                };
+                let Some((_, parent_dir, parent_helper)) = rows.get(&parent) else {
+                    break;
+                };
+                if let Some(parent_dir) = parent_dir {
+                    dir = Some(parent_dir.clone());
+                    break;
+                }
+                if !parent_helper {
+                    dir = Some(default_dir.to_owned());
+                    break;
+                }
+                current = parent;
+            }
+            if dir.is_none() && has_other_profile {
+                return Err("存在其他实例且残留进程归属不明确，已停止切换".into());
+            }
+        }
+        result.push((pid, Some(dir.unwrap_or_else(|| default_dir.to_owned()))));
+    }
+    result.sort_by_key(|row| row.0);
+    Ok(result)
+}
+
+#[cfg(target_os = "windows")]
+fn workbuddy_force_target_matches(
+    exe: &Path,
+    expected_exe: &Path,
+    args: &[std::ffi::OsString],
+    targets: &HashSet<String>,
+    default_dir: Option<&str>,
+) -> bool {
+    if args.is_empty()
+        || !exe.file_name().is_some_and(|n| {
+            expected_exe
+                .file_name()
+                .is_some_and(|e| n.eq_ignore_ascii_case(e))
+        })
+    {
+        return false;
+    }
+    let actual = normalize_path_for_compare(&exe.to_string_lossy());
+    let expected = normalize_path_for_compare(&expected_exe.to_string_lossy());
+    if actual.is_empty() || actual != expected {
+        return false;
+    }
+    let dir = extract_user_data_dir(args);
+    entry_matches_target_dirs(dir.as_ref(), targets, default_dir)
+}
+
+#[cfg(target_os = "windows")]
+fn force_close_exact_switch_processes(
+    remaining: &[(u32, Option<String>)],
+    target_dirs: &HashSet<String>,
+    default_dir: Option<&str>,
+    expected: &Path,
+    app_label: &str,
+) -> Result<usize, String> {
+    use windows::core::PWSTR;
+    use windows::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
+    use windows::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, QueryFullProcessImageNameW, TerminateProcess,
+        PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+    };
+    // Pin the verified process identity with an OS handle, not a name or a later PID-only taskkill.
+    struct TargetHandle(HANDLE);
+    impl Drop for TargetHandle {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+    let expected_path = normalize_path_for_compare(&expected.to_string_lossy());
+    let mut system = System::new();
+    system.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::All,
+        true,
+        ProcessRefreshKind::nothing()
+            .with_exe(UpdateKind::OnlyIfNotSet)
+            .with_cmd(UpdateKind::OnlyIfNotSet),
+    );
+    let mut handles = Vec::new();
+    for pid in collect_remaining_pids(remaining) {
+        if pid == 0 || pid == std::process::id() {
+            return Err("残留进程身份不明确，未进行强制关闭".into());
+        }
+        let Some(process) = system.process(Pid::from(pid as usize)) else {
+            continue;
+        };
+        let Some(exe) = process.exe() else {
+            return Err("无法核实残留进程路径，请手动退出目标客户端".into());
+        };
+        if !workbuddy_force_target_matches(exe, expected, process.cmd(), target_dirs, default_dir) {
+            return Err("发现无法确认归属的残留进程；未强制关闭，请手动退出目标客户端".into());
+        }
+        let handle = TargetHandle(unsafe {
+            OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+                false,
+                pid,
+            )
+            .map_err(|e| format!("无法打开已确认的 目标客户端进程: {e}"))?
+        });
+        let mut path = vec![0_u16; 32768];
+        let mut len = path.len() as u32;
+        let (mut created, mut exited, mut kernel, mut user) = (
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+            FILETIME::default(),
+        );
+        unsafe {
+            QueryFullProcessImageNameW(
+                handle.0,
+                PROCESS_NAME_WIN32,
+                PWSTR(path.as_mut_ptr()),
+                &mut len,
+            )
+            .map_err(|e| format!("无法复核 目标客户端进程路径: {e}"))?;
+            GetProcessTimes(handle.0, &mut created, &mut exited, &mut kernel, &mut user)
+                .map_err(|e| format!("无法复核 目标客户端进程创建时间: {e}"))?;
+        }
+        let filetime = ((created.dwHighDateTime as u64) << 32) | created.dwLowDateTime as u64;
+        let started = filetime.saturating_sub(116_444_736_000_000_000) / 10_000_000;
+        if normalize_path_for_compare(&String::from_utf16_lossy(&path[..len as usize]))
+            != expected_path
+            || started == 0
+            || started != process.start_time()
+        {
+            return Err("残留进程身份发生变化，未强制关闭".into());
+        }
+        handles.push((pid, handle));
+    }
+    // Preflight every target before terminating any. No elevation; no process-tree escalation.
+    let mut terminated = 0;
+    let mut failed = false;
+    for (pid, handle) in handles {
+        match unsafe { TerminateProcess(handle.0, 1) } {
+            Ok(()) => {
+                terminated += 1;
+                crate::modules::logger::log_info(&format!(
+                    "[{app_label} Close] scoped switch termination pid={pid}"
+                ));
+            }
+            Err(error) => {
+                failed = true;
+                crate::modules::logger::log_warn(&format!(
+                    "[{app_label} Close] scoped switch termination failed pid={pid} error={error}"
+                ));
+            }
+        }
+    }
+    if failed {
+        return Err("部分残留进程未能退出，已停止切换，请手动退出目标客户端".into());
+    }
+    Ok(terminated)
+}
+
 pub fn close_workbuddy_instances(
     user_data_dirs: &[String],
     timeout_secs: u64,
-) -> Result<(), String> {
+    force_close_confirmed: bool,
+) -> Result<bool, crate::models::workbuddy::WorkBuddyCommandError> {
+    use crate::models::workbuddy::{WorkBuddyCommandError, WorkBuddyErrorCode};
+    let failure = |message: String| {
+        WorkBuddyCommandError::new(WorkBuddyErrorCode::ClientCloseFailed, message)
+    };
     let default_dir = get_default_workbuddy_user_data_dir_for_os()
         .map(|value| normalize_path_for_compare(&value))
         .filter(|value| !value.is_empty());
-    // Official processes expose Electron userData (`.../app`) in cmdline.
     let normalized: Vec<String> = user_data_dirs
         .iter()
         .filter_map(|dir| {
             let trimmed = dir.trim();
-            if trimmed.is_empty() {
-                return None;
-            }
-            Some(trimmed.to_string())
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
         })
         .collect();
     #[cfg(target_os = "windows")]
     {
-        let entries = collect_workbuddy_process_entries_checked()
-            .map_err(|error| format!("WorkBuddy 进程探测失败，已取消切换: {error}"))?;
         let target_dirs = normalized
             .iter()
             .map(|value| normalize_path_for_compare(value))
             .filter(|value| !value.is_empty())
             .collect::<HashSet<_>>();
-        // 未检测到目标实例：跳过关闭与关闭后复查（各省一次进程探测）。
-        if filter_entries_by_target_dirs(entries, &target_dirs, default_dir.as_deref()).is_empty()
-        {
-            crate::modules::logger::log_info("[WorkBuddy Close] 未检测到目标实例，无需关闭");
-            return Ok(());
+        if target_dirs.is_empty() {
+            return Err(failure("未指定目标 WorkBuddy 实例".into()));
         }
-
-        let targets = filter_entries_by_target_dirs(collect_workbuddy_process_entries_checked()?, &target_dirs, default_dir.as_deref());
-        let pids = collect_remaining_pids(&targets);
-        for pid in &pids { request_windows_graceful_close(*pid,"WorkBuddy Close"); }
-        if !wait_pids_exit(&pids, timeout_secs) {
-            return Err("WorkBuddy 尚未正常退出。请保存当前任务并手动退出客户端，再重试切换；本次未强制关闭".into());
+        let fresh = || -> Result<Vec<(u32, Option<String>)>, WorkBuddyCommandError> {
+            let entries = collect_workbuddy_process_entries_for_switch().map_err(failure)?;
+            Ok(filter_entries_by_target_dirs(
+                entries,
+                &target_dirs,
+                default_dir.as_deref(),
+            ))
+        };
+        let targets = fresh()?;
+        if targets.is_empty() {
+            return Ok(false);
         }
-
-        let entries = collect_workbuddy_process_entries_checked()
-            .map_err(|error| format!("WorkBuddy 关闭后进程复查失败，已取消切换: {error}"))?;
-        let remaining =
-            filter_entries_by_target_dirs(entries, &target_dirs, default_dir.as_deref());
-        if !remaining.is_empty() {
-            return Err(format!(
-                "WorkBuddy 关闭后仍检测到目标实例: {}",
-                summarize_process_entries_for_log(&remaining)
+        if !force_close_confirmed {
+            let pids = collect_remaining_pids(&targets);
+            let sent =
+                request_workbuddy_window_close(&pids.iter().copied().collect()).map_err(failure)?;
+            if sent > 0 {
+                let _ = wait_pids_exit(&pids, timeout_secs.min(8));
+            }
+            if fresh()?.is_empty() {
+                return Ok(false);
+            }
+            return Err(WorkBuddyCommandError::new(
+                WorkBuddyErrorCode::ForceCloseRequired,
+                "WorkBuddy 未完全退出，请手动退出后重试。",
             ));
         }
-        Ok(())
+        // Explicit account-card switch: close only the resolved installation/profile.
+        let expected = resolve_workbuddy_launch_path().map_err(failure)?;
+        let forced = force_close_exact_switch_processes(
+            &targets,
+            &target_dirs,
+            default_dir.as_deref(),
+            &expected,
+            "WorkBuddy",
+        )
+        .map_err(failure)?;
+        let pids = collect_remaining_pids(&targets);
+        let _ = wait_pids_exit(&pids, 5);
+        if let Ok(mut cache) = WORKBUDDY_PROCESS_PROBE_CACHE.lock() {
+            *cache = None;
+        }
+        if !fresh()?.is_empty() {
+            return Err(failure(
+                "目标进程未完全退出或客户端重新启动，已取消切换".into(),
+            ));
+        }
+        Ok(forced > 0)
     }
-
     #[cfg(not(target_os = "windows"))]
     {
+        let _ = force_close_confirmed;
         close_user_data_dir_scoped_instances(
             "WorkBuddy Close",
             "WorkBuddy",
@@ -9291,6 +9682,8 @@ pub fn close_workbuddy_instances(
             default_dir.clone(),
             collect_workbuddy_process_entries,
         )
+        .map(|_| false)
+        .map_err(failure)
     }
 }
 
@@ -11322,13 +11715,20 @@ fn request_codex_graceful_close(pid: u32) -> bool {
         "tell application \"System Events\" to set frontmost of (first process whose unix id is {}) to true", pid
     );
     Command::new("osascript")
-        .args(["-e", &focus_script, "-e", "tell application \"System Events\" to keystroke \"q\" using command down"])
+        .args([
+            "-e",
+            &focus_script,
+            "-e",
+            "tell application \"System Events\" to keystroke \"q\" using command down",
+        ])
         .output()
         .is_ok_and(|output| output.status.success())
 }
 
 #[cfg(target_os = "windows")]
-fn normal_windows_shutdown_args(pid:u32)->[String;3]{["/PID".into(),pid.to_string(),"/T".into()]}
+fn normal_windows_shutdown_args(pid: u32) -> [String; 3] {
+    ["/PID".into(), pid.to_string(), "/T".into()]
+}
 
 #[cfg(target_os = "windows")]
 fn windows_graceful_shutdown_command(pid: u32) -> Command {
@@ -11344,15 +11744,12 @@ fn windows_graceful_shutdown_command(pid: u32) -> Command {
 }
 
 #[cfg(target_os = "windows")]
-fn request_windows_graceful_close(pid: u32,label:&str) -> bool {
+fn request_windows_graceful_close(pid: u32, label: &str) -> bool {
     if pid == 0 || !is_pid_running(pid) {
         return true;
     }
 
-    crate::modules::logger::log_info(&format!(
-        "[{label}] graceful taskkill start pid={}",
-        pid
-    ));
+    crate::modules::logger::log_info(&format!("[{label}] graceful taskkill start pid={}", pid));
     match windows_graceful_shutdown_command(pid).output() {
         Ok(output) => {
             if output.status.success() {
@@ -11364,8 +11761,7 @@ fn request_windows_graceful_close(pid: u32,label:&str) -> bool {
             } else {
                 crate::modules::logger::log_warn(&format!(
                     "[{label}] graceful taskkill failed pid={} status={}",
-                    pid,
-                    output.status
+                    pid, output.status
                 ));
                 false
             }
@@ -13830,13 +14226,25 @@ fn trae_default_start_args(
     let mut args = Vec::new();
     // 合并版冷启动应尊重官方 Agent 启动偏好；编辑器开窗参数会绕过它。
     if !agent_workbench {
-        args.push(if use_new_window { "--new-window" } else { "--reuse-window" }.to_string());
+        args.push(
+            if use_new_window {
+                "--new-window"
+            } else {
+                "--reuse-window"
+            }
+            .to_string(),
+        );
     }
     for arg in extra_args {
         let arg = arg.trim();
-        if arg.is_empty() { continue; }
-        if agent_workbench && (matches!(arg, "--new-window" | "--reuse-window" | "-n" | "-r")
-            || arg.starts_with("--new-window=") || arg.starts_with("--reuse-window=")) {
+        if arg.is_empty() {
+            continue;
+        }
+        if agent_workbench
+            && (matches!(arg, "--new-window" | "--reuse-window" | "-n" | "-r")
+                || arg.starts_with("--new-window=")
+                || arg.starts_with("--reuse-window="))
+        {
             continue;
         }
         args.push(arg.to_string());
@@ -13879,7 +14287,8 @@ pub fn start_trae_platform_default_with_args_with_new_window(
         use std::os::windows::process::CommandExt;
 
         let launch_path = resolve_trae_launch_path_for_platform(platform)?;
-        let agent_workbench = crate::modules::trae_account::is_unified_trae_cn_executable(&launch_path);
+        let agent_workbench =
+            crate::modules::trae_account::is_unified_trae_cn_executable(&launch_path);
         let mut cmd = Command::new(&launch_path);
         apply_managed_proxy_env_to_command(&mut cmd);
         if should_detach_child() {
@@ -13890,7 +14299,11 @@ pub fn start_trae_platform_default_with_args_with_new_window(
         } else {
             cmd.creation_flags(0x08000000);
         }
-        cmd.args(trae_default_start_args(agent_workbench, use_new_window, extra_args));
+        cmd.args(trae_default_start_args(
+            agent_workbench,
+            use_new_window,
+            extra_args,
+        ));
         let child = spawn_command_with_trace(&mut cmd)
             .map_err(|e| format!("启动 {} 失败: {}", platform.display_name(), e))?;
         crate::modules::logger::log_info(&format!(
@@ -14350,18 +14763,125 @@ mod codex_path_migration_tests {
 #[cfg(all(test, target_os = "windows"))]
 mod tests {
     #[test]
+    fn exact_switch_profiles_keep_helpers_in_their_own_instance() {
+        use std::collections::HashMap;
+        let mut rows = HashMap::from([
+            (1, (None, None, false)),
+            (2, (Some(1), None, true)),
+            (3, (None, Some("other".into()), false)),
+            (4, (Some(3), None, true)),
+            (5, (Some(4), None, true)),
+        ]);
+        let resolved = super::resolve_exact_switch_profiles(&rows, "default").unwrap();
+        assert_eq!(
+            resolved,
+            vec![
+                (1, Some("default".into())),
+                (2, Some("default".into())),
+                (3, Some("other".into())),
+                (4, Some("other".into())),
+                (5, Some("other".into()))
+            ]
+        );
+        rows.insert(6, (None, None, true));
+        assert!(super::resolve_exact_switch_profiles(&rows, "default").is_err());
+        rows.remove(&3);
+        rows.remove(&4);
+        rows.remove(&5);
+        assert!(super::resolve_exact_switch_profiles(&rows, "default").is_ok());
+    }
+
+    #[test]
+    fn workbuddy_force_close_requires_exact_exe_and_matching_profile() {
+        use std::collections::HashSet;
+        use std::path::Path;
+        let exe = Path::new(r"C:\Apps\WorkBuddy\WorkBuddy.exe");
+        let profile = super::normalize_path_for_compare(r"C:\Users\test\.workbuddy\app");
+        let targets = HashSet::from([profile.clone()]);
+        let good = vec![exe.as_os_str().to_os_string()];
+        assert!(super::workbuddy_force_target_matches(
+            exe,
+            exe,
+            &good,
+            &targets,
+            Some(&profile)
+        ));
+        assert!(!super::workbuddy_force_target_matches(
+            Path::new(r"C:\Other\WorkBuddy.exe"),
+            exe,
+            &good,
+            &targets,
+            Some(&profile)
+        ));
+        assert!(!super::workbuddy_force_target_matches(
+            Path::new(r"C:\Apps\WorkBuddy\node.exe"),
+            exe,
+            &good,
+            &targets,
+            Some(&profile)
+        ));
+        assert!(!super::workbuddy_force_target_matches(
+            exe,
+            exe,
+            &[],
+            &targets,
+            Some(&profile)
+        ));
+        let other = vec![
+            exe.as_os_str().to_os_string(),
+            "--user-data-dir=C:\\other-profile".into(),
+        ];
+        assert!(!super::workbuddy_force_target_matches(
+            exe,
+            exe,
+            &other,
+            &targets,
+            Some(&profile)
+        ));
+        assert!(!super::workbuddy_force_target_matches(
+            exe,
+            exe,
+            &good,
+            &HashSet::new(),
+            Some(&profile)
+        ));
+    }
+
+    #[test]
+    fn workbuddy_window_shutdown_with_no_target_never_closes_any_window() {
+        let sent =
+            super::request_workbuddy_window_close(&std::collections::HashSet::new()).unwrap();
+        assert_eq!(sent, 0);
+    }
+
+    #[test]
+    fn workbuddy_window_activation_does_not_wait_for_an_invalid_pid() {
+        let started = std::time::Instant::now();
+        assert!(super::activate_workbuddy_window_for_pid(u32::MAX).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+    }
+
+    #[test]
     fn workbuddy_shutdown_command_uses_windows_without_forcing_exit() {
         let command = super::windows_graceful_shutdown_command(123);
         assert_eq!(command.get_program(), "taskkill");
-        let args = command.get_args().map(|arg| arg.to_string_lossy().into_owned()).collect::<Vec<_>>();
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
         assert_eq!(args, ["/PID", "123", "/T"]);
         assert!(!args.iter().any(|arg| arg.eq_ignore_ascii_case("/F")));
     }
 
     #[test]
-    fn workbuddy_shutdown_arguments_never_force_exit(){
-        assert_eq!(super::normal_windows_shutdown_args(123),["/PID","123","/T"]);
-        assert!(!super::normal_windows_shutdown_args(123).iter().any(|a|a=="/F"));
+    fn workbuddy_shutdown_arguments_never_force_exit() {
+        assert_eq!(
+            super::normal_windows_shutdown_args(123),
+            ["/PID", "123", "/T"]
+        );
+        assert!(!super::normal_windows_shutdown_args(123)
+            .iter()
+            .any(|a| a == "/F"));
     }
 
     use super::{
@@ -14505,14 +15025,28 @@ mod tests {
 
     #[test]
     fn relocated_trae_is_recognized_by_product_identity_not_folder_name() {
-        let dir = std::env::temp_dir().join(format!("relocated-trae-{}-{}", std::process::id(), uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "relocated-trae-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
         let resources = dir.join("resources/app");
         std::fs::create_dir_all(&resources).unwrap();
-        std::fs::write(resources.join("product.json"), r#"{"applicationName":"trae-cn","appVersion":"3.4.3"}"#).unwrap();
+        std::fs::write(
+            resources.join("product.json"),
+            r#"{"applicationName":"trae-cn","appVersion":"3.4.3"}"#,
+        )
+        .unwrap();
         let exe = dir.join("Trae CN.exe");
         std::fs::write(&exe, b"fixture").unwrap();
-        assert!(windows_trae_candidate_matches_platform(&exe, TraePlatformKind::TraeCn));
-        assert!(!windows_trae_candidate_matches_platform(&exe, TraePlatformKind::TraeSoloCn));
+        assert!(windows_trae_candidate_matches_platform(
+            &exe,
+            TraePlatformKind::TraeCn
+        ));
+        assert!(!windows_trae_candidate_matches_platform(
+            &exe,
+            TraePlatformKind::TraeSoloCn
+        ));
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -14523,8 +15057,18 @@ mod tests {
         let exe = dir.join("Trae CN.exe");
         std::fs::write(&exe, b"fixture").unwrap();
         let old = dir.join("removed/Trae CN.exe");
-        assert_eq!(super::resolve_trae_custom_or_detected_path(Some(&old.to_string_lossy()), || Some(exe.clone())), Some(exe.clone()));
-        assert_eq!(super::resolve_trae_custom_or_detected_path(Some(&exe.to_string_lossy()), || panic!("valid custom path must win")), Some(exe));
+        assert_eq!(
+            super::resolve_trae_custom_or_detected_path(Some(&old.to_string_lossy()), || Some(
+                exe.clone()
+            )),
+            Some(exe.clone())
+        );
+        assert_eq!(
+            super::resolve_trae_custom_or_detected_path(Some(&exe.to_string_lossy()), || panic!(
+                "valid custom path must win"
+            )),
+            Some(exe)
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -14536,15 +15080,30 @@ mod tests {
 
     #[test]
     fn trae_default_start_agent_workbench_removes_forced_editor_flags() {
-        let args = ["--new-window", "-r", "--reuse-window", "-n", "--locale=zh-CN"]
-            .map(str::to_string);
-        assert_eq!(super::trae_default_start_args(true, true, &args), vec!["--locale=zh-CN"]);
+        let args = [
+            "--new-window",
+            "-r",
+            "--reuse-window",
+            "-n",
+            "--locale=zh-CN",
+        ]
+        .map(str::to_string);
+        assert_eq!(
+            super::trae_default_start_args(true, true, &args),
+            vec!["--locale=zh-CN"]
+        );
     }
 
     #[test]
     fn trae_default_start_legacy_keeps_existing_window_behavior() {
-        assert_eq!(super::trae_default_start_args(false, true, &[]), vec!["--new-window"]);
-        assert_eq!(super::trae_default_start_args(false, false, &[]), vec!["--reuse-window"]);
+        assert_eq!(
+            super::trae_default_start_args(false, true, &[]),
+            vec!["--new-window"]
+        );
+        assert_eq!(
+            super::trae_default_start_args(false, false, &[]),
+            vec!["--reuse-window"]
+        );
     }
 
     #[test]
